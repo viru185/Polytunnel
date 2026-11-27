@@ -77,3 +77,28 @@ by position: 1 `authcookie`, 3 portal, 4 user, 7 domain, 12 connection type (`tu
 The session cookie handed to the tunnel (and printed by `polytunnel auth --emit cookie`) is
 `authcookie=…&portal=…&user=…&domain=…&computer=…&preferred-ip=…`, URL-encoded. `computer`
 must match the value sent at login.
+
+## 5. Tunnel configuration
+
+`POST https://gw1.example.com/ssl-vpn/getconfig.esp` with the session fields and the ESP
+algorithms Polytunnel supports (`enc-algo=aes-256-cbc,aes-128-cbc`, `hmac-algo=sha256,sha1`).
+The `<response status="success">` holds `ip-address`, `netmask`, `mtu`, `dns/member`,
+`dns-suffix/member`, `access-routes/member` (empty: full tunnel), `exclude-access-routes`,
+`gw-address`, `ssl-tunnel-url` and, for ESP, an `<ipsec>` block: `udp-port`, `enc-algo`,
+`hmac-algo`, `c2s-spi`, `s2c-spi` and the keys `ekey-c2s`, `akey-c2s`, `ekey-s2c`, `akey-s2c`
+(each `<bits>` + hex `<val>`).
+
+## 6. Data transport
+
+* **ESP**: RFC 4303 tunnel mode over UDP to the gateway (`udp-port`, usually 4501). Polytunnel
+  checks it with an ICMP echo through the tunnel and keeps it alive with periodic probes;
+  if the gateway stops answering, it switches to TLS.
+* **TLS**: `GET <ssl-tunnel-url>?user=…&authcookie=…`; the gateway answers `START_TUNNEL`.
+  Each packet then carries a 16-byte header: `1a2b3c4d`, ethertype (`0800`/`86dd`), payload
+  length, `01 00 00 00 00 00 00 00`. A header with ethertype and length zero is a keepalive.
+
+## 7. HIP and logout
+
+`/ssl-vpn/hipreportcheck.esp` (with the report's MD5) tells whether the gateway wants a host
+report; `/ssl-vpn/hipreport.esp` submits it. Polytunnel's report contains host information only.
+`/ssl-vpn/logout.esp` ends the session.

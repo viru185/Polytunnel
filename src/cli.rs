@@ -8,6 +8,10 @@ pub enum Command {
     Help,
     Version,
     Auth(AuthArgs),
+    /// Log in, then have the service bring the tunnel up.
+    Connect(AuthArgs),
+    Disconnect,
+    Status,
     Gateways(GatewaysArgs),
     Profiles,
     Uri(UriAction),
@@ -71,6 +75,10 @@ Usage:
   polytunnel auth <PROFILE> [OPTIONS]          Log in with a saved profile
   polytunnel auth gp <PORTAL> [OPTIONS]        Log in to a GlobalProtect portal
   polytunnel auth fortinet <SERVER> [OPTIONS]  Log in to a FortiGate SSL VPN
+  polytunnel connect <PROFILE> [OPTIONS]       Log in and connect (also `connect gp ...`,
+                                               `connect fortinet ...`)
+  polytunnel disconnect                        Disconnect
+  polytunnel status                            Show the connection status
   polytunnel gateways <PROFILE> [OPTIONS]      Rank a GlobalProtect portal's gateways
   polytunnel gateways gp <PORTAL> [OPTIONS]      (find the best gateway)
   polytunnel profiles                          Show the profiles file and its profiles
@@ -213,6 +221,23 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                 browser: !no_browser,
             })
         }
+        Some("connect") => {
+            if gateways_only || emit.is_some() {
+                return Err("--refresh, --json and --emit do not apply to `connect`".into());
+            }
+            Command::Connect(AuthArgs {
+                target: target("connect", &mut words)?,
+                emit: Emit::Openconnect,
+                user,
+                gateway,
+                prefer,
+                realm,
+                paste,
+                browser: !no_browser,
+            })
+        }
+        Some("disconnect") => Command::Disconnect,
+        Some("status") => Command::Status,
         Some("gateways") => {
             if auth_only {
                 return Err("that option is for `auth`".into());
@@ -236,7 +261,10 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     if let Some(extra) = words.next() {
         return Err(format!("unexpected argument '{extra}'"));
     }
-    let takes_options = matches!(command, Command::Auth(_) | Command::Gateways(_));
+    let takes_options = matches!(
+        command,
+        Command::Auth(_) | Command::Connect(_) | Command::Gateways(_)
+    );
     if !takes_options && (auth_only || gateways_only || has_prefer) {
         return Err("those options only work with `auth` or `gateways`".into());
     }
@@ -349,6 +377,21 @@ mod tests {
     }
 
     #[test]
+    fn connect_variants() {
+        assert_eq!(
+            p(&["connect", "work", "--prefer", "East"]),
+            Ok(Command::Connect(AuthArgs {
+                prefer: Some("East".into()),
+                ..auth(AuthTarget::Profile("work".into()))
+            }))
+        );
+        assert_eq!(p(&["disconnect"]), Ok(Command::Disconnect));
+        assert_eq!(p(&["status"]), Ok(Command::Status));
+        assert!(p(&["connect", "work", "--emit", "json"]).is_err());
+        assert!(p(&["status", "--paste"]).is_err());
+    }
+
+    #[test]
     fn callbacks() {
         assert_eq!(
             p(&["--callback", "globalprotectcallback:abc"]),
@@ -408,6 +451,9 @@ mod tests {
             "--callback",
             "auth",
             "gateways",
+            "connect",
+            "disconnect",
+            "status",
             "profiles",
             "uri",
         ] {
