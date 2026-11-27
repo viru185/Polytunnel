@@ -1,0 +1,13 @@
+[Unit]
+Description=Polytunnel VPN service
+Documentation=https://github.com/viru185/Polytunnel
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/polytunnel-daemon run
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

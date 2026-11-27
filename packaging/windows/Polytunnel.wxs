@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Polytunnel MSI (WiX Toolset 5). Build:
+
+    dotnet tool restore
+    dotnet wix build packaging/windows/Polytunnel.wxs -arch x64 ^
+      -d Version=0.1.0 -d BinDir=target/release -d WintunDll=path/to/wintun.dll ^
+      -d WintunLicense=path/to/wintun/LICENSE.txt ^
+      -d NoticesFile=THIRD-PARTY-NOTICES.txt -o dist/polytunnel-x64.msi
+
+  Per-machine install into Program Files, the Polytunnel service (LocalSystem, started at
+  boot), a Start menu shortcut, and clean major upgrades (the old service is removed before
+  the new one is installed).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Polytunnel"
+           Manufacturer="Polytunnel contributors"
+           Version="$(var.Version)"
+           UpgradeCode="67804223-D7CD-4334-BA9F-E497E61DC06C"
+           Scope="perMachine"
+           Compressed="yes">
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer version of Polytunnel is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="PolytunnelIcon" SourceFile="assets/polytunnel.ico" />
+    <Property Id="ARPPRODUCTICON" Value="PolytunnelIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/viru185/Polytunnel" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/viru185/Polytunnel/issues" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="Polytunnel" />
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Polytunnel" AllowAbsent="no">
+      <Component Id="App" Directory="INSTALLFOLDER">
+        <File Id="PolytunnelExe" Source="$(var.BinDir)/polytunnel.exe" KeyPath="yes" />
+      </Component>
+
+      <Component Id="Daemon" Directory="INSTALLFOLDER">
+        <File Id="DaemonExe" Source="$(var.BinDir)/polytunnel-daemon.exe" KeyPath="yes" />
+        <ServiceInstall Id="PolytunnelService"
+                        Name="Polytunnel"
+                        DisplayName="Polytunnel VPN service"
+                        Description="Creates Polytunnel's VPN tunnels and network settings for the Polytunnel app."
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Account="LocalSystem"
+                        Arguments="run --service"
+                        Vital="yes" />
+        <ServiceControl Id="PolytunnelServiceControl"
+                        Name="Polytunnel"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+      </Component>
+
+      <Component Id="Wintun" Directory="INSTALLFOLDER">
+        <File Id="WintunDll" Name="wintun.dll" Source="$(var.WintunDll)" KeyPath="yes" />
+      </Component>
+
+      <Component Id="WintunLicense" Directory="INSTALLFOLDER">
+        <File Id="WintunLicense" Name="wintun-LICENSE.txt" Source="$(var.WintunLicense)" KeyPath="yes" />
+      </Component>
+      <Component Id="License" Directory="INSTALLFOLDER">
+        <File Id="License" Name="LICENSE.txt" Source="LICENSE" KeyPath="yes" />
+      </Component>
+      <Component Id="Notices" Directory="INSTALLFOLDER">
+        <File Id="Notices" Name="THIRD-PARTY-NOTICES.txt" Source="$(var.NoticesFile)" KeyPath="yes" />
+      </Component>
+
+      <Component Id="StartMenu" Directory="ProgramMenuFolder">
+        <Shortcut Id="StartMenuShortcut"
+                  Name="Polytunnel"
+                  Description="Lightweight VPN client for GlobalProtect and Fortinet"
+                  Target="[INSTALLFOLDER]polytunnel.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="PolytunnelIcon" />
+        <RegistryValue Root="HKLM" Key="Software\Polytunnel" Name="StartMenuShortcut"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </Feature>
+  </Package>
+</Wix>

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stop an earlier version of the Polytunnel service before files are replaced.
+launchctl bootout system/com.github.viru185.polytunnel.daemon 2>/dev/null || true
+exit 0
