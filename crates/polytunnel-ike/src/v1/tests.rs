@@ -777,3 +777,102 @@ fn messages_from_strangers_are_ignored() {
     assert!(client.receive(now, &forged).is_empty());
     assert!(!client.is_closed());
 }
+
+/// A small xorshift generator: reproducible "fuzzing" without extra tools.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        usize::try_from(self.next() % n as u64).unwrap()
+    }
+
+    fn bytes(&mut self, n: usize) -> Vec<u8> {
+        (0..n).map(|_| self.next() as u8).collect()
+    }
+
+    /// Flips, overwrites, truncates or extends a valid message.
+    fn mutate(&mut self, msg: &[u8]) -> Vec<u8> {
+        let mut m = msg.to_vec();
+        for _ in 0..1 + self.below(4) {
+            match self.below(4) {
+                0 if !m.is_empty() => {
+                    let i = self.below(m.len());
+                    m[i] ^= 1 << self.below(8);
+                }
+                1 if !m.is_empty() => {
+                    let i = self.below(m.len());
+                    m[i] = self.next() as u8;
+                }
+                2 => m.truncate(self.below(m.len() + 1)),
+                _ => {
+                    let extra = self.below(40);
+                    m.extend(self.bytes(extra));
+                }
+            }
+        }
+        m
+    }
+}
+
+#[test]
+fn parsers_survive_garbage() {
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    for _ in 0..20_000 {
+        let n = rng.below(300);
+        let data = rng.bytes(n);
+        let first = data.first().copied().unwrap_or(1) % 16;
+        let _ = Header::parse(&data);
+        let _ = Chain::parse(first, &data);
+        let _ = Sa::parse(&data);
+        let _ = Id::parse(&data);
+        let _ = Notify::parse(&data);
+        let _ = Delete::parse(&data);
+        let _ = Cfg::parse(&data);
+        let _ = ModeConfig::parse(&super::wire::parse_attributes(&data).unwrap_or_default());
+    }
+}
+
+#[test]
+fn the_initiator_survives_mutated_messages_in_every_phase() {
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    // Before phase 1: mutations of a real message 2.
+    for _ in 0..300 {
+        let now = Instant::now();
+        let mut client = Initiator::new(config(), now).unwrap();
+        let msg1 = sends(&client.start(now))[0].1.clone();
+        let mut gw = Gateway::new();
+        let msg2 = gw.on_msg1(&msg1, None);
+        let _ = client.receive(now, &rng.mutate(&msg2));
+        let _ = client.poll(now + Duration::from_secs(3));
+    }
+    // After phase 1: mutated encrypted requests and garbage with the right cookies.
+    let (mut client, mut gw, now) = through_phase1();
+    let request = gw
+        .cfg(
+            cfg_type::REQUEST,
+            0x7777,
+            vec![Attribute::variable(attr::XAUTH_USER_NAME, Vec::new())],
+        )
+        .msg;
+    for i in 0..3000 {
+        let message = if i % 3 == 0 {
+            let mut m = request[..28].to_vec();
+            let n = rng.below(200);
+            m.extend(rng.bytes(n));
+            let len = u32::try_from(m.len()).unwrap();
+            m[24..28].copy_from_slice(&len.to_be_bytes());
+            m
+        } else {
+            rng.mutate(&request)
+        };
+        // Not panicking is the point; the session may or may not survive the garbage.
+        let _ = client.receive(now, &message);
+    }
+}
