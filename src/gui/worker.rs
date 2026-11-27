@@ -158,13 +158,17 @@ fn ipsec_request(
     events: &Notifier,
 ) -> Result<ipc::Connect, String> {
     let server = ipsec::server_host(p)?;
-    let psk = ask_hidden(
-        events,
-        "Pre-shared key".into(),
-        format!("The pre-shared key of the IPsec tunnel to {server}."),
-    )
-    .ok_or("cancelled")?;
-    let xauth = if ipsec::uses_xauth(p) {
+    let psk = if ipsec::needs_psk(p) {
+        ask_hidden(
+            events,
+            "Pre-shared key".into(),
+            format!("The pre-shared key of the IPsec tunnel to {server}."),
+        )
+        .ok_or("cancelled")?
+    } else {
+        Secret::new("")
+    };
+    let xauth = if ipsec::needs_login(p) {
         let (reply, answer) = mpsc::channel();
         events.send(Event::Prompt(Prompt::Credentials {
             title: format!("Sign in to {server}"),
