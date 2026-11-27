@@ -45,6 +45,40 @@ Platforms: Windows (x64, ARM64) first, Linux (x64, ARM64), macOS (beta).
 | M10–M11 | Embedded login window, kill switch |
 | M12–M13 | Code signing, auto-update |
 
+## Usage (early preview)
+
+Log in from the command line. Until Polytunnel's own tunnels land (M4), you can hand the
+session to a separately installed [openconnect](https://www.infradead.org/openconnect/):
+
+```sh
+# GlobalProtect: your default browser opens for single sign-on
+polytunnel auth gp vpn.example.com
+polytunnel auth gp vpn.example.com --emit cookie | openconnect --protocol=gp --os=win --cookie-on-stdin gw.example.com
+
+# Fortinet SSL VPN (username/password, plus a code if two-factor is on)
+polytunnel auth fortinet vpn.example.net:10443 --user me --emit cookie \
+  | openconnect --protocol=fortinet --cookie-on-stdin vpn.example.net:10443
+```
+
+- The first browser login registers Polytunnel for `globalprotectcallback:` links for your
+  user account (`polytunnel uri status|register|unregister`). If the browser cannot hand the
+  login back, add `--paste` and paste the link (or the final page's source) into the terminal.
+- `--gateway <name>` picks a gateway by address or description; `--emit json` prints JSON.
+- Profiles in `profiles.toml` (`polytunnel profiles` shows where) save typing:
+
+```toml
+[profile.work]
+type = "global-protect"
+portal = "vpn.example.com"
+
+[profile.office]
+type = "fortinet-ssl"
+server = "vpn.example.net:10443"
+username = "me"
+```
+
+Then `polytunnel auth work`.
+
 ## Building from source
 
 Requires the stable Rust toolchain (see `rust-toolchain.toml`).
@@ -61,14 +95,15 @@ The binaries are `target/release/polytunnel` (app and CLI) and
 
 ```
 src/                       `polytunnel` (root crate): tray agent, window, command line
-crates/polytunnel-core     shared types, validation, IPC schema
+crates/polytunnel-core     shared types: HTTP abstraction, secrets, profiles, XML reader
+crates/polytunnel-gp       GlobalProtect login (pre-login, SAML callback, portal, gateway)
+crates/polytunnel-forti    Fortinet SSL VPN login
 crates/polytunnel-daemon   `polytunnel-daemon`: privileged background service
 xtask                      repository tasks (`cargo xtask lint-fixtures`)
-docs/                      architecture notes and decision records
+docs/                      architecture notes, decision records, protocol notes
 ```
 
-More crates (GlobalProtect, Fortinet, IKE, ESP, networking, updates) arrive with their
-milestones. See [docs/architecture.md](docs/architecture.md).
+More crates (IKE, ESP, networking, updates) arrive with their milestones. See [docs/architecture.md](docs/architecture.md).
 
 ## Contributing
 

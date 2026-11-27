@@ -2,8 +2,19 @@
 //!
 //! `main.rs` only collects the arguments and calls [`run`].
 
+pub mod auth;
 pub mod author;
+pub mod browser;
+pub mod callback;
 pub mod cli;
+pub mod emit;
+pub mod http;
+pub mod paths;
+pub mod prompter;
+pub mod sysinfo;
+pub mod uri;
+#[cfg(windows)]
+pub mod win;
 
 use std::ffi::OsString;
 
@@ -45,6 +56,10 @@ pub fn run(argv: Vec<OsString>, hooks: &Hooks) -> i32 {
             println!("polytunnel {}", polytunnel_core::VERSION);
             0
         }
+        Command::Auth(args) => auth::run(&args),
+        Command::Profiles => auth::list_profiles(),
+        Command::Uri(action) => uri::run(action),
+        Command::Callback(link) => callback::run(&link),
     }
 }
 
@@ -71,6 +86,7 @@ mod tests {
             vec!["--author"],
             vec!["--version", "--author"],
             vec!["--nope", "--author"],
+            vec!["auth", "work", "--author"],
         ] {
             AUTHOR_SHOWN.store(false, Ordering::SeqCst);
             let argv = argv.into_iter().map(OsString::from).collect();
