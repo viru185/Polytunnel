@@ -86,3 +86,34 @@ jobs:
             echo "$RUNNER_OS $name: $((size / 1024)) KB"
             echo "**$RUNNER_OS** \`$name\`: $((size / 1024)) KB" >> "$GITHUB_STEP_SUMMARY"
           done
+
+  net-integration:
+    name: network integration (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    env:
+      WINTUN_SHA256: 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch Wintun (pinned, checksum verified)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/wintun.zip" https://www.wintun.net/builds/wintun-0.14.1.zip
+          echo "$WINTUN_SHA256  $RUNNER_TEMP/wintun.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/wintun.zip" -d "$RUNNER_TEMP"
+          echo "POLYTUNNEL_WINTUN_DLL=$RUNNER_TEMP/wintun/bin/amd64/wintun.dll" >> "$GITHUB_ENV"
+      - name: TUN, routes and DNS round trip (Windows runners are administrators)
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p polytunnel-net --test system -- --ignored --test-threads=1
+      - name: TUN, routes and DNS round trip (as root)
+        if: runner.os == 'Linux'
+        run: |
+          bin=$(cargo test --locked -p polytunnel-net --test system --no-run 2>&1             | grep -oE 'target/debug/deps/system-[0-9a-f]+' | head -1)
+          sudo "$bin" --ignored --test-threads=1
+
