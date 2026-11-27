@@ -36,10 +36,20 @@ regex = '''(?i)\bSVPNCOOKIE\s*=\s*([0-9a-z+/=%_-]{16,})'''
 secretGroup = 1
 keywords = ["svpncookie"]
 
+# Pre-shared keys are matched only as literal values, so code that passes a key around
+# (`psk: Zeroizing::new(psk())`, `let psk = ask_secret(...)`) is not reported.
+
 [[rules]]
 id = "ipsec-pre-shared-key"
-description = "IPsec pre-shared key"
-regex = '''(?i)\b(?:psk|pre[-_ ]?shared[-_ ]?key|authkey)["']?\s*[=:]\s*["']?([^\s"']{8,})'''
+description = "IPsec pre-shared key in quotes (psk = \"...\", \"psk\": \"...\", : PSK \"...\")"
+regex = '''(?i)\b(?:psk|pre[-_ ]?shared[-_ ]?key|authkey)["']?(?:\s*[=:]\s*|[ \t]+)["']([^\s"']{8,})["']'''
+secretGroup = 1
+keywords = ["psk", "shared", "authkey"]
+
+[[rules]]
+id = "ipsec-pre-shared-key-assignment"
+description = "IPsec pre-shared key as a bare value (PSK=..., AuthKey=...)"
+regex = '''(?im)\b(?:psk|pre[-_ ]?shared[-_ ]?key|authkey)[ \t]*=[ \t]*([^\s"'$(){}\[\];,]{8,})[ \t]*\r?$'''
 secretGroup = 1
 keywords = ["psk", "shared", "authkey"]
 
