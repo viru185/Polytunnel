@@ -2,6 +2,7 @@
 //! trust store. Shared by the app (logins) and the daemon (tunnel setup, HIP, logout).
 
 mod pinned;
+pub mod trace;
 
 use std::time::Duration;
 

@@ -218,7 +218,8 @@ pub fn answer(id: u32, values: Vec<Secret>) -> Result<(), String> {
 
 /// Hands `connect` to the service.
 pub fn send_connect(connect: Connect) -> Result<(), String> {
-    match request(&Request::Connect { connect })? {
+    let trace = crate::trace::enabled();
+    match request(&Request::Connect { connect, trace })? {
         Response::Accepted {} => Ok(()),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected answer from the service: {other:?}")),

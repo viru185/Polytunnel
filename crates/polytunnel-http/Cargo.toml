@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+form_urlencoded.workspace = true
 native-tls.workspace = true
 polytunnel-core.workspace = true
 sha2.workspace = true

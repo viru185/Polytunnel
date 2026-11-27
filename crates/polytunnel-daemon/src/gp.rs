@@ -16,7 +16,6 @@ use polytunnel_esp::{Cipher, InboundSa, Integrity, Keys, OutboundSa};
 use polytunnel_gp::login::GatewaySession;
 use polytunnel_gp::tunnel::{self, EspHmac, EspSettings, TunnelSettings, frame};
 use polytunnel_gp::{ClientInfo, hip};
-use polytunnel_http::UreqTransport;
 use polytunnel_net::journal::Journal;
 use polytunnel_net::system::System;
 use polytunnel_net::{Prefix, TunnelConfig};
@@ -151,7 +150,7 @@ async fn connect_and_run(
     let settings = {
         let (client, session) = (client.clone(), session.clone());
         blocking(move || {
-            let response = UreqTransport::new()
+            let response = crate::trace::transport(None)
                 .send(&tunnel::getconfig_request(&client, &session))
                 .map_err(|e| e.to_string())?;
             tunnel::parse_getconfig(&response).map_err(|e| e.to_string())
@@ -205,7 +204,7 @@ async fn connect_and_run(
 
     let (client, session) = (client.clone(), session.clone());
     let _ = blocking(move || {
-        UreqTransport::new()
+        crate::trace::transport(None)
             .send(&tunnel::logout_request(&client, &session))
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -216,7 +215,7 @@ async fn connect_and_run(
 
 fn hip_exchange(client: &ClientInfo, session: &GatewaySession, ip: &str) -> Result<(), String> {
     let (report, md5) = hip::report(client, session, ip, &hip_time());
-    let http = UreqTransport::new();
+    let http = crate::trace::transport(None);
     let needed = hip::parse_check(
         &http
             .send(&hip::check_request(session, ip, &md5))

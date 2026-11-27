@@ -16,7 +16,6 @@ use polytunnel_core::ipc::{FortiConnect, Status};
 use polytunnel_core::pin::CertFingerprint;
 use polytunnel_forti::ppp::{Event, IpConfig, Ppp};
 use polytunnel_forti::tunnel::{self, TunnelSettings, frame};
-use polytunnel_http::UreqTransport;
 use polytunnel_net::journal::Journal;
 use polytunnel_net::system::System;
 use polytunnel_net::{Prefix, TunnelConfig};
@@ -60,7 +59,7 @@ pub async fn run(c: FortiConnect, status: StatusCell, mut stop: watch::Receiver<
     }
     let (server, cookie, pin) = (c.server.clone(), c.cookie.clone(), c.server_cert);
     let _ = blocking(move || {
-        UreqTransport::with_server_cert(pin)
+        crate::trace::transport(pin)
             .send(&tunnel::logout_request(&server, &cookie))
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -115,7 +114,7 @@ async fn connect_and_run(
     let settings = {
         let (server, cookie, pin) = (c.server.clone(), c.cookie.clone(), c.server_cert);
         blocking(move || {
-            let response = UreqTransport::with_server_cert(pin)
+            let response = crate::trace::transport(pin)
                 .send(&tunnel::config_request(&server, &cookie))
                 .map_err(|e| e.to_string())?;
             tunnel::parse_config(&response).map_err(|e| e.to_string())

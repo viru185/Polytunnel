@@ -78,7 +78,10 @@ impl Manager {
             Request::Status {} => Response::Status {
                 status: self.status(),
             },
-            Request::Connect { connect } => self.connect(connect),
+            Request::Connect { connect, trace } => {
+                crate::trace::set(trace);
+                self.connect(connect)
+            }
             Request::Disconnect {} => {
                 self.stop_current();
                 Response::Accepted {}

@@ -40,6 +40,9 @@ pub enum Request {
     Status {},
     Connect {
         connect: Connect,
+        /// Record this connection's exchanges in the service's troubleshooting trace.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        trace: bool,
     },
     Disconnect {},
     /// Answers a [`Status::NeedsInput`] prompt (one value per field).
@@ -510,6 +513,7 @@ mod tests {
     fn frames_round_trip() {
         let request = Request::Connect {
             connect: Connect::GlobalProtect(Box::new(gp())),
+            trace: true,
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &request).unwrap();

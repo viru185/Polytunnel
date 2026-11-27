@@ -316,6 +316,8 @@ struct App {
     gateways: Option<GatewaysUi>,
     ipc_rx: Receiver<Message>,
     autostart: bool,
+    /// The troubleshooting trace switch.
+    trace: bool,
     link_status: String,
     /// The kill switch setting, when the service could be asked.
     killswitch: Option<polytunnel_core::ipc::KillSwitchSettings>,
@@ -392,6 +394,7 @@ impl App {
             gateways: None,
             ipc_rx,
             autostart: autostart::enabled(),
+            trace: crate::trace::enabled(),
             link_status: link_status_text(),
             killswitch: connect::killswitch(None).ok().map(|(s, _, _)| s),
             update: None,
@@ -985,6 +988,36 @@ impl App {
                     self.link_status = link_status_text();
                 }
             });
+            ui.separator();
+            let mut trace = self.trace;
+            if ui
+                .checkbox(
+                    &mut trace,
+                    "Record a troubleshooting trace (passwords and cookies are removed)",
+                )
+                .changed()
+            {
+                match crate::trace::set(trace) {
+                    Ok(()) => {
+                        self.trace = trace;
+                        self.log(if trace {
+                            format!(
+                                "Recording connection traces in {} (the service's are in                                  its own folder).",
+                                crate::trace::file().display()
+                            )
+                        } else {
+                            "Connection traces are off.".to_string()
+                        });
+                    }
+                    Err(e) => self.log(format!("Could not change the trace setting: {e}")),
+                }
+            }
+            if self.trace {
+                ui.label(format!("App: {}", crate::trace::file().display()));
+                if cfg!(windows) {
+                    ui.label(r"Service: %ProgramData%\Polytunnel\trace.log (administrators only)");
+                }
+            }
         });
     }
 

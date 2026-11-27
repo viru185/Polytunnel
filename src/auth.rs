@@ -16,7 +16,6 @@ use crate::emit::{self, LoginOutput};
 use crate::gateways::GatewayPrefs;
 use crate::prompter::{self, CliPrompter, SsoMode};
 use crate::{paths, sysinfo};
-use polytunnel_http::UreqTransport;
 
 pub fn run(args: &AuthArgs) -> i32 {
     let result = resolve(args).and_then(|profile| match profile {
@@ -149,8 +148,13 @@ pub(crate) fn gp_login(profile: &GlobalProtectProfile, args: &AuthArgs) -> Resul
         method: profile.probe.unwrap_or_default(),
     };
     let mut prompter = CliPrompter::new(mode, args.browser, prefs);
-    let result = flow::login(&UreqTransport::new(), &client, &options, &mut prompter)
-        .map_err(|e| e.to_string())?;
+    let result = flow::login(
+        &crate::trace::transport(None),
+        &client,
+        &options,
+        &mut prompter,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(GpLogin { client, result })
 }
 
@@ -220,7 +224,7 @@ pub(crate) fn forti_login(profile: &FortinetSslProfile) -> Result<FortiLogin, St
     let realm = profile.realm.clone().unwrap_or_default();
     eprintln!("Logging in to {}...", base.trim_start_matches("https://"));
     let cookie = polytunnel_forti::login(
-        &UreqTransport::with_server_cert(profile.server_cert),
+        &crate::trace::transport(profile.server_cert),
         &base,
         &username,
         &password,

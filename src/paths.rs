@@ -23,6 +23,15 @@ pub fn runtime_dir() -> PathBuf {
         .join(APP_DIR)
 }
 
+/// A per-user directory for logs and traces: `%LOCALAPPDATA%\Polytunnel`,
+/// `~/.local/share/Polytunnel`, `~/Library/Application Support/Polytunnel`.
+pub fn log_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .or_else(dirs::cache_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(APP_DIR)
+}
+
 /// The login name, reduced to characters that are safe in pipe and file names.
 pub fn user_name() -> String {
     let raw = std::env::var("USERNAME")

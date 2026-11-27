@@ -3886,6 +3886,7 @@ dependencies = [
 name = "polytunnel-http"
 version = "0.0.0"
 dependencies = [
+ "form_urlencoded",
  "native-tls",
  "polytunnel-core",
  "rcgen",

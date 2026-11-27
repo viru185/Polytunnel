@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use crate::cli::{AuthTarget, GatewaysArgs};
 use crate::prompter::{CliPrompter, SsoMode};
 use crate::{auth, paths, probe, sysinfo};
-use polytunnel_http::UreqTransport;
 
 /// How the user wants gateways picked.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -251,9 +250,13 @@ fn run_inner(args: &GatewaysArgs) -> Result<(), String> {
                 default_browser: true,
             };
             let mut prompter = CliPrompter::new(SsoMode::Callback, true, prefs.clone());
-            let session =
-                flow::portal_login(&UreqTransport::new(), &client, &options, &mut prompter)
-                    .map_err(|e| e.to_string())?;
+            let session = flow::portal_login(
+                &crate::trace::transport(None),
+                &client,
+                &options,
+                &mut prompter,
+            )
+            .map_err(|e| e.to_string())?;
             save_cache(&session)?;
             load_cache(&portal).ok_or("cannot read the saved gateway list")?
         }
