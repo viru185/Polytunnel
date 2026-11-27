@@ -60,6 +60,8 @@ pub struct PortalConfig {
     pub portal_prelogonuserauthcookie: Option<Secret>,
     /// Seconds the client waits for gateway responses when picking the best one.
     pub cutoff_time: Option<u32>,
+    /// The GlobalProtect app version the portal offers (`<version>`), if any.
+    pub version: Option<String>,
 }
 
 pub fn request(base: &str, client: &ClientInfo, username: &str, auth: &PortalAuth) -> Request {
@@ -135,6 +137,10 @@ pub fn parse(response: &Response) -> Result<PortalConfig, GpError> {
         cutoff_time: root
             .text_at("gateways/cutoff-time")
             .and_then(|t| t.parse().ok()),
+        version: root
+            .text_at("version")
+            .filter(|v| client::valid_version(v))
+            .map(str::to_string),
     })
 }
 
@@ -183,6 +189,7 @@ mod tests {
 
     const CONFIG: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <policy>
+  <version>6.2.8-223</version>
   <portal-name>vpn</portal-name>
   <portal-userauthcookie>FAKE-portal-cookie</portal-userauthcookie>
   <portal-prelogonuserauthcookie>empty</portal-prelogonuserauthcookie>
@@ -215,6 +222,9 @@ mod tests {
     fn parses_gateways_and_cookies() {
         let config = parse(&Response::new(200, CONFIG)).unwrap();
         assert_eq!(config.cutoff_time, Some(5));
+        assert_eq!(config.version.as_deref(), Some("6.2.8-223"));
+        let odd = CONFIG.replace("6.2.8-223", "six two eight");
+        assert_eq!(parse(&Response::new(200, odd)).unwrap().version, None);
         assert_eq!(
             config.portal_userauthcookie,
             Some(Secret::new("FAKE-portal-cookie"))

@@ -105,8 +105,14 @@ fn label(args: &AuthArgs) -> String {
     }
 }
 
-/// The service request for a finished GlobalProtect login.
-pub fn gp_connect(profile: String, client: ClientInfo, session: GatewaySession) -> Connect {
+/// The service request for a finished GlobalProtect login. `app_version` is what the tunnel
+/// configuration request announces (see `polytunnel_gp::client::announced_version`).
+pub fn gp_connect(
+    profile: String,
+    client: ClientInfo,
+    session: GatewaySession,
+    app_version: Option<String>,
+) -> Connect {
     Connect::GlobalProtect(Box::new(GpConnect {
         profile,
         gateway: session.gateway,
@@ -121,7 +127,7 @@ pub fn gp_connect(profile: String, client: ClientInfo, session: GatewaySession) 
             os_version: client.os_version,
             computer: client.computer,
             host_id: client.host_id,
-            app_version: client.app_version,
+            app_version,
         },
         allow_esp: true,
     }))
@@ -148,7 +154,11 @@ fn connect_request(args: &AuthArgs) -> Result<Connect, String> {
     Ok(match auth::resolve(args)? {
         Profile::GlobalProtect(p) => {
             let GpLogin { client, result } = auth::gp_login(&p, args)?;
-            gp_connect(profile, client, result.session)
+            let version = polytunnel_gp::client::announced_version(
+                p.client_version.as_deref(),
+                result.config.version.as_deref(),
+            );
+            gp_connect(profile, client, result.session, version)
         }
         Profile::FortinetSsl(p) => {
             let FortiLogin { base, cookie, .. } = auth::forti_login(&p)?;

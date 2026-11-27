@@ -16,7 +16,8 @@ pub fn client_info(os: Option<ClientOs>, app_version: Option<String>) -> ClientI
         os_version: os_version(),
         computer: computer_name(),
         host_id: host_id(),
-        app_version,
+        // An empty `client-version` turns the announcement off.
+        app_version: app_version.filter(|v| !v.trim().is_empty()),
     }
 }
 

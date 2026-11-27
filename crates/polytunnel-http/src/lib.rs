@@ -57,6 +57,9 @@ fn config() -> Config {
         .max_redirects_will_error(false)
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_global(Some(Duration::from_secs(60)))
+        // The app and the service run with different environments, and the tunnel itself
+        // never uses a proxy: no proxy from environment variables either.
+        .proxy(None)
         .build()
 }
 

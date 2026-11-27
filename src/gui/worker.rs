@@ -212,10 +212,15 @@ fn login_gp(
     };
     let result = flow::login(&UreqTransport::new(), &client, &options, &mut prompter)
         .map_err(|e| e.to_string())?;
+    let version = polytunnel_gp::client::announced_version(
+        p.client_version.as_deref(),
+        result.config.version.as_deref(),
+    );
     Ok(connect::gp_connect(
         name.to_string(),
         client,
         result.session,
+        version,
     ))
 }
 

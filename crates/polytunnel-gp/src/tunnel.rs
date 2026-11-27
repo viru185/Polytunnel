@@ -29,8 +29,11 @@ fn session_fields(session: &GatewaySession) -> Vec<(&'static str, String)> {
         ("authcookie", session.authcookie.expose().to_string()),
         ("portal", session.portal.clone()),
         ("user", session.user.clone()),
-        ("domain", session.domain.clone()),
     ];
+    // A missing domain is left out, as openconnect does.
+    if !session.domain.is_empty() {
+        fields.push(("domain", session.domain.clone()));
+    }
     if let Some(ip) = &session.preferred_ip {
         fields.push(("preferred-ip", ip.clone()));
     }
