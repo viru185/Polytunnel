@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use polytunnel_core::Secret;
 use polytunnel_core::ipc::{IpsecConnect, Status, XauthLogin};
-use polytunnel_core::profile::{LocalIdType, ModeConfigStyle};
+use polytunnel_core::profile::{IpsecTransport, LocalIdType, ModeConfigStyle, ServerAuthStyle};
 use polytunnel_daemon::ipsec;
 use tokio::sync::{mpsc, watch};
 
@@ -41,6 +41,13 @@ fn request(psk: String, password: String, esp_lifetime: u32) -> IpsecConnect {
         dpd: 10,
         nat_keepalive: 5,
         client_version: "Polytunnel interop".into(),
+        ike_version: 1,
+        eap: None,
+        server_auth: ServerAuthStyle::Psk,
+        ca_pem: None,
+        remote_id: None,
+        transport: IpsecTransport::Udp,
+        tcp_port: 443,
     }
 }
 
