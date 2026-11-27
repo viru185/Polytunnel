@@ -272,12 +272,40 @@ impl IkeKeys {
     /// A complete message whose payloads are all inside an SK payload. `initiator`: which
     /// side is sending (its keys are used).
     pub fn encrypt(&self, initiator: bool, header: Header, inner: &[Payload]) -> Vec<u8> {
-        let (ek, ak) = self.keys(initiator);
         let inner_first = inner.first().map_or(payload::NONE, |p| p.kind);
-        let mut plain = encode_chain(inner);
+        self.encrypt_bytes(initiator, header, inner_first, &encode_chain(inner), None)
+    }
+
+    /// Encrypts already-encoded payloads as an SK payload, or as fragment `(number, total)`
+    /// in an SKF payload (RFC 7383).
+    pub fn encrypt_bytes(
+        &self,
+        initiator: bool,
+        header: Header,
+        inner_first: u8,
+        chain: &[u8],
+        fragment: Option<(u16, u16)>,
+    ) -> Vec<u8> {
+        let (ek, ak) = self.keys(initiator);
+        let mut plain = chain.to_vec();
+        let (kind, extra) = match fragment {
+            Some((number, total)) => {
+                let mut f = number.to_be_bytes().to_vec();
+                f.extend_from_slice(&total.to_be_bytes());
+                (payload::SKF, f)
+            }
+            None => (payload::SK, Vec::new()),
+        };
         let header = Header {
-            next: payload::SK,
+            next: kind,
             ..header
+        };
+        // The generic payload header (plus fragment fields) that precedes the IV.
+        let lead = |len: usize| {
+            let mut h = vec![inner_first, 0];
+            h.extend_from_slice(&u16::try_from(len).expect("small").to_be_bytes());
+            h.extend_from_slice(&extra);
+            h
         };
         match self.suite.encr {
             Encr::AesCbc { .. } => {
@@ -290,11 +318,9 @@ impl IkeKeys {
                 getrandom::fill(&mut iv).expect("the system random number generator failed");
                 let len = plain.len();
                 cbc_encrypt(ek, &iv, &mut plain, len);
-                let sk_len = 4 + 16 + plain.len() + icv;
+                let sk_len = 4 + extra.len() + 16 + plain.len() + icv;
                 let mut out = header.encode(sk_len).to_vec();
-                out.push(inner_first);
-                out.push(0);
-                out.extend_from_slice(&u16::try_from(sk_len).expect("small").to_be_bytes());
+                out.extend_from_slice(&lead(sk_len));
                 out.extend_from_slice(&iv);
                 out.extend_from_slice(&plain);
                 let mac = integ.prf(ak, &[&out]);
@@ -305,11 +331,9 @@ impl IkeKeys {
                 plain.push(0); // pad length
                 let mut iv = [0u8; 8];
                 getrandom::fill(&mut iv).expect("the system random number generator failed");
-                let sk_len = 4 + 8 + plain.len() + 16;
+                let sk_len = 4 + extra.len() + 8 + plain.len() + 16;
                 let mut out = header.encode(sk_len).to_vec();
-                out.push(inner_first);
-                out.push(0);
-                out.extend_from_slice(&u16::try_from(sk_len).expect("small").to_be_bytes());
+                out.extend_from_slice(&lead(sk_len));
                 let salt: [u8; 4] = ek[key_len..].try_into().expect("4-byte salt");
                 let tag = gcm_seal(&ek[..key_len], &salt, &iv, &out, &mut plain);
                 out.extend_from_slice(&iv);
