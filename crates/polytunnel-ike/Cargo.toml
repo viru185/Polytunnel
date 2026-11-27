@@ -1,6 +1,6 @@
 [package]
 name = "polytunnel-ike"
-version = "0.0.0"
+version = "0.1.0"
 description = "IKE for Polytunnel: IKEv1 aggressive mode with XAuth and mode-config (FortiGate dial-up IPsec)."
 edition.workspace = true
 rust-version.workspace = true

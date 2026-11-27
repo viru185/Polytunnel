@@ -1,6 +1,6 @@
 [package]
 name = "polytunnel-core"
-version = "0.0.0"
+version = "0.1.0"
 description = "Shared types for Polytunnel: validated values, secrets, profiles and the IPC schema."
 edition.workspace = true
 rust-version.workspace = true
