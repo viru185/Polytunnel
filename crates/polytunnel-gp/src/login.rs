@@ -131,7 +131,8 @@ pub fn parse(base: &str, computer: &str, response: &Response) -> Result<GatewayS
         .children_named("argument")
         .map(|a| {
             let v = a.text.trim();
-            if v == "(null)" {
+            // Gateways write "(null)" or "-1" for values they do not have.
+            if v == "(null)" || v == "-1" {
                 String::new()
             } else {
                 v.to_string()
@@ -224,6 +225,15 @@ mod tests {
             "authcookie=FAKE0123authcookie&portal=vpn-portal&user=user%40example.com\
              &domain=example.com&computer=WORKSTATION-1&preferred-ip=10.20.30.40"
         );
+
+        let unset = jnlp("FAKE0123authcookie").replace("10.20.30.40", "-1");
+        let unset = parse(
+            "https://gw.example.com",
+            "WORKSTATION-1",
+            &Response::new(200, unset),
+        )
+        .unwrap();
+        assert_eq!(unset.preferred_ip, None, "-1 means no preferred address");
     }
 
     #[test]
