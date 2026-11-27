@@ -120,12 +120,15 @@ jobs:
       - name: TUN, routes and DNS round trip (as root)
         if: runner.os == 'Linux'
         run: |
-          bin=$(cargo test --locked -p polytunnel-net --test system --no-run 2>&1             | grep -oE 'target/debug/deps/system-[0-9a-f]+' | head -1)
+          # Cargo reports where it put the test program (not always target/debug/deps).
+          bin=$(cargo test --locked -p polytunnel-net --test system --no-run --message-format=json | jq -r 'select(.executable != null and .target.name == "system") | .executable' | tail -1)
+          test -x "$bin"
           sudo "$bin" --ignored --test-threads=1
       - name: Kill switch (nftables, as root)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get install -y nftables
-          bin=$(cargo test --locked -p polytunnel-net --test killswitch --no-run 2>&1             | grep -oE 'target/debug/deps/killswitch-[0-9a-f]+' | head -1)
+          bin=$(cargo test --locked -p polytunnel-net --test killswitch --no-run --message-format=json | jq -r 'select(.executable != null and .target.name == "killswitch") | .executable' | tail -1)
+          test -x "$bin"
           sudo "$bin" --ignored
 
