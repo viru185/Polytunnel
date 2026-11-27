@@ -7,9 +7,9 @@ pub mod author;
 pub mod browser;
 pub mod callback;
 pub mod cli;
+pub mod connect;
 pub mod emit;
 pub mod gateways;
-pub mod http;
 pub mod paths;
 pub mod probe;
 pub mod prompter;
@@ -59,6 +59,9 @@ pub fn run(argv: Vec<OsString>, hooks: &Hooks) -> i32 {
             0
         }
         Command::Auth(args) => auth::run(&args),
+        Command::Connect(args) => connect::run_connect(&args),
+        Command::Disconnect => connect::run_disconnect(),
+        Command::Status => connect::run_status(),
         Command::Profiles => auth::list_profiles(),
         Command::Gateways(args) => gateways::run(&args),
         Command::Uri(action) => uri::run(action),

@@ -7,14 +7,15 @@ use polytunnel_core::profile::{
     FortinetSslProfile, GlobalProtectProfile, Profile, Profiles, normalize_server,
 };
 use polytunnel_forti::FortiError;
-use polytunnel_gp::flow::{self, LoginOptions};
+use polytunnel_gp::ClientInfo;
+use polytunnel_gp::flow::{self, LoginOptions, LoginResult};
 
 use crate::cli::{AuthArgs, AuthTarget};
 use crate::emit::{self, LoginOutput};
 use crate::gateways::GatewayPrefs;
-use crate::http::UreqTransport;
 use crate::prompter::{self, CliPrompter, SsoMode};
 use crate::{paths, sysinfo};
+use polytunnel_http::UreqTransport;
 
 pub fn run(args: &AuthArgs) -> i32 {
     let result = resolve(args).and_then(|profile| match profile {
@@ -35,7 +36,7 @@ pub fn run(args: &AuthArgs) -> i32 {
 }
 
 /// The profile to use, with command-line overrides applied.
-fn resolve(args: &AuthArgs) -> Result<Profile, String> {
+pub(crate) fn resolve(args: &AuthArgs) -> Result<Profile, String> {
     let mut profile = match &args.target {
         AuthTarget::Profile(name) => load_profile(name)?,
         AuthTarget::GlobalProtect(portal) => Profile::GlobalProtect(GlobalProtectProfile {
@@ -99,7 +100,13 @@ pub(crate) fn load_profile(name: &str) -> Result<Profile, String> {
     })
 }
 
-fn login_gp(profile: &GlobalProtectProfile, args: &AuthArgs) -> Result<LoginOutput, String> {
+/// A finished GlobalProtect login.
+pub(crate) struct GpLogin {
+    pub client: ClientInfo,
+    pub result: LoginResult,
+}
+
+pub(crate) fn gp_login(profile: &GlobalProtectProfile, args: &AuthArgs) -> Result<GpLogin, String> {
     let client = sysinfo::client_info(profile.client_os, profile.client_version.clone());
     let options = LoginOptions {
         portal: profile.portal.clone(),
@@ -118,9 +125,13 @@ fn login_gp(profile: &GlobalProtectProfile, args: &AuthArgs) -> Result<LoginOutp
         method: profile.probe.unwrap_or_default(),
     };
     let mut prompter = CliPrompter::new(mode, args.browser, prefs);
-    let transport = UreqTransport::new();
-    let result =
-        flow::login(&transport, &client, &options, &mut prompter).map_err(|e| e.to_string())?;
+    let result = flow::login(&UreqTransport::new(), &client, &options, &mut prompter)
+        .map_err(|e| e.to_string())?;
+    Ok(GpLogin { client, result })
+}
+
+fn login_gp(profile: &GlobalProtectProfile, args: &AuthArgs) -> Result<LoginOutput, String> {
+    let GpLogin { client, result } = gp_login(profile, args)?;
     Ok(LoginOutput {
         protocol: "gp",
         host: result.session.gateway.clone(),
@@ -132,7 +143,15 @@ fn login_gp(profile: &GlobalProtectProfile, args: &AuthArgs) -> Result<LoginOutp
     })
 }
 
-fn login_fortinet(profile: &FortinetSslProfile) -> Result<LoginOutput, String> {
+/// A finished Fortinet SSL VPN login.
+pub(crate) struct FortiLogin {
+    pub base: String,
+    pub username: String,
+    /// The `SVPNCOOKIE` value.
+    pub cookie: Secret,
+}
+
+pub(crate) fn forti_login(profile: &FortinetSslProfile) -> Result<FortiLogin, String> {
     let base = normalize_server(&profile.server).map_err(|e| e.to_string())?;
     let username = match &profile.username {
         Some(u) => u.clone(),
@@ -141,9 +160,8 @@ fn login_fortinet(profile: &FortinetSslProfile) -> Result<LoginOutput, String> {
     let password = prompter::ask_secret("Password: ").map_err(|e| e.to_string())?;
     let realm = profile.realm.clone().unwrap_or_default();
     eprintln!("Logging in to {}...", base.trim_start_matches("https://"));
-    let transport = UreqTransport::new();
     let cookie = polytunnel_forti::login(
-        &transport,
+        &UreqTransport::new(),
         &base,
         &username,
         &password,
@@ -162,6 +180,19 @@ fn login_fortinet(profile: &FortinetSslProfile) -> Result<LoginOutput, String> {
         },
     )
     .map_err(|e| e.to_string())?;
+    Ok(FortiLogin {
+        base,
+        username,
+        cookie,
+    })
+}
+
+fn login_fortinet(profile: &FortinetSslProfile) -> Result<LoginOutput, String> {
+    let FortiLogin {
+        base,
+        username,
+        cookie,
+    } = forti_login(profile)?;
     Ok(LoginOutput {
         protocol: "fortinet",
         host: base,
