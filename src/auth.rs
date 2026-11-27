@@ -62,7 +62,12 @@ pub(crate) fn resolve(args: &AuthArgs) -> Result<Profile, String> {
             override_with(&mut p.preferred_gateway, &args.prefer);
         }
         Profile::FortinetSsl(p) => {
-            if args.gateway.is_some() || args.prefer.is_some() || args.paste || !args.browser {
+            if args.gateway.is_some()
+                || args.prefer.is_some()
+                || args.paste
+                || !args.browser
+                || args.embedded
+            {
                 return Err(
                     "--gateway, --prefer, --paste and --no-browser are for GlobalProtect".into(),
                 );
@@ -75,6 +80,7 @@ pub(crate) fn resolve(args: &AuthArgs) -> Result<Profile, String> {
                 || args.prefer.is_some()
                 || args.paste
                 || !args.browser
+                || args.embedded
                 || args.realm.is_some()
             {
                 return Err("IPsec profiles only take --user".into());
@@ -131,6 +137,8 @@ pub(crate) fn gp_login(profile: &GlobalProtectProfile, args: &AuthArgs) -> Resul
     };
     let mode = if args.paste {
         SsoMode::Paste
+    } else if args.embedded || profile.embedded_login == Some(true) {
+        SsoMode::Embedded
     } else {
         SsoMode::Callback
     };
@@ -273,6 +281,7 @@ mod tests {
             realm: None,
             paste: false,
             browser: true,
+            embedded: false,
         }
     }
 

@@ -90,6 +90,9 @@ polytunnel auth fortinet vpn.example.net:10443 --user me --emit cookie \
 - The first browser login registers Polytunnel for `globalprotectcallback:` links for your
   user account (`polytunnel uri status|register|unregister`). If the browser cannot hand the
   login back, add `--paste` and paste the link (or the final page's source) into the terminal.
+- On Windows and macOS, `--embedded` (or `embedded-login = true` in the profile, or the
+  checkbox in the window) signs in in Polytunnel's own small login window instead of the
+  browser; it catches the result by itself.
 - Without `--gateway`, Polytunnel measures every gateway's TLS handshake time in parallel and
   picks the best one the way the official app does (source region, then the Highest/High/Medium
   pool before Low/Lowest, then speed). `--prefer <name>` uses a gateway when it answers and

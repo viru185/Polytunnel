@@ -37,6 +37,8 @@ pub struct AuthArgs {
     pub paste: bool,
     /// GlobalProtect: open the browser (false: print the URL).
     pub browser: bool,
+    /// GlobalProtect: sign in in Polytunnel's own login window.
+    pub embedded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +102,7 @@ Auth options:
       --paste            GlobalProtect: paste the browser's login result into the
                          terminal instead of waiting for the globalprotectcallback: link
       --no-browser       GlobalProtect: print the sign-in address instead of opening it
+      --embedded         GlobalProtect: sign in in Polytunnel's own login window
 
 Gateways options:
       --refresh          Log in to the portal again instead of using the saved list
@@ -142,6 +145,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     let mut emit = None;
     let (mut user, mut gateway, mut prefer, mut realm) = (None, None, None, None);
     let (mut paste, mut no_browser, mut refresh, mut json) = (false, false, false, false);
+    let mut embedded = false;
 
     let value = |parser: &mut lexopt::Parser| -> Result<String, String> {
         parser
@@ -176,6 +180,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             }
             Long("paste") => paste = true,
             Long("no-browser") => no_browser = true,
+            Long("embedded") => embedded = true,
             Long("refresh") => refresh = true,
             Long("json") => json = true,
             Value(v) => positionals.push(
@@ -191,7 +196,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         || realm.is_some()
         || emit.is_some()
         || paste
-        || no_browser;
+        || no_browser
+        || embedded;
     let gateways_only = refresh || json;
     let has_prefer = prefer.is_some();
 
@@ -227,6 +233,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                 realm,
                 paste,
                 browser: !no_browser,
+                embedded,
             })
         }
         Some("connect") => {
@@ -242,6 +249,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                 realm,
                 paste,
                 browser: !no_browser,
+                embedded,
             })
         }
         Some("disconnect") => Command::Disconnect,
@@ -297,6 +305,7 @@ mod tests {
             realm: None,
             paste: false,
             browser: true,
+            embedded: false,
         }
     }
 

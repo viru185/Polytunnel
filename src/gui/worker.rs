@@ -202,6 +202,7 @@ fn login_gp(
     let mut prompter = GuiPrompter {
         events,
         cancel,
+        embedded: p.embedded_login == Some(true),
         listener: None,
         prefs: GatewayPrefs {
             preferred: p.preferred_gateway.clone(),
@@ -273,6 +274,8 @@ fn login_fortinet(
 struct GuiPrompter<'a> {
     events: &'a Notifier,
     cancel: &'a AtomicBool,
+    /// Sign in in the embedded login window instead of the browser.
+    embedded: bool,
     listener: Option<callback::Listener>,
     prefs: GatewayPrefs,
 }
@@ -284,6 +287,15 @@ impl Prompter for GuiPrompter<'_> {
         server: &str,
         request: &SamlRequest,
     ) -> Result<SsoResult, GpError> {
+        if self.embedded {
+            let host = server.trim_start_matches("https://");
+            self.events.progress(format!(
+                "Single sign-on for the {} {host}: complete it in the login window.",
+                iface.label()
+            ));
+            return crate::embedded::login(request, &format!("Sign in to {host}"))
+                .map_err(GpError::SsoFailed);
+        }
         if self.listener.is_none() {
             self.listener = callback::Listener::start().ok();
         }

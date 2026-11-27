@@ -9,6 +9,7 @@ pub mod browser;
 pub mod callback;
 pub mod cli;
 pub mod connect;
+pub mod embedded;
 pub mod emit;
 pub mod forticlient;
 pub mod gateways;

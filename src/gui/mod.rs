@@ -104,6 +104,7 @@ struct Editor {
     realm: String,
     strict_tiers: bool,
     tcp_probe: bool,
+    embedded: bool,
     local_id: String,
     dh_group: String,
     pfs: bool,
@@ -129,6 +130,7 @@ impl Editor {
             realm: String::new(),
             strict_tiers: false,
             tcp_probe: false,
+            embedded: false,
             local_id: String::new(),
             dh_group: crate::ipsec::DEFAULT_DH_GROUP.to_string(),
             pfs: true,
@@ -153,6 +155,7 @@ impl Editor {
                 preferred: text(&p.preferred_gateway),
                 strict_tiers: p.gateway_selection == Some(GatewayPolicy::StrictTiers),
                 tcp_probe: p.probe == Some(ProbeMethod::Tcp),
+                embedded: p.embedded_login == Some(true),
                 ..Editor::new(Kind::GlobalProtect)
             },
             Profile::FortinetSsl(p) => Editor {
@@ -211,6 +214,7 @@ impl Editor {
                 preferred_gateway: opt(&self.preferred),
                 gateway_selection: self.strict_tiers.then_some(GatewayPolicy::StrictTiers),
                 probe: self.tcp_probe.then_some(ProbeMethod::Tcp),
+                embedded_login: self.embedded.then_some(true),
                 ..Default::default()
             }),
             Kind::FortinetSsl => Profile::FortinetSsl(FortinetSslProfile {
@@ -682,6 +686,14 @@ impl App {
                             "Measure the TCP handshake instead of TLS",
                         );
                         ui.end_row();
+                        if crate::embedded::helper().is_some() {
+                            ui.label("");
+                            ui.checkbox(
+                                &mut editor.embedded,
+                                "Sign in in Polytunnel's own window instead of the browser",
+                            );
+                            ui.end_row();
+                        }
                     }
                     Kind::FortinetSsl => {
                         ui.label("Realm (optional)");
