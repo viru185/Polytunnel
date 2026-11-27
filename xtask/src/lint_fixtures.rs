@@ -408,7 +408,10 @@ mod tests {
             ]
         );
         assert!(ipv4_candidates("version 10.0.26300.1 and v1.2.3.4 and x1.2.3.4").is_empty());
-        assert!(ipv4_candidates(r#"<assemblyIdentity version="8.8.4.4"/> version='9.9.9.9'"#).is_empty());
+        assert!(
+            ipv4_candidates(r#"<assemblyIdentity version="8.8.4.4"/> version='9.9.9.9'"#)
+                .is_empty()
+        );
         assert!(ipv4_candidates("999.1.1.1 1.2.3").is_empty());
     }
 
