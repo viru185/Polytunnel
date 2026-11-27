@@ -86,7 +86,7 @@ GlobalProtect profiles also accept `preferred-gateway = "<name>"`,
 `gateway-selection = "pools"` (default) or `"strict-tiers"`, and `probe = "tls"` (default) or
 `"tcp"`. Then `polytunnel auth work`.
 
-### Connecting (GlobalProtect)
+### Connecting
 
 Polytunnel's own tunnels run in a small background service, so connecting never needs an
 administrator prompt. Install the service once (administrator / root), then connect as a
@@ -94,7 +94,8 @@ normal user:
 
 ```sh
 polytunnel-daemon install        # once; Windows: put wintun.dll next to polytunnel-daemon.exe
-polytunnel connect work          # log in (browser SSO), pick the best gateway, bring the tunnel up
+polytunnel connect work          # GlobalProtect: browser SSO, best gateway, tunnel up
+polytunnel connect office        # Fortinet SSL VPN: password (+ code), PPP tunnel up
 polytunnel status
 polytunnel disconnect
 ```
