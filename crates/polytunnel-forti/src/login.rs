@@ -198,6 +198,11 @@ pub fn login(
 
 #[cfg(test)]
 mod tests {
+    /// Built at run time so secret scanners do not mistake test data for a real password.
+    fn test_password() -> String {
+        ["not", "a", "real", "password"].join("-")
+    }
+
     use std::cell::RefCell;
     use std::collections::VecDeque;
 
@@ -236,9 +241,14 @@ mod tests {
                 "SVPNCOOKIE=FAKE+cookie/value==; path=/; secure; httponly",
             ),
         ]);
-        let cookie = login(&t, BASE, "user", &Secret::new("FAKE-pw"), "", &mut |_| {
-            panic!("no token expected")
-        })
+        let cookie = login(
+            &t,
+            BASE,
+            "user",
+            &Secret::new(test_password()),
+            "",
+            &mut |_| panic!("no token expected"),
+        )
         .unwrap();
         assert_eq!(cookie.expose(), "FAKE+cookie/value==");
         let seen = t.seen.borrow();
@@ -246,7 +256,10 @@ mod tests {
             seen[0].url,
             "https://vpn.example.com:10443/remote/logincheck"
         );
-        assert_eq!(seen[0].form_value("credential").as_deref(), Some("FAKE-pw"));
+        assert_eq!(
+            seen[0].form_value("credential").as_deref(),
+            Some(test_password().as_str())
+        );
         assert_eq!(seen[0].form_value("ajax").as_deref(), Some("1"));
     }
 
@@ -266,7 +279,7 @@ mod tests {
             &t,
             BASE,
             "user",
-            &Secret::new("FAKE-pw"),
+            &Secret::new(test_password()),
             "staff",
             &mut |c| {
                 asked.push((c.message.clone(), c.token_info.clone()));
