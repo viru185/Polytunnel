@@ -239,6 +239,11 @@ fn ipv4_candidates(line: &str) -> Vec<Ipv4Addr> {
         if glued(before) || before == Some(b'.') || glued(after) {
             continue; // part of a version, identifier or longer dotted sequence
         }
+        // `version="1.0.0.0"` (manifests, package metadata) is a version, not an address.
+        let prefix = line[..start].to_ascii_lowercase();
+        if prefix.ends_with("version=\"") || prefix.ends_with("version='") {
+            continue;
+        }
         let parts: Vec<&str> = run.split('.').collect();
         if parts.len() == 4
             && parts.iter().all(|p| (1..=3).contains(&p.len()))
@@ -403,6 +408,7 @@ mod tests {
             ]
         );
         assert!(ipv4_candidates("version 10.0.26300.1 and v1.2.3.4 and x1.2.3.4").is_empty());
+        assert!(ipv4_candidates(r#"<assemblyIdentity version="8.8.4.4"/> version='9.9.9.9'"#).is_empty());
         assert!(ipv4_candidates("999.1.1.1 1.2.3").is_empty());
     }
 
