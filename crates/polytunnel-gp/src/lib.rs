@@ -23,11 +23,13 @@
 pub mod client;
 pub mod error;
 pub mod flow;
+pub mod hip;
 pub mod login;
 pub mod portal;
 pub mod prelogin;
 pub mod rank;
 pub mod sso;
+pub mod tunnel;
 
 pub use client::ClientInfo;
 pub use error::GpError;

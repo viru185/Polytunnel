@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 base64.workspace = true
 form_urlencoded.workspace = true
+md5.workspace = true
 polytunnel-core.workspace = true
 serde.workspace = true
 
