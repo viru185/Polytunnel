@@ -3,7 +3,7 @@
 use std::io;
 use std::net::IpAddr;
 
-use super::{System, args, if_index, if_name, run};
+use super::{System, args, if_index, if_name, route_already_gone, run};
 use crate::plan::{Change, Via};
 
 pub struct Linux;
@@ -48,6 +48,9 @@ impl System for Linux {
     }
 
     fn revert(&mut self, change: &Change) -> io::Result<()> {
+        if route_already_gone(change) {
+            return Ok(());
+        }
         if let Some(args) = route_args(false, change)? {
             return match run("ip", &args) {
                 Ok(_) => Ok(()),

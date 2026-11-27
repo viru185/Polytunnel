@@ -46,6 +46,15 @@ pub enum Via {
     },
 }
 
+impl Via {
+    /// The interface the route uses.
+    pub fn if_index(&self) -> u32 {
+        match *self {
+            Via::Tunnel { if_index } | Via::Gateway { if_index, .. } => if_index,
+        }
+    }
+}
+
 /// One reversible change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "change")]
