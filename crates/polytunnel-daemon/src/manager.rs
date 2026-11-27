@@ -10,7 +10,8 @@ use tokio::runtime::Runtime;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::gp::{self, StatusCell};
+use crate::common::StatusCell;
+use crate::gp;
 use crate::{info, paths, warn};
 
 struct Running {
@@ -97,16 +98,10 @@ impl Manager {
                 info!("connect request for profile '{profile}' (GlobalProtect)");
                 self.runtime.spawn(gp::run(*gp, status, stop_rx))
             }
-            Connect::FortinetSsl(_) => {
-                *self.status.lock().unwrap_or_else(|e| e.into_inner()) = Status::Failed {
-                    profile,
-                    message: "Fortinet SSL VPN tunnels are not available in this version yet"
-                        .into(),
-                };
-                return Response::Error {
-                    message: "Fortinet SSL VPN tunnels are not available in this version yet"
-                        .into(),
-                };
+            Connect::FortinetSsl(forti) => {
+                info!("connect request for profile '{profile}' (Fortinet SSL VPN)");
+                self.runtime
+                    .spawn(crate::forti::run(forti, status, stop_rx))
             }
         };
         *self.current.lock().unwrap_or_else(|e| e.into_inner()) = Some(Running { stop, task });

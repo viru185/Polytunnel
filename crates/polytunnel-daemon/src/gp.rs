@@ -8,8 +8,7 @@
 //! 5. On disconnect: log out, remove the device, roll the network changes back.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use polytunnel_core::http::Transport;
 use polytunnel_core::ipc::{GpConnect, Status};
@@ -19,44 +18,25 @@ use polytunnel_gp::tunnel::{self, EspHmac, EspSettings, TunnelSettings, frame};
 use polytunnel_gp::{ClientInfo, hip};
 use polytunnel_http::UreqTransport;
 use polytunnel_net::journal::Journal;
-use polytunnel_net::plan::{Context, plan};
 use polytunnel_net::system::System;
-use polytunnel_net::tun::{self, TunOptions};
 use polytunnel_net::{Prefix, TunnelConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::watch;
 use tokio::time::timeout;
 
+use crate::common::{
+    Ended, STEP_TIMEOUT, StatusCell, blocking, bring_up, host_port, now_unix, set,
+};
 use crate::packets::{self, Channels, Pump};
 use crate::{info, paths, warn};
 
-pub type StatusCell = Arc<Mutex<Status>>;
-
-const STEP_TIMEOUT: Duration = Duration::from_secs(15);
 const TLS_KEEPALIVE: Duration = Duration::from_secs(30);
 const ESP_KEEPALIVE: Duration = Duration::from_secs(10);
 const ESP_DEAD_AFTER: Duration = Duration::from_secs(45);
 const TLS_RECONNECTS: usize = 3;
 const PROBE_ID: u16 = 0x7054;
 const PROBE_PAYLOAD: &[u8] = b"polytunnel esp probe";
-
-/// How a transport loop ended.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Ended {
-    Stopped,
-    Lost(String),
-}
-
-fn set(status: &StatusCell, value: Status) {
-    *status.lock().unwrap_or_else(|e| e.into_inner()) = value;
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
 
 /// `MM/DD/YYYY HH:MM:SS` in UTC (for HIP reports).
 fn hip_time() -> String {
@@ -79,14 +59,6 @@ fn hip_time() -> String {
     )
 }
 
-async fn blocking<T: Send + 'static>(
-    f: impl FnOnce() -> Result<T, String> + Send + 'static,
-) -> Result<T, String> {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| e.to_string())?
-}
-
 fn client_and_session(c: &GpConnect) -> (ClientInfo, GatewaySession) {
     let client = ClientInfo {
         os: c.client.os,
@@ -106,21 +78,6 @@ fn client_and_session(c: &GpConnect) -> (ClientInfo, GatewaySession) {
         preferred_ipv6: c.preferred_ipv6.clone(),
     };
     (client, session)
-}
-
-/// `https://host[:port]` -> (host for SNI, port).
-fn host_port(base: &str) -> (String, u16) {
-    let authority = base.trim_start_matches("https://");
-    if let Some(v6) = authority.strip_prefix('[')
-        && let Some((host, rest)) = v6.split_once(']')
-    {
-        let port = rest.trim_start_matches(':').parse().unwrap_or(443);
-        return (host.to_string(), port);
-    }
-    match authority.rsplit_once(':') {
-        Some((host, port)) => (host.to_string(), port.parse().unwrap_or(443)),
-        None => (authority.to_string(), 443),
-    }
 }
 
 /// The network plan input for the gateway's settings.
@@ -213,37 +170,7 @@ async fn connect_and_run(
     servers.extend(settings.gateway_address);
 
     let config = tunnel_config(&settings, servers.clone());
-    let device = Arc::new(
-        tun::open(&TunOptions {
-            name: "Polytunnel".into(),
-            guid: Some(tun::stable_guid(&c.profile)),
-            addresses: config.addresses.clone(),
-            mtu: config.mtu,
-            wintun_dll: paths::wintun_dll(),
-        })
-        .map_err(|e| format!("cannot create the tunnel interface: {e}"))?,
-    );
-    let tunnel_if = device.if_index().map_err(|e| e.to_string())?;
-
-    let mut server_routes = Vec::new();
-    for server in &servers {
-        if let Ok((gateway, index)) = system.route_to(*server) {
-            server_routes.push((*server, gateway, index));
-        }
-    }
-    let context = Context {
-        tunnel_if,
-        server_routes,
-        default_v4: system
-            .route_to("203.0.113.1".parse().expect("constant"))
-            .ok(),
-        default_v6: system
-            .route_to("2001:db8::1".parse().expect("constant"))
-            .ok(),
-    };
-    journal
-        .apply_all(system, plan(&config, &context))
-        .map_err(|e| format!("cannot configure the network: {e}"))?;
+    let device = bring_up(&c.profile, &config, journal, system)?;
 
     if let Some((ip, _)) = settings.address_v4 {
         let (client, session) = (client.clone(), session.clone());
@@ -743,18 +670,6 @@ mod tests {
         assert_eq!(config.addresses, vec!["10.20.30.40/32".parse().unwrap()]);
         assert_eq!(config.routes, vec!["10.0.0.0/8".parse().unwrap()]);
         assert_eq!(config.mtu, 1300);
-        assert_eq!(
-            host_port("https://gw.example.com"),
-            ("gw.example.com".into(), 443)
-        );
-        assert_eq!(
-            host_port("https://gw.example.com:8443"),
-            ("gw.example.com".into(), 8443)
-        );
-        assert_eq!(
-            host_port("https://[2001:db8::1]:4443"),
-            ("2001:db8::1".into(), 4443)
-        );
         let t = hip_time();
         assert_eq!(t.len(), 19, "{t}");
         assert_eq!(&t[2..3], "/");

@@ -18,10 +18,12 @@ path = "src/main.rs"
 
 [dependencies]
 interprocess.workspace = true
+getrandom.workspace = true
 lexopt.workspace = true
 native-tls.workspace = true
 polytunnel-core.workspace = true
 polytunnel-esp.workspace = true
+polytunnel-forti.workspace = true
 polytunnel-gp.workspace = true
 polytunnel-http.workspace = true
 polytunnel-net.workspace = true
