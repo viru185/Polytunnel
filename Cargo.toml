@@ -28,6 +28,9 @@ assets = [
   ["assets/polytunnel.png", "usr/share/icons/hicolor/256x256/apps/polytunnel.png", "644"],
   ["README.md", "usr/share/doc/polytunnel/README.md", "644"],
 ]
+# cargo-deb writes the scripts that enable and start the service only when
+# maintainer-scripts is set; packaging/linux holds no scripts of its own.
+maintainer-scripts = "packaging/linux"
 systemd-units = { unit-name = "polytunnel-daemon", unit-scripts = "packaging/linux", enable = true, start = true }
 
 [package.metadata.generate-rpm]
