@@ -1,6 +1,6 @@
 [package]
 name = "polytunnel-net"
-version = "0.0.0"
+version = "0.1.0"
 description = "Network setup for Polytunnel: TUN device, routes, DNS and a rollback journal."
 edition.workspace = true
 rust-version.workspace = true

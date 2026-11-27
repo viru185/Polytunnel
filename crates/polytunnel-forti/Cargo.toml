@@ -1,6 +1,6 @@
 [package]
 name = "polytunnel-forti"
-version = "0.0.0"
+version = "0.1.0"
 description = "Fortinet for Polytunnel: SSL VPN login (with two-factor) and FortiClient profile import."
 edition.workspace = true
 rust-version.workspace = true

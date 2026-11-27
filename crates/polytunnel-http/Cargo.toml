@@ -1,6 +1,6 @@
 [package]
 name = "polytunnel-http"
-version = "0.0.0"
+version = "0.1.0"
 description = "HTTPS transport for Polytunnel's protocol crates: ureq with the OS TLS stack and trust store."
 edition.workspace = true
 rust-version.workspace = true

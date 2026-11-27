@@ -1,6 +1,6 @@
 [package]
 name = "polytunnel-sso"
-version = "0.0.0"
+version = "0.1.0"
 description = "Polytunnel's optional embedded login window for single sign-on (GlobalProtect SAML)."
 edition.workspace = true
 rust-version.workspace = true

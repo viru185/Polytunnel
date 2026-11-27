@@ -1,6 +1,6 @@
 [package]
 name = "polytunnel-esp"
-version = "0.0.0"
+version = "0.1.0"
 description = "ESP (RFC 4303) for Polytunnel: security associations, replay window, UDP encapsulation."
 edition.workspace = true
 rust-version.workspace = true
