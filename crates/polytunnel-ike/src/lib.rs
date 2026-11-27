@@ -14,6 +14,7 @@ pub mod dh;
 pub mod eap;
 pub mod prf;
 pub mod session;
+pub mod tcp;
 pub mod v1;
 pub mod v2;
 
