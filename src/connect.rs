@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use interprocess::local_socket::{Stream, prelude::*};
 use polytunnel_core::Secret;
 use polytunnel_core::ipc::{
-    self, ClientFacts, Connect, FortiConnect, GpConnect, PROTOCOL_VERSION, Request, Response,
-    Status,
+    self, ClientFacts, Connect, FortiConnect, GpConnect, PROTOCOL_VERSION, Prompt, Request,
+    Response, Status,
 };
 use polytunnel_core::profile::Profile;
 use polytunnel_gp::ClientInfo;
@@ -16,6 +16,7 @@ use polytunnel_gp::login::GatewaySession;
 
 use crate::auth::{self, FortiLogin, GpLogin};
 use crate::cli::AuthArgs;
+use crate::{ipsec, prompter};
 
 /// How long to wait for the service to bring a tunnel up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
@@ -78,6 +79,9 @@ pub fn describe(status: &Status) -> String {
     match status {
         Status::Idle {} => "Not connected.".into(),
         Status::Connecting { profile } => format!("Connecting ({profile})..."),
+        Status::NeedsInput { profile, .. } => {
+            format!("Connecting ({profile}): waiting for your sign-in input...")
+        }
         Status::Connected {
             profile,
             server,
@@ -144,7 +148,52 @@ fn connect_request(args: &AuthArgs) -> Result<Connect, String> {
             let FortiLogin { base, cookie, .. } = auth::forti_login(&p)?;
             forti_connect(profile, base, cookie)
         }
+        Profile::FortinetIpsec(p) => {
+            let io = |e: std::io::Error| e.to_string();
+            let server = ipsec::server_host(&p)?;
+            eprintln!("IPsec tunnel to {server}");
+            let psk = prompter::ask_secret("Pre-shared key: ").map_err(io)?;
+            let xauth = if ipsec::uses_xauth(&p) {
+                let username = match &p.username {
+                    Some(u) => u.clone(),
+                    None => prompter::ask("Username: ").map_err(io)?,
+                };
+                Some((username, prompter::ask_secret("Password: ").map_err(io)?))
+            } else {
+                None
+            };
+            ipsec::connect_request(profile, &p, ipsec::Secrets { psk, xauth })?
+        }
     })
+}
+
+/// Answers a service prompt on the terminal.
+fn ask_on_terminal(prompt: &Prompt) -> Result<Vec<Secret>, String> {
+    if let Some(message) = &prompt.message {
+        eprintln!("{message}");
+    }
+    prompt
+        .fields
+        .iter()
+        .map(|f| {
+            let label = format!("{}: ", f.label);
+            if f.secret {
+                prompter::ask_secret(&label)
+            } else {
+                prompter::ask(&label).map(Secret::new)
+            }
+            .map_err(|e| e.to_string())
+        })
+        .collect()
+}
+
+/// Sends the user's answer to a service prompt.
+pub fn answer(id: u32, values: Vec<Secret>) -> Result<(), String> {
+    match request(&Request::Answer { id, values })? {
+        Response::Accepted {} => Ok(()),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected answer from the service: {other:?}")),
+    }
 }
 
 /// Hands `connect` to the service.
@@ -156,15 +205,33 @@ pub fn send_connect(connect: Connect) -> Result<(), String> {
     }
 }
 
-/// Polls the service until the tunnel is up or has failed.
-pub fn wait_connected(on_status: &mut dyn FnMut(&Status)) -> Result<Status, String> {
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
+/// Polls the service until the tunnel is up or has failed, answering its prompts (one-time
+/// codes during IPsec sign-in) with `on_prompt`. Cancelling a prompt disconnects.
+pub fn wait_connected(
+    on_status: &mut dyn FnMut(&Status),
+    on_prompt: &mut dyn FnMut(&Prompt) -> Result<Vec<Secret>, String>,
+) -> Result<Status, String> {
+    let mut deadline = Instant::now() + CONNECT_TIMEOUT;
+    let mut answered = None;
     loop {
         let s = status()?;
         on_status(&s);
-        match s {
+        match &s {
             Status::Connected { .. } => return Ok(s),
             Status::Failed { .. } => return Err(describe(&s)),
+            Status::NeedsInput { prompt, .. } if answered != Some(prompt.id) => {
+                let values = match on_prompt(prompt) {
+                    Ok(values) => values,
+                    Err(e) => {
+                        let _ = disconnect();
+                        return Err(e);
+                    }
+                };
+                answer(prompt.id, values)?;
+                answered = Some(prompt.id);
+                // Time spent typing does not count against the connection.
+                deadline = Instant::now() + CONNECT_TIMEOUT;
+            }
             _ if Instant::now() < deadline => thread::sleep(Duration::from_millis(500)),
             _ => {
                 return Err(format!(
@@ -195,7 +262,7 @@ pub fn run_connect(args: &AuthArgs) -> i32 {
         return 1;
     }
     eprintln!("Bringing the tunnel up...");
-    match wait_connected(&mut |_| {}) {
+    match wait_connected(&mut |_| {}, &mut ask_on_terminal) {
         Ok(s) => {
             println!("{}", describe(&s));
             0

@@ -21,6 +21,10 @@ pub fn run(args: &AuthArgs) -> i32 {
     let result = resolve(args).and_then(|profile| match profile {
         Profile::GlobalProtect(p) => login_gp(&p, args),
         Profile::FortinetSsl(p) => login_fortinet(&p),
+        Profile::FortinetIpsec(_) => Err(
+            "IPsec has no web login to hand to another client; connect with              'polytunnel connect <profile>' instead"
+                .into(),
+        ),
     });
     match result {
         Ok(out) => {
@@ -65,6 +69,17 @@ pub(crate) fn resolve(args: &AuthArgs) -> Result<Profile, String> {
             }
             override_with(&mut p.username, &args.user);
             override_with(&mut p.realm, &args.realm);
+        }
+        Profile::FortinetIpsec(p) => {
+            if args.gateway.is_some()
+                || args.prefer.is_some()
+                || args.paste
+                || !args.browser
+                || args.realm.is_some()
+            {
+                return Err("IPsec profiles only take --user".into());
+            }
+            override_with(&mut p.username, &args.user);
         }
     }
     Ok(profile)
@@ -223,6 +238,7 @@ pub fn list_profiles() -> i32 {
                     let target = match profile {
                         Profile::GlobalProtect(p) => &p.portal,
                         Profile::FortinetSsl(p) => &p.server,
+                        Profile::FortinetIpsec(p) => &p.server,
                     };
                     println!("  {name:<20} {:<18} {target}", profile.kind());
                 }

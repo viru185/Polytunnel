@@ -14,6 +14,7 @@ pub mod forticlient;
 pub mod gateways;
 pub mod gui;
 pub mod instance;
+pub mod ipsec;
 pub mod paths;
 pub mod probe;
 pub mod prompter;

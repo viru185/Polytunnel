@@ -8,8 +8,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use polytunnel_core::Secret;
+use polytunnel_core::ipc;
 use polytunnel_core::profile::{
-    FortinetSslProfile, GlobalProtectProfile, Profile, normalize_server,
+    FortinetIpsecProfile, FortinetSslProfile, GlobalProtectProfile, Profile, normalize_server,
 };
 use polytunnel_forti::FortiError;
 use polytunnel_gp::GpError;
@@ -20,7 +21,7 @@ use polytunnel_gp::sso::{self, SsoResult};
 use polytunnel_http::UreqTransport;
 
 use crate::gateways::{self, GatewayPrefs};
-use crate::{browser, callback, connect, sysinfo, uri};
+use crate::{browser, callback, connect, ipsec, sysinfo, uri};
 
 const SSO_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
@@ -34,7 +35,9 @@ pub enum Prompt {
         username: Option<String>,
         reply: Sender<Option<(String, Secret)>>,
     },
+    /// One hidden value: a verification code, a pre-shared key, ...
     Code {
+        title: String,
         message: String,
         reply: Sender<Option<Secret>>,
     },
@@ -108,14 +111,75 @@ fn run(
     let request = match profile {
         Profile::GlobalProtect(p) => login_gp(name, p, events, cancel)?,
         Profile::FortinetSsl(p) => login_fortinet(name, p, events)?,
+        Profile::FortinetIpsec(p) => ipsec_request(name, p, events)?,
     };
     if cancel.load(Ordering::SeqCst) {
         return Err("cancelled".into());
     }
     connect::send_connect(request)?;
     events.progress("Bringing the tunnel up...");
-    let status = connect::wait_connected(&mut |_| {})?;
+    let status = connect::wait_connected(&mut |_| {}, &mut |prompt| {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("cancelled".into());
+        }
+        answer_prompt(prompt, events)
+    })?;
     Ok(connect::describe(&status))
+}
+
+/// Asks one hidden value in the window; `None` when the user cancels.
+fn ask_hidden(events: &Notifier, title: String, message: String) -> Option<Secret> {
+    let (reply, answer) = mpsc::channel();
+    events.send(Event::Prompt(Prompt::Code {
+        title,
+        message,
+        reply,
+    }));
+    answer.recv().ok().flatten()
+}
+
+/// The service needs more sign-in input (a one-time code, ...): ask for each field.
+fn answer_prompt(prompt: &ipc::Prompt, events: &Notifier) -> Result<Vec<Secret>, String> {
+    prompt
+        .fields
+        .iter()
+        .map(|field| {
+            let message = prompt.message.clone().unwrap_or_else(|| {
+                format!("The gateway asks for your {}.", field.label.to_lowercase())
+            });
+            ask_hidden(events, field.label.clone(), message).ok_or_else(|| "cancelled".to_string())
+        })
+        .collect()
+}
+
+fn ipsec_request(
+    name: &str,
+    p: &FortinetIpsecProfile,
+    events: &Notifier,
+) -> Result<ipc::Connect, String> {
+    let server = ipsec::server_host(p)?;
+    let psk = ask_hidden(
+        events,
+        "Pre-shared key".into(),
+        format!("The pre-shared key of the IPsec tunnel to {server}."),
+    )
+    .ok_or("cancelled")?;
+    let xauth = if ipsec::uses_xauth(p) {
+        let (reply, answer) = mpsc::channel();
+        events.send(Event::Prompt(Prompt::Credentials {
+            title: format!("Sign in to {server}"),
+            message: None,
+            username_label: "Username".into(),
+            password_label: "Password".into(),
+            username: p.username.clone(),
+            reply,
+        }));
+        Some(answer.recv().ok().flatten().ok_or("cancelled")?)
+    } else {
+        None
+    };
+    events.progress(format!("Negotiating IPsec with {server}..."));
+    ipsec::connect_request(name.to_string(), p, ipsec::Secrets { psk, xauth })
 }
 
 fn login_gp(
@@ -123,7 +187,7 @@ fn login_gp(
     p: &GlobalProtectProfile,
     events: &Notifier,
     cancel: &AtomicBool,
-) -> Result<polytunnel_core::ipc::Connect, String> {
+) -> Result<ipc::Connect, String> {
     let client = sysinfo::client_info(p.client_os, p.client_version.clone());
     let options = LoginOptions {
         portal: p.portal.clone(),
@@ -154,7 +218,7 @@ fn login_fortinet(
     name: &str,
     p: &FortinetSslProfile,
     events: &Notifier,
-) -> Result<polytunnel_core::ipc::Connect, String> {
+) -> Result<ipc::Connect, String> {
     let base = normalize_server(&p.server).map_err(|e| e.to_string())?;
     let (reply, answer) = mpsc::channel();
     events.send(Event::Prompt(Prompt::Credentials {
@@ -190,7 +254,11 @@ fn login_fortinet(
             {
                 message.push_str("\n(Approve the push notification, then press OK.)");
             }
-            events.send(Event::Prompt(Prompt::Code { message, reply }));
+            events.send(Event::Prompt(Prompt::Code {
+                title: "Verification code".into(),
+                message,
+                reply,
+            }));
             answer.recv().ok().flatten().ok_or(FortiError::Cancelled)
         },
     )

@@ -186,7 +186,7 @@ impl Agent {
         let connected = matches!(status, Ok(Status::Connected { .. }));
         let active = matches!(
             status,
-            Ok(Status::Connected { .. } | Status::Connecting { .. })
+            Ok(Status::Connected { .. } | Status::Connecting { .. } | Status::NeedsInput { .. })
         );
         self.status_item.set_text(&text);
         self.disconnect_item.set_enabled(active);
