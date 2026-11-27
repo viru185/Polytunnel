@@ -51,6 +51,10 @@ pub enum Request {
     KillSwitch {
         set: Option<KillSwitchSettings>,
     },
+    /// Looks for a newer release (signed manifest), and installs it when `install`.
+    Update {
+        install: bool,
+    },
 }
 
 /// When traffic outside the tunnel is blocked.
@@ -229,6 +233,15 @@ pub enum Response {
         active: bool,
         /// Why the rules could not be applied, if they could not.
         problem: Option<String>,
+    },
+    Update {
+        /// The running service's version.
+        current: String,
+        /// The latest release's version, when it could be checked.
+        latest: Option<String>,
+        /// An installation has started (the service restarts when it is done).
+        installing: bool,
+        message: String,
     },
 }
 

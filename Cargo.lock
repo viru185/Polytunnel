@@ -3824,6 +3824,7 @@ dependencies = [
 name = "polytunnel-daemon"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "getrandom 0.4.3",
  "interprocess",
  "lexopt",
@@ -3836,6 +3837,10 @@ dependencies = [
  "polytunnel-http",
  "polytunnel-ike",
  "polytunnel-net",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2",
  "tokio",
  "tokio-native-tls",
  "widestring",

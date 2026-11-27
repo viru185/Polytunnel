@@ -17,6 +17,7 @@ name = "polytunnel-daemon"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
 interprocess.workspace = true
 getrandom.workspace = true
 lexopt.workspace = true
@@ -28,6 +29,10 @@ polytunnel-gp.workspace = true
 polytunnel-http.workspace = true
 polytunnel-ike.workspace = true
 polytunnel-net.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-native-tls.workspace = true
 zeroize.workspace = true
