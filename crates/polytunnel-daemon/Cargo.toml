@@ -1,0 +1,30 @@
+[package]
+name = "polytunnel-daemon"
+version = "0.0.0"
+description = "Polytunnel background service: owns tunnels, routes, DNS and the kill switch."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "polytunnel_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "polytunnel-daemon"
+path = "src/main.rs"
+
+[dependencies]
+lexopt.workspace = true
+polytunnel-core.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

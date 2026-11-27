@@ -1,0 +1,20 @@
+# Build output
+/target
+/dist
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local tooling
+.claude/
+
+# Never commit captures, raw logs or real server responses (see CONTRIBUTING.md)
+*.pcap
+*.pcapng
+*.har
+*.log
+/captures/
