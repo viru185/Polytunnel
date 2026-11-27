@@ -816,12 +816,14 @@ dependencies = [
 name = "polytunnel-daemon"
 version = "0.0.0"
 dependencies = [
+ "getrandom",
  "interprocess",
  "lexopt",
  "libc",
  "native-tls",
  "polytunnel-core",
  "polytunnel-esp",
+ "polytunnel-forti",
  "polytunnel-gp",
  "polytunnel-http",
  "polytunnel-net",
