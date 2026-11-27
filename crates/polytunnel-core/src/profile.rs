@@ -145,6 +145,10 @@ pub struct FortinetSslProfile {
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realm: Option<String>,
+    /// Trust exactly this certificate (its SHA-256), for a FortiGate whose certificate the
+    /// system does not trust, such as its factory certificate. Unset: the system decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_cert: Option<crate::pin::CertFingerprint>,
 }
 
 /// A FortiGate dial-up IPsec tunnel (IKEv1 aggressive mode, pre-shared key, XAuth,

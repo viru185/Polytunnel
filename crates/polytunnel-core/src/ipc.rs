@@ -125,6 +125,9 @@ pub struct FortiConnect {
     pub server: String,
     /// The `SVPNCOOKIE` value.
     pub cookie: Secret,
+    /// The profile's trusted certificate, if it names one (see the profile's `server-cert`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_cert: Option<crate::pin::CertFingerprint>,
 }
 
 /// A FortiGate dial-up IPsec tunnel to negotiate (the daemon runs IKE itself).
@@ -554,8 +557,14 @@ mod tests {
             profile: "office".into(),
             server: "https://vpn.example.net:10443".into(),
             cookie: Secret::new("FAKE+cookie=="),
+            server_cert: Some("0123456789abcdef".repeat(4).parse().unwrap()),
         });
         assert_eq!(forti.validate(), Ok(()));
+        // A malformed fingerprint never gets past the frame decoder.
+        let json = serde_json::to_string(&forti)
+            .unwrap()
+            .replace("sha256:0123", "sha256:zz23");
+        assert!(serde_json::from_str::<Connect>(&json).is_err());
     }
 
     fn ipsec() -> IpsecConnect {

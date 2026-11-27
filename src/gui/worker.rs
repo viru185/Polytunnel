@@ -241,7 +241,7 @@ fn login_fortinet(
     ));
     let realm = p.realm.clone().unwrap_or_default();
     let cookie = polytunnel_forti::login(
-        &UreqTransport::new(),
+        &UreqTransport::with_server_cert(p.server_cert),
         &base,
         &username,
         &password,
@@ -267,8 +267,13 @@ fn login_fortinet(
             answer.recv().ok().flatten().ok_or(FortiError::Cancelled)
         },
     )
-    .map_err(|e| e.to_string())?;
-    Ok(connect::forti_connect(name.to_string(), base, cookie))
+    .map_err(|e| crate::auth::forti_error(&base, p.server_cert, e))?;
+    Ok(connect::forti_connect(
+        name.to_string(),
+        base,
+        cookie,
+        p.server_cert,
+    ))
 }
 
 struct GuiPrompter<'a> {

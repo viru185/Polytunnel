@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use polytunnel_core::Secret;
 use polytunnel_core::http::Transport;
 use polytunnel_core::ipc::{FortiConnect, Status};
+use polytunnel_core::pin::CertFingerprint;
 use polytunnel_forti::ppp::{Event, IpConfig, Ppp};
 use polytunnel_forti::tunnel::{self, TunnelSettings, frame};
 use polytunnel_http::UreqTransport;
@@ -57,9 +58,9 @@ pub async fn run(c: FortiConnect, status: StatusCell, mut stop: watch::Receiver<
     if let Err(e) = journal.rollback(system.as_mut()) {
         warn!("could not undo every network change: {e}");
     }
-    let (server, cookie) = (c.server.clone(), c.cookie.clone());
+    let (server, cookie, pin) = (c.server.clone(), c.cookie.clone(), c.server_cert);
     let _ = blocking(move || {
-        UreqTransport::new()
+        UreqTransport::with_server_cert(pin)
             .send(&tunnel::logout_request(&server, &cookie))
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -112,9 +113,9 @@ async fn connect_and_run(
 ) -> Result<(), String> {
     info!("connecting to {}", c.server);
     let settings = {
-        let (server, cookie) = (c.server.clone(), c.cookie.clone());
+        let (server, cookie, pin) = (c.server.clone(), c.cookie.clone(), c.server_cert);
         blocking(move || {
-            let response = UreqTransport::new()
+            let response = UreqTransport::with_server_cert(pin)
                 .send(&tunnel::config_request(&server, &cookie))
                 .map_err(|e| e.to_string())?;
             tunnel::parse_config(&response).map_err(|e| e.to_string())
@@ -131,7 +132,7 @@ async fn connect_and_run(
             .collect();
     let addr = *addrs.first().ok_or("the server has no address")?;
 
-    let stream = open_tunnel(&host, port, addr, &c.cookie).await?;
+    let stream = open_tunnel(&host, port, addr, &c.cookie, c.server_cert.as_ref()).await?;
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut decoder = frame::Decoder::default();
     let magic = {
@@ -173,12 +174,13 @@ async fn open_tunnel(
     port: u16,
     addr: SocketAddr,
     cookie: &Secret,
+    pin: Option<&CertFingerprint>,
 ) -> Result<tokio_native_tls::TlsStream<TcpStream>, String> {
     let tcp = timeout(STEP_TIMEOUT, TcpStream::connect(addr))
         .await
         .map_err(|_| "connecting to the server timed out".to_string())?
         .map_err(|e| format!("cannot connect to the server: {e}"))?;
-    let connector = native_tls::TlsConnector::new().map_err(|e| e.to_string())?;
+    let connector = polytunnel_http::tls_connector(pin)?;
     let mut tls = timeout(
         STEP_TIMEOUT,
         tokio_native_tls::TlsConnector::from(connector).connect(host, tcp),
@@ -186,6 +188,10 @@ async fn open_tunnel(
     .await
     .map_err(|_| "the TLS handshake timed out".to_string())?
     .map_err(|e| format!("TLS: {e}"))?;
+    // With a pinned certificate, nothing is sent before it is checked.
+    if let Some(pin) = pin {
+        polytunnel_http::check_pin(tls.get_ref(), pin)?;
+    }
     let host_header = if port == 443 {
         host.to_string()
     } else {

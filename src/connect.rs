@@ -128,11 +128,17 @@ pub fn gp_connect(profile: String, client: ClientInfo, session: GatewaySession) 
 }
 
 /// The service request for a finished Fortinet login.
-pub fn forti_connect(profile: String, server: String, cookie: Secret) -> Connect {
+pub fn forti_connect(
+    profile: String,
+    server: String,
+    cookie: Secret,
+    server_cert: Option<polytunnel_core::pin::CertFingerprint>,
+) -> Connect {
     Connect::FortinetSsl(FortiConnect {
         profile,
         server,
         cookie,
+        server_cert,
     })
 }
 
@@ -146,7 +152,7 @@ fn connect_request(args: &AuthArgs) -> Result<Connect, String> {
         }
         Profile::FortinetSsl(p) => {
             let FortiLogin { base, cookie, .. } = auth::forti_login(&p)?;
-            forti_connect(profile, base, cookie)
+            forti_connect(profile, base, cookie, p.server_cert)
         }
         Profile::FortinetIpsec(p) => {
             let io = |e: std::io::Error| e.to_string();

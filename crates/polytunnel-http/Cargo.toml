@@ -9,8 +9,14 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+native-tls.workspace = true
 polytunnel-core.workspace = true
+sha2.workspace = true
 ureq.workspace = true
+
+[dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+rustls.workspace = true
 
 [lints]
 workspace = true

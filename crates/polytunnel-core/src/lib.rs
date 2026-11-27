@@ -6,6 +6,7 @@
 
 pub mod http;
 pub mod ipc;
+pub mod pin;
 pub mod profile;
 pub mod secret;
 pub mod xml;

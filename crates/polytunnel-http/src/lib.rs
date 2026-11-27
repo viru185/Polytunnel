@@ -1,11 +1,19 @@
 //! The real HTTP transport for Polytunnel: ureq with the operating system's TLS stack and
 //! trust store. Shared by the app (logins) and the daemon (tunnel setup, HIP, logout).
 
+mod pinned;
+
 use std::time::Duration;
 
 use polytunnel_core::http::{HttpError, Method, Request, Response, Transport};
+use polytunnel_core::pin::CertFingerprint;
 use ureq::Agent;
+use ureq::config::Config;
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
+use ureq::unversioned::resolver::DefaultResolver;
+use ureq::unversioned::transport::{Connector, TcpConnector};
+
+pub use pinned::{check_pin, fingerprint, tls_connector, untrusted_certificate};
 
 /// Response bodies larger than this are refused (VPN login answers are a few KB).
 const MAX_BODY: u64 = 4 * 1024 * 1024;
@@ -15,24 +23,41 @@ pub struct UreqTransport {
 }
 
 impl UreqTransport {
+    /// HTTPS checked by the system's TLS stack and trust store.
     pub fn new() -> Self {
-        let tls = TlsConfig::builder()
-            .provider(TlsProvider::NativeTls)
-            .root_certs(RootCerts::PlatformVerifier)
-            .build();
-        let agent: Agent = Agent::config_builder()
-            .tls_config(tls)
-            // Protocol code interprets every status itself.
-            .http_status_as_error(false)
-            // ...and must see redirects instead of following them.
-            .max_redirects(0)
-            .max_redirects_will_error(false)
-            .timeout_connect(Some(Duration::from_secs(15)))
-            .timeout_global(Some(Duration::from_secs(60)))
-            .build()
-            .into();
-        UreqTransport { agent }
+        UreqTransport {
+            agent: Agent::new_with_config(config()),
+        }
     }
+
+    /// With a pin, HTTPS that accepts exactly that certificate (see [`pinned`]); without
+    /// one, the same as [`UreqTransport::new`].
+    pub fn with_server_cert(pin: Option<CertFingerprint>) -> Self {
+        let Some(pin) = pin else {
+            return Self::new();
+        };
+        let connector = TcpConnector::default().chain(pinned::PinnedTls { pin });
+        UreqTransport {
+            agent: Agent::with_parts(config(), connector, DefaultResolver::default()),
+        }
+    }
+}
+
+fn config() -> Config {
+    let tls = TlsConfig::builder()
+        .provider(TlsProvider::NativeTls)
+        .root_certs(RootCerts::PlatformVerifier)
+        .build();
+    Agent::config_builder()
+        .tls_config(tls)
+        // Protocol code interprets every status itself.
+        .http_status_as_error(false)
+        // ...and must see redirects instead of following them.
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_global(Some(Duration::from_secs(60)))
+        .build()
 }
 
 impl Default for UreqTransport {

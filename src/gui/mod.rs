@@ -102,6 +102,8 @@ struct Editor {
     gateway: String,
     preferred: String,
     realm: String,
+    /// Fortinet SSL: the trusted certificate's SHA-256 (empty: the system decides).
+    server_cert: String,
     strict_tiers: bool,
     tcp_probe: bool,
     embedded: bool,
@@ -128,6 +130,7 @@ impl Editor {
             gateway: String::new(),
             preferred: String::new(),
             realm: String::new(),
+            server_cert: String::new(),
             strict_tiers: false,
             tcp_probe: false,
             embedded: false,
@@ -164,6 +167,7 @@ impl Editor {
                 server: p.server.clone(),
                 username: text(&p.username),
                 realm: text(&p.realm),
+                server_cert: p.server_cert.map(|c| c.to_string()).unwrap_or_default(),
                 ..Editor::new(Kind::FortinetSsl)
             },
             Profile::FortinetIpsec(p) => Editor {
@@ -221,6 +225,13 @@ impl Editor {
                 server: self.server.trim().to_string(),
                 username: opt(&self.username),
                 realm: opt(&self.realm),
+                server_cert: match self.server_cert.trim() {
+                    "" => None,
+                    pin => Some(
+                        pin.parse()
+                            .map_err(|e| format!("Server certificate: {e}."))?,
+                    ),
+                },
             }),
             Kind::FortinetIpsec => {
                 let group: u16 = self
@@ -705,6 +716,16 @@ impl App {
                         ui.label("Realm (optional)");
                         ui.text_edit_singleline(&mut editor.realm);
                         ui.end_row();
+                        ui.label("Server certificate (optional)").on_hover_text(
+                            "The SHA-256 fingerprint of the FortiGate's certificate, when the \
+                             system does not trust it (a factory certificate). Polytunnel then \
+                             trusts exactly that certificate for this server.",
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut editor.server_cert)
+                                .hint_text("sha256:... (from the sign-in error)"),
+                        );
+                        ui.end_row();
                     }
                     Kind::FortinetIpsec => {
                         ui.label("Local ID (optional)");
@@ -1143,6 +1164,7 @@ mod tests {
             server: "vpn.example.net:10443".into(),
             username: Some("me".into()),
             realm: None,
+            server_cert: Some("0123456789abcdef".repeat(4).parse().unwrap()),
         });
         assert_eq!(
             Editor::from_profile("office", &forti).to_profile(),

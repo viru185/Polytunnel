@@ -208,6 +208,7 @@ mod tests {
                 profile: "office".into(),
                 server: "https://vpn.example.net:10443".into(),
                 cookie: Secret::new("a\r\nX-Injected: 1"),
+                server_cert: None,
             }),
         };
         assert!(matches!(exchange(&endpoint, &bad), Response::Error { .. }));

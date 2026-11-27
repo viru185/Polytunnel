@@ -189,6 +189,7 @@ pub fn ssl_tunnels() -> Vec<ImportedSsl> {
                     server,
                     username: None,
                     realm: None,
+                    server_cert: None,
                 },
             })
         })

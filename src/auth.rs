@@ -3,6 +3,7 @@
 use std::fs;
 
 use polytunnel_core::Secret;
+use polytunnel_core::pin::CertFingerprint;
 use polytunnel_core::profile::{
     FortinetSslProfile, GlobalProtectProfile, Profile, Profiles, normalize_server,
 };
@@ -174,6 +175,41 @@ pub(crate) struct FortiLogin {
     pub cookie: Secret,
 }
 
+/// A Fortinet login error as a message. When the cause is a certificate the system does not
+/// trust (a FortiGate's factory certificate, typically), the message names its fingerprint
+/// and how to trust it.
+pub(crate) fn forti_error(base: &str, pin: Option<CertFingerprint>, error: FortiError) -> String {
+    if pin.is_none()
+        && matches!(error, FortiError::Http(_))
+        && let Some((host, port)) = host_port(base)
+        && let Some(fingerprint) = polytunnel_http::untrusted_certificate(&host, port)
+    {
+        return format!(
+            "the system does not trust the server's certificate ({error}).\n\
+             Its SHA-256 fingerprint is {}.\n\
+             If that is your FortiGate's certificate (FortiClient shows it in its security \
+             alert, and your administrator can confirm it), trust it: edit the profile and set \
+             Server certificate to {fingerprint}, or add server-cert = \"{fingerprint}\" to the \
+             profile in profiles.toml.",
+            fingerprint.colon_hex()
+        );
+    }
+    error.to_string()
+}
+
+/// `(host, port)` of an `https://host[:port]` base address.
+fn host_port(base: &str) -> Option<(String, u16)> {
+    let authority = base.strip_prefix("https://")?.split('/').next()?;
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.ends_with(':') && port.chars().all(|c| c.is_ascii_digit()) => {
+            (host, port.parse().ok()?)
+        }
+        _ => (authority, 443),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    (!host.is_empty()).then(|| (host.to_string(), port))
+}
+
 pub(crate) fn forti_login(profile: &FortinetSslProfile) -> Result<FortiLogin, String> {
     let base = normalize_server(&profile.server).map_err(|e| e.to_string())?;
     let username = match &profile.username {
@@ -184,7 +220,7 @@ pub(crate) fn forti_login(profile: &FortinetSslProfile) -> Result<FortiLogin, St
     let realm = profile.realm.clone().unwrap_or_default();
     eprintln!("Logging in to {}...", base.trim_start_matches("https://"));
     let cookie = polytunnel_forti::login(
-        &UreqTransport::new(),
+        &UreqTransport::with_server_cert(profile.server_cert),
         &base,
         &username,
         &password,
@@ -202,7 +238,7 @@ pub(crate) fn forti_login(profile: &FortinetSslProfile) -> Result<FortiLogin, St
             prompter::ask_secret(&format!("Code{hint}: ")).map_err(|_| FortiError::Cancelled)
         },
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| forti_error(&base, profile.server_cert, e))?;
     Ok(FortiLogin {
         base,
         username,
@@ -270,6 +306,26 @@ pub fn list_profiles() -> i32 {
 mod tests {
     use super::*;
     use crate::cli::Emit;
+
+    #[test]
+    fn host_and_port_of_base_addresses() {
+        let hp = |b: &str| host_port(b);
+        assert_eq!(
+            hp("https://vpn.example.net:10443"),
+            Some(("vpn.example.net".into(), 10443))
+        );
+        assert_eq!(hp("https://203.0.113.7"), Some(("203.0.113.7".into(), 443)));
+        assert_eq!(
+            hp("https://[2001:db8::1]:8443/x"),
+            Some(("2001:db8::1".into(), 8443))
+        );
+        assert_eq!(
+            hp("https://[2001:db8::1]"),
+            Some(("2001:db8::1".into(), 443))
+        );
+        assert_eq!(hp("http://vpn.example.net"), None);
+        assert_eq!(hp("https://"), None);
+    }
 
     fn args(target: AuthTarget) -> AuthArgs {
         AuthArgs {
