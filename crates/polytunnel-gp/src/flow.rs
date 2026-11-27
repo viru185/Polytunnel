@@ -41,6 +41,13 @@ pub trait Prompter {
 
     /// A short progress message ("Contacting the portal...").
     fn progress(&mut self, _message: &str) {}
+
+    /// Picks the gateway when the user did not name one. `Ok(None)`: use the default
+    /// [`choose_gateway`]. Implementations usually probe the gateways and call
+    /// [`crate::rank::rank`].
+    fn select_gateway(&mut self, _portal: &PortalSession) -> Result<Option<Gateway>, GpError> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -48,10 +55,24 @@ pub struct LoginOptions {
     /// Portal address in any form [`normalize_server`] accepts.
     pub portal: String,
     pub username: Option<String>,
-    /// Gateway to use: address, host or description. `None`: let [`choose_gateway`] pick.
+    /// Gateway to use: address, host or description. `None`: [`Prompter::select_gateway`]
+    /// (or [`choose_gateway`]) picks one.
     pub gateway: Option<String>,
     /// Ask the portal for the system-browser SAML flow.
     pub default_browser: bool,
+}
+
+/// A logged-in portal: who the user is and which gateways they may use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortalSession {
+    /// `https://host[:port]` of the portal.
+    pub portal: String,
+    /// The portal's source-region verdict for this client.
+    pub region: Option<String>,
+    pub username: String,
+    pub config: PortalConfig,
+    /// The typed password, if any (gateways often accept the same one).
+    password: Option<Secret>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,12 +85,38 @@ pub struct LoginResult {
     pub session: GatewaySession,
 }
 
+/// The whole login: portal, gateway choice, gateway session.
 pub fn login(
     transport: &dyn Transport,
     client: &ClientInfo,
     options: &LoginOptions,
     prompter: &mut dyn Prompter,
 ) -> Result<LoginResult, GpError> {
+    let portal = portal_login(transport, client, options, prompter)?;
+    let gateway = match options.gateway.as_deref() {
+        Some(wanted) => choose_gateway(&portal.portal, &portal.config, Some(wanted))?,
+        None => match prompter.select_gateway(&portal)? {
+            Some(gateway) => gateway,
+            None => choose_gateway(&portal.portal, &portal.config, None)?,
+        },
+    };
+    let session = connect_gateway(transport, client, options, prompter, &portal, &gateway)?;
+    Ok(LoginResult {
+        portal: portal.portal,
+        region: portal.region,
+        config: portal.config,
+        gateway,
+        session,
+    })
+}
+
+/// Logs in to the portal and fetches its configuration (the gateway list).
+pub fn portal_login(
+    transport: &dyn Transport,
+    client: &ClientInfo,
+    options: &LoginOptions,
+    prompter: &mut dyn Prompter,
+) -> Result<PortalSession, GpError> {
     let portal = normalize_server(&options.portal).map_err(|e| GpError::NoGateway(e.0))?;
 
     prompter.progress(&format!(
@@ -77,35 +124,43 @@ pub fn login(
         portal::host_of(&portal)
     ));
     let pre = prelogin_at(transport, client, &portal, Interface::Portal, options)?;
-    let region = pre.region.clone();
 
-    let (username, auth, portal_password) =
+    let (username, auth, password) =
         portal_proof(prompter, &portal, &pre, options.username.as_deref())?;
 
     prompter.progress("Fetching the portal configuration");
     let config =
         portal::parse(&transport.send(&portal::request(&portal, client, &username, &auth))?)?;
 
-    let gateway = choose_gateway(&portal, &config, options.gateway.as_deref())?;
+    Ok(PortalSession {
+        portal,
+        region: pre.region,
+        username,
+        config,
+        password,
+    })
+}
+
+/// Logs in to `gateway` with what the portal login provided.
+pub fn connect_gateway(
+    transport: &dyn Transport,
+    client: &ClientInfo,
+    options: &LoginOptions,
+    prompter: &mut dyn Prompter,
+    portal: &PortalSession,
+    gateway: &Gateway,
+) -> Result<GatewaySession, GpError> {
     prompter.progress(&format!("Logging in to the gateway {}", gateway.label()));
-    let session = gateway_login(
+    gateway_login(
         transport,
         client,
         options,
         prompter,
-        &gateway,
-        &username,
-        &config,
-        portal_password,
-    )?;
-
-    Ok(LoginResult {
-        portal,
-        region,
-        config,
         gateway,
-        session,
-    })
+        &portal.username,
+        &portal.config,
+        portal.password.clone(),
+    )
 }
 
 fn prelogin_at(
@@ -350,9 +405,22 @@ mod tests {
         callbacks: VecDeque<String>,
         saml_seen: Vec<(Interface, String)>,
         passwords: VecDeque<(String, String)>,
+        /// Host to pick in `select_gateway` (None: default choice).
+        pick: Option<&'static str>,
     }
 
     impl Prompter for User {
+        fn select_gateway(&mut self, portal: &PortalSession) -> Result<Option<Gateway>, GpError> {
+            Ok(self.pick.and_then(|host| {
+                portal
+                    .config
+                    .gateways
+                    .iter()
+                    .find(|g| g.host() == host)
+                    .cloned()
+            }))
+        }
+
         fn saml(
             &mut self,
             iface: Interface,
@@ -587,6 +655,32 @@ mod tests {
         };
         login(&transport, &test_client(), &options(), &mut user).unwrap();
         assert_eq!(user.saml_seen.len(), 2);
+    }
+
+    #[test]
+    fn the_prompter_can_pick_the_gateway() {
+        let transport = Script::new(vec![
+            (
+                "https://portal.example.com/global-protect/prelogin.esp",
+                saml_prelogin(),
+            ),
+            (
+                "https://portal.example.com/global-protect/getconfig.esp",
+                config(true),
+            ),
+            (
+                "https://gw2.example.com/ssl-vpn/prelogin.esp",
+                saml_prelogin(),
+            ),
+            ("https://gw2.example.com/ssl-vpn/login.esp", jnlp()),
+        ]);
+        let mut user = User {
+            callbacks: [callback("FAKE-pre-1")].into(),
+            pick: Some("gw2.example.com"),
+            ..Default::default()
+        };
+        let result = login(&transport, &test_client(), &options(), &mut user).unwrap();
+        assert_eq!(result.gateway.address, "https://gw2.example.com");
     }
 
     #[test]

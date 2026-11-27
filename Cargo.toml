@@ -18,10 +18,14 @@ dirs.workspace = true
 getrandom.workspace = true
 interprocess.workspace = true
 lexopt.workspace = true
+native-tls.workspace = true
 polytunnel-core.workspace = true
 polytunnel-forti.workspace = true
 polytunnel-gp.workspace = true
 rpassword.workspace = true
+serde.workspace = true
+socket2.workspace = true
+toml.workspace = true
 ureq.workspace = true
 
 [target.'cfg(windows)'.dependencies]
@@ -29,6 +33,7 @@ ureq.workspace = true
 widestring = "1.2.1"
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_System_Console",
@@ -83,8 +88,10 @@ getrandom = "0.4.3"
 interprocess = { version = "2.4.10", default-features = false }
 lexopt = "0.3.2"
 libc = "0.2"
+native-tls = "0.2.18"
 rpassword = "7.5.5"
 serde = { version = "1.0.229", features = ["derive"] }
+socket2 = { version = "0.6.5", features = ["all"] }
 toml = { version = "1.2.3", default-features = false, features = ["parse", "serde", "std", "display"] }
 ureq = { version = "3.5.2", default-features = false, features = ["native-tls-no-default"] }
 windows-sys = "0.61.2"

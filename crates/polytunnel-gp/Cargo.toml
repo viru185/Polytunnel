@@ -12,6 +12,7 @@ publish = false
 base64.workspace = true
 form_urlencoded.workspace = true
 polytunnel-core.workspace = true
+serde.workspace = true
 
 [lints]
 workspace = true

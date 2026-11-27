@@ -92,6 +92,38 @@ pub struct GlobalProtectProfile {
     /// portals require it, but sending it means claiming to be that app version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_version: Option<String>,
+    /// Gateway to prefer when it answers; otherwise the best one is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_gateway: Option<String>,
+    /// How priority and speed are combined when picking the best gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_selection: Option<GatewayPolicy>,
+    /// How gateway response times are measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<ProbeMethod>,
+}
+
+/// How priority and speed are combined when picking the best GlobalProtect gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GatewayPolicy {
+    /// Highest/High/Medium compete on speed; Low/Lowest only as a fallback (the documented
+    /// behaviour of current GlobalProtect apps).
+    #[default]
+    Pools,
+    /// Strictly by priority, then by speed.
+    StrictTiers,
+}
+
+/// How gateway response times are measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProbeMethod {
+    /// TLS handshake time (the GlobalProtect default).
+    #[default]
+    Tls,
+    /// TCP handshake time.
+    Tcp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

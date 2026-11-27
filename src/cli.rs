@@ -8,6 +8,7 @@ pub enum Command {
     Help,
     Version,
     Auth(AuthArgs),
+    Gateways(GatewaysArgs),
     Profiles,
     Uri(UriAction),
     /// Deliver a `globalprotectcallback:` link to the waiting login.
@@ -19,12 +20,24 @@ pub struct AuthArgs {
     pub target: AuthTarget,
     pub emit: Emit,
     pub user: Option<String>,
+    /// GlobalProtect: always use this gateway.
     pub gateway: Option<String>,
+    /// GlobalProtect: use this gateway when it answers, else the best one.
+    pub prefer: Option<String>,
     pub realm: Option<String>,
     /// GlobalProtect: read the SSO result from the terminal.
     pub paste: bool,
     /// GlobalProtect: open the browser (false: print the URL).
     pub browser: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewaysArgs {
+    pub target: AuthTarget,
+    /// Log in to the portal again instead of using the saved gateway list.
+    pub refresh: bool,
+    pub json: bool,
+    pub prefer: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,21 +68,29 @@ Polytunnel {version}
 Lightweight VPN client for Palo Alto GlobalProtect and Fortinet (SSL VPN and IPsec).
 
 Usage:
-  polytunnel auth <PROFILE> [OPTIONS]        Log in with a saved profile
-  polytunnel auth gp <PORTAL> [OPTIONS]      Log in to a GlobalProtect portal
+  polytunnel auth <PROFILE> [OPTIONS]          Log in with a saved profile
+  polytunnel auth gp <PORTAL> [OPTIONS]        Log in to a GlobalProtect portal
   polytunnel auth fortinet <SERVER> [OPTIONS]  Log in to a FortiGate SSL VPN
-  polytunnel profiles                        Show the profiles file and its profiles
+  polytunnel gateways <PROFILE> [OPTIONS]      Rank a GlobalProtect portal's gateways
+  polytunnel gateways gp <PORTAL> [OPTIONS]      (find the best gateway)
+  polytunnel profiles                          Show the profiles file and its profiles
   polytunnel uri <register|unregister|status>  Handle GlobalProtect browser logins
-  polytunnel --callback <LINK>               Hand a globalprotectcallback: link to a login
+  polytunnel --callback <LINK>                 Hand a globalprotectcallback: link to a login
 
 Auth options:
   -u, --user <NAME>      Username (default: from the profile, or asked)
-  -g, --gateway <NAME>   GlobalProtect gateway to use: address or description
+  -g, --gateway <NAME>   GlobalProtect: always use this gateway (address or description)
+      --prefer <NAME>    GlobalProtect: use this gateway when it answers, else the best one
       --realm <REALM>    Fortinet authentication realm
       --emit <FORMAT>    Output: openconnect (default), cookie or json
       --paste            GlobalProtect: paste the browser's login result into the
                          terminal instead of waiting for the globalprotectcallback: link
       --no-browser       GlobalProtect: print the sign-in address instead of opening it
+
+Gateways options:
+      --refresh          Log in to the portal again instead of using the saved list
+      --json             Print JSON
+      --prefer <NAME>    Prefer this gateway when it answers
 
 Options:
   -h, --help             Print help
@@ -80,6 +101,24 @@ Options:
     )
 }
 
+/// `auth`/`gateways` target: `<profile>`, `gp <portal>` or `fortinet <server>`.
+fn target(command: &str, words: &mut impl Iterator<Item = String>) -> Result<AuthTarget, String> {
+    match (words.next(), words.next()) {
+        (Some(kind), Some(address)) if kind == "gp" || kind == "globalprotect" => {
+            Ok(AuthTarget::GlobalProtect(address))
+        }
+        (Some(kind), Some(address)) if kind == "fortinet" || kind == "forti" => {
+            Ok(AuthTarget::Fortinet(address))
+        }
+        (Some(name), None) if name != "gp" && name != "fortinet" => Ok(AuthTarget::Profile(name)),
+        (Some(kind), None) => Err(format!("{command} {kind} needs a server address")),
+        (Some(_), Some(_)) => Err(format!(
+            "use `{command} gp <portal>`, `{command} fortinet <server>` or `{command} <profile>`"
+        )),
+        (None, _) => Err(format!("{command} needs a profile name or a server")),
+    }
+}
+
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     use lexopt::prelude::*;
 
@@ -87,8 +126,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     let mut positionals: Vec<String> = Vec::new();
     let mut callback: Option<String> = None;
     let mut emit = None;
-    let (mut user, mut gateway, mut realm) = (None, None, None);
-    let (mut paste, mut no_browser) = (false, false);
+    let (mut user, mut gateway, mut prefer, mut realm) = (None, None, None, None);
+    let (mut paste, mut no_browser, mut refresh, mut json) = (false, false, false, false);
 
     let value = |parser: &mut lexopt::Parser| -> Result<String, String> {
         parser
@@ -107,6 +146,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             Long("callback") => callback = Some(value(&mut parser)?),
             Short('u') | Long("user") => user = Some(value(&mut parser)?),
             Short('g') | Long("gateway") => gateway = Some(value(&mut parser)?),
+            Long("prefer") => prefer = Some(value(&mut parser)?),
             Long("realm") => realm = Some(value(&mut parser)?),
             Long("emit") => {
                 emit = Some(match value(&mut parser)?.as_str() {
@@ -122,6 +162,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             }
             Long("paste") => paste = true,
             Long("no-browser") => no_browser = true,
+            Long("refresh") => refresh = true,
+            Long("json") => json = true,
             Value(v) => positionals.push(
                 v.into_string()
                     .map_err(|_| "arguments must be valid Unicode".to_string())?,
@@ -130,12 +172,14 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         }
     }
 
-    let auth_flags = user.is_some()
+    let auth_only = user.is_some()
         || gateway.is_some()
         || realm.is_some()
         || emit.is_some()
         || paste
         || no_browser;
+    let gateways_only = refresh || json;
+    let has_prefer = prefer.is_some();
 
     // The browser may pass the link as a bare argument.
     if callback.is_none()
@@ -145,7 +189,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         callback = positionals.pop();
     }
     if let Some(link) = callback {
-        if !positionals.is_empty() || auth_flags {
+        if !positionals.is_empty() || auth_only || gateways_only || has_prefer {
             return Err("--callback takes no other arguments".into());
         }
         return Ok(Command::Callback(link));
@@ -155,33 +199,29 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     let command = match words.next().as_deref() {
         None => return Ok(Command::Help),
         Some("auth") => {
-            let target = match (words.next(), words.next()) {
-                (Some(kind), Some(address)) if kind == "gp" || kind == "globalprotect" => {
-                    AuthTarget::GlobalProtect(address)
-                }
-                (Some(kind), Some(address)) if kind == "fortinet" || kind == "forti" => {
-                    AuthTarget::Fortinet(address)
-                }
-                (Some(name), None) if name != "gp" && name != "fortinet" => {
-                    AuthTarget::Profile(name)
-                }
-                (Some(kind), None) => return Err(format!("auth {kind} needs a server address")),
-                (Some(_), Some(_)) => {
-                    return Err(
-                        "use `auth gp <portal>`, `auth fortinet <server>` or `auth <profile>`"
-                            .into(),
-                    );
-                }
-                (None, _) => return Err("auth needs a profile name or a server".into()),
-            };
+            if gateways_only {
+                return Err("--refresh and --json are for `gateways`".into());
+            }
             Command::Auth(AuthArgs {
-                target,
+                target: target("auth", &mut words)?,
                 emit: emit.unwrap_or(Emit::Openconnect),
                 user,
                 gateway,
+                prefer,
                 realm,
                 paste,
                 browser: !no_browser,
+            })
+        }
+        Some("gateways") => {
+            if auth_only {
+                return Err("that option is for `auth`".into());
+            }
+            Command::Gateways(GatewaysArgs {
+                target: target("gateways", &mut words)?,
+                refresh,
+                json,
+                prefer,
             })
         }
         Some("profiles") => Command::Profiles,
@@ -196,8 +236,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     if let Some(extra) = words.next() {
         return Err(format!("unexpected argument '{extra}'"));
     }
-    if auth_flags && !matches!(command, Command::Auth(_)) {
-        return Err("those options only work with `auth`".into());
+    let takes_options = matches!(command, Command::Auth(_) | Command::Gateways(_));
+    if !takes_options && (auth_only || gateways_only || has_prefer) {
+        return Err("those options only work with `auth` or `gateways`".into());
     }
     Ok(command)
 }
@@ -216,6 +257,7 @@ mod tests {
             emit: Emit::Openconnect,
             user: None,
             gateway: None,
+            prefer: None,
             realm: None,
             paste: false,
             browser: true,
@@ -252,6 +294,13 @@ mod tests {
             }))
         );
         assert_eq!(
+            p(&["auth", "work", "--prefer", "West"]),
+            Ok(Command::Auth(AuthArgs {
+                prefer: Some("West".into()),
+                ..auth(AuthTarget::Profile("work".into()))
+            }))
+        );
+        assert_eq!(
             p(&[
                 "auth",
                 "fortinet",
@@ -266,6 +315,37 @@ mod tests {
                 ..auth(AuthTarget::Fortinet("vpn.example.net:10443".into()))
             }))
         );
+    }
+
+    #[test]
+    fn gateways_variants() {
+        assert_eq!(
+            p(&[
+                "gateways",
+                "work",
+                "--refresh",
+                "--json",
+                "--prefer",
+                "East"
+            ]),
+            Ok(Command::Gateways(GatewaysArgs {
+                target: AuthTarget::Profile("work".into()),
+                refresh: true,
+                json: true,
+                prefer: Some("East".into()),
+            }))
+        );
+        assert_eq!(
+            p(&["gateways", "gp", "vpn.example.com"]),
+            Ok(Command::Gateways(GatewaysArgs {
+                target: AuthTarget::GlobalProtect("vpn.example.com".into()),
+                refresh: false,
+                json: false,
+                prefer: None,
+            }))
+        );
+        assert!(p(&["gateways", "work", "--paste"]).is_err());
+        assert!(p(&["auth", "work", "--refresh"]).is_err());
     }
 
     #[test]
@@ -303,6 +383,7 @@ mod tests {
             &["auth", "gp", "a", "b"],
             &["auth", "work", "--emit", "xml"],
             &["profiles", "--paste"],
+            &["profiles", "--prefer", "x"],
             &["uri", "frobnicate"],
         ] {
             assert!(p(bad).is_err(), "{bad:?}");
@@ -317,12 +398,16 @@ mod tests {
             "--version",
             "--user",
             "--gateway",
+            "--prefer",
             "--realm",
             "--emit",
             "--paste",
             "--no-browser",
+            "--refresh",
+            "--json",
             "--callback",
             "auth",
+            "gateways",
             "profiles",
             "uri",
         ] {

@@ -6,10 +6,12 @@ use std::time::{Duration, Instant};
 
 use polytunnel_core::Secret;
 use polytunnel_gp::GpError;
-use polytunnel_gp::flow::{PasswordPrompt, Prompter};
+use polytunnel_gp::flow::{PasswordPrompt, PortalSession, Prompter};
+use polytunnel_gp::portal::Gateway;
 use polytunnel_gp::prelogin::{Interface, SamlRequest};
 use polytunnel_gp::sso::{self, MAX_CALLBACK_LEN, SsoResult};
 
+use crate::gateways::{self, GatewayPrefs};
 use crate::{browser, callback, uri};
 
 /// How long to wait for the browser to finish a SAML login.
@@ -27,14 +29,16 @@ pub struct CliPrompter {
     mode: SsoMode,
     open_browser: bool,
     listener: Option<callback::Listener>,
+    prefs: GatewayPrefs,
 }
 
 impl CliPrompter {
-    pub fn new(mode: SsoMode, open_browser: bool) -> Self {
+    pub fn new(mode: SsoMode, open_browser: bool, prefs: GatewayPrefs) -> Self {
         CliPrompter {
             mode,
             open_browser,
             listener: None,
+            prefs,
         }
     }
 
@@ -169,6 +173,31 @@ impl Prompter for CliPrompter {
 
     fn progress(&mut self, message: &str) {
         eprintln!("{message}...");
+    }
+
+    fn select_gateway(&mut self, portal: &PortalSession) -> Result<Option<Gateway>, GpError> {
+        if let Err(e) = gateways::save_cache(portal) {
+            eprintln!("Could not save the gateway list: {e}");
+        }
+        let list = &portal.config.gateways;
+        if list.len() <= 1 {
+            return Ok(None); // nothing to choose from
+        }
+        eprintln!("Measuring {} gateways...", list.len());
+        let ranking = gateways::rank_gateways(
+            list,
+            portal.region.as_deref(),
+            portal.config.cutoff_time,
+            &self.prefs,
+        );
+        eprint!("{}", gateways::render_table(&ranking, self.prefs.method));
+        for line in &ranking.explanation {
+            eprintln!("{line}");
+        }
+        ranking
+            .chosen()
+            .map(|r| Some(r.gateway.clone()))
+            .ok_or_else(|| GpError::NoGateway("no gateway answered".into()))
     }
 }
 
