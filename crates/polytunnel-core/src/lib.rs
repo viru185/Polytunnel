@@ -4,6 +4,13 @@
 //! user-side app and the privileged daemon depend on it, so everything here must be safe to
 //! use on either side of the IPC boundary.
 
+pub mod http;
+pub mod profile;
+pub mod secret;
+pub mod xml;
+
+pub use secret::Secret;
+
 /// The product name shown to users.
 pub const PRODUCT_NAME: &str = "Polytunnel";
 

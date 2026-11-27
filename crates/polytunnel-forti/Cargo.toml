@@ -1,0 +1,15 @@
+[package]
+name = "polytunnel-forti"
+version = "0.0.0"
+description = "Fortinet for Polytunnel: SSL VPN login (with two-factor) and FortiClient profile import."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+polytunnel-core.workspace = true
+
+[lints]
+workspace = true
