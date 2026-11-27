@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Polytunnel
+Comment=Lightweight VPN client for GlobalProtect and Fortinet
+Exec=/usr/bin/polytunnel
+Icon=polytunnel
+Terminal=false
+Categories=Network;

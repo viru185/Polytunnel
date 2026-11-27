@@ -1,0 +1,5 @@
+#!/bin/sh
+# Start the Polytunnel service (runs as root, owns the tunnels).
+launchctl bootstrap system /Library/LaunchDaemons/com.github.viru185.polytunnel.daemon.plist 2>/dev/null \
+  || launchctl kickstart -k system/com.github.viru185.polytunnel.daemon
+exit 0

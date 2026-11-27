@@ -45,6 +45,23 @@ Platforms: Windows (x64, ARM64) first, Linux (x64, ARM64), macOS (beta).
 | M10–M11 | Embedded login window, kill switch |
 | M12–M13 | Code signing, auto-update |
 
+## Install
+
+Download the package for your system from the
+[latest release](https://github.com/viru185/Polytunnel/releases/latest). Each file has a
+`.sha256` checksum next to it.
+
+| System | File | What it installs |
+|---|---|---|
+| Windows x64 / ARM64 | `polytunnel-<version>-windows-x64.msi` / `-arm64.msi` | The app in Program Files, a Start menu entry and the Polytunnel service. Uninstall from **Settings > Apps**. |
+| Debian, Ubuntu | `polytunnel_<version>_amd64.deb` / `_arm64.deb` | `sudo apt install ./polytunnel_<version>_amd64.deb` (the service starts at once) |
+| Fedora, RHEL, openSUSE | `polytunnel-<version>-1.x86_64.rpm` / `.aarch64.rpm` | `sudo dnf install ./polytunnel-<version>-1.x86_64.rpm` |
+| macOS (beta) | `polytunnel-<version>-macos-universal.pkg` | Polytunnel.app in Applications and its launch daemon |
+
+Portable builds (`.zip` for Windows, `.tar.gz` for Linux) are there too; register their
+service with `polytunnel-daemon install` as administrator or root. Releases are not code-signed
+yet, so Windows SmartScreen may warn the first time; choose **More info > Run anyway**.
+
 ## The app
 
 Run `polytunnel` (or open it from the Start menu) for the window: profiles for GlobalProtect and
@@ -99,11 +116,11 @@ GlobalProtect profiles also accept `preferred-gateway = "<name>"`,
 ### Connecting
 
 Polytunnel's own tunnels run in a small background service, so connecting never needs an
-administrator prompt. Install the service once (administrator / root), then connect as a
-normal user:
+administrator prompt. The installers set the service up; for a portable or source build,
+install it once as administrator / root. Then connect as a normal user:
 
 ```sh
-polytunnel-daemon install        # once; Windows: put wintun.dll next to polytunnel-daemon.exe
+polytunnel-daemon install        # portable builds only; Windows: wintun.dll next to the exe
 polytunnel connect work          # GlobalProtect: browser SSO, best gateway, tunnel up
 polytunnel connect office        # Fortinet SSL VPN: password (+ code), PPP tunnel up
 polytunnel status
@@ -128,6 +145,11 @@ cargo test --workspace
 
 The binaries are `target/release/polytunnel` (app and CLI) and
 `target/release/polytunnel-daemon` (background service).
+
+`packaging/build.sh <target> <version>` turns a `cargo build --release --target <target>` into
+the installers (MSI and zip, deb/rpm and tarball, or macOS pkg); the script's header lists the
+tools each platform needs. The Windows MSI uses WiX 5 as a local .NET tool (`dotnet tool
+restore`).
 
 ## Project layout
 

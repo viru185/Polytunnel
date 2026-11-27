@@ -1,0 +1,16 @@
+Polytunnel third-party notices
+==============================
+
+Polytunnel is MIT-licensed. It includes the following open-source Rust crates, whose licences
+are reproduced below. On Windows it also ships the unmodified, signed Wintun driver DLL
+(https://www.wintun.net), whose licence is in wintun-LICENSE.txt.
+{{#each licenses}}
+
+------------------------------------------------------------------------------
+{{{name}}} ({{{id}}})
+
+Used by:
+{{#each used_by}}  - {{{crate.name}}} {{{crate.version}}}
+{{/each}}
+{{{text}}}
+{{/each}}

@@ -13,6 +13,38 @@ keywords = ["vpn", "globalprotect", "fortinet", "ipsec", "saml"]
 categories = ["command-line-utilities", "network-programming"]
 publish = false
 
+[package.metadata.deb]
+name = "polytunnel"
+maintainer = "Polytunnel contributors <https://github.com/viru185/Polytunnel>"
+copyright = "Polytunnel contributors"
+section = "net"
+priority = "optional"
+depends = "$auto, systemd"
+extended-description = """Lightweight VPN client for Palo Alto GlobalProtect (SAML single sign-on, best-gateway selection) and Fortinet SSL VPN, with a background service that owns the tunnels."""
+assets = [
+  ["target/release/polytunnel", "usr/bin/", "755"],
+  ["target/release/polytunnel-daemon", "usr/bin/", "755"],
+  ["packaging/linux/polytunnel.desktop", "usr/share/applications/", "644"],
+  ["assets/polytunnel.png", "usr/share/icons/hicolor/256x256/apps/polytunnel.png", "644"],
+  ["README.md", "usr/share/doc/polytunnel/README.md", "644"],
+]
+# cargo-deb writes the scripts that enable and start the service only when
+# maintainer-scripts is set; packaging/linux holds no scripts of its own.
+maintainer-scripts = "packaging/linux"
+systemd-units = { unit-name = "polytunnel-daemon", unit-scripts = "packaging/linux", enable = true, start = true }
+
+[package.metadata.generate-rpm]
+summary = "Lightweight VPN client for GlobalProtect and Fortinet"
+assets = [
+  { source = "target/release/polytunnel", dest = "/usr/bin/polytunnel", mode = "755" },
+  { source = "target/release/polytunnel-daemon", dest = "/usr/bin/polytunnel-daemon", mode = "755" },
+  { source = "packaging/linux/polytunnel-daemon.service", dest = "/usr/lib/systemd/system/polytunnel-daemon.service", mode = "644" },
+  { source = "packaging/linux/polytunnel.desktop", dest = "/usr/share/applications/polytunnel.desktop", mode = "644" },
+  { source = "assets/polytunnel.png", dest = "/usr/share/icons/hicolor/256x256/apps/polytunnel.png", mode = "644" },
+]
+post_install_script = "systemctl daemon-reload; systemctl enable --now polytunnel-daemon.service || true"
+pre_uninstall_script = "systemctl disable --now polytunnel-daemon.service || true"
+
 [dependencies]
 dirs.workspace = true
 eframe.workspace = true
