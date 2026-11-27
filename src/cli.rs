@@ -2,6 +2,8 @@
 
 use std::ffi::OsString;
 
+use polytunnel_core::ipc::KillSwitchMode;
+
 /// What the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -21,6 +23,11 @@ pub enum Command {
     Uri(UriAction),
     /// Deliver a `globalprotectcallback:` link to the waiting login.
     Callback(String),
+    /// Show or change the kill switch.
+    KillSwitch {
+        mode: Option<KillSwitchMode>,
+        allow_lan: Option<bool>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +44,8 @@ pub struct AuthArgs {
     pub paste: bool,
     /// GlobalProtect: open the browser (false: print the URL).
     pub browser: bool,
+    /// GlobalProtect: sign in in Polytunnel's own login window.
+    pub embedded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +94,8 @@ Usage:
                                                `connect fortinet ...`)
   polytunnel disconnect                        Disconnect
   polytunnel status                            Show the connection status
+  polytunnel killswitch [off|connected|always] [--allow-lan|--block-lan]
+                                               Show or set the kill switch
   polytunnel gateways <PROFILE> [OPTIONS]      Rank a GlobalProtect portal's gateways
   polytunnel gateways gp <PORTAL> [OPTIONS]      (find the best gateway)
   polytunnel profiles                          Show the profiles file and its profiles
@@ -100,6 +111,7 @@ Auth options:
       --paste            GlobalProtect: paste the browser's login result into the
                          terminal instead of waiting for the globalprotectcallback: link
       --no-browser       GlobalProtect: print the sign-in address instead of opening it
+      --embedded         GlobalProtect: sign in in Polytunnel's own login window
 
 Gateways options:
       --refresh          Log in to the portal again instead of using the saved list
@@ -142,6 +154,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     let mut emit = None;
     let (mut user, mut gateway, mut prefer, mut realm) = (None, None, None, None);
     let (mut paste, mut no_browser, mut refresh, mut json) = (false, false, false, false);
+    let mut embedded = false;
+    let mut allow_lan = None;
 
     let value = |parser: &mut lexopt::Parser| -> Result<String, String> {
         parser
@@ -176,6 +190,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             }
             Long("paste") => paste = true,
             Long("no-browser") => no_browser = true,
+            Long("embedded") => embedded = true,
+            Long("allow-lan") => allow_lan = Some(true),
+            Long("block-lan") => allow_lan = Some(false),
             Long("refresh") => refresh = true,
             Long("json") => json = true,
             Value(v) => positionals.push(
@@ -191,7 +208,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         || realm.is_some()
         || emit.is_some()
         || paste
-        || no_browser;
+        || no_browser
+        || embedded;
     let gateways_only = refresh || json;
     let has_prefer = prefer.is_some();
 
@@ -227,6 +245,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                 realm,
                 paste,
                 browser: !no_browser,
+                embedded,
             })
         }
         Some("connect") => {
@@ -242,9 +261,24 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                 realm,
                 paste,
                 browser: !no_browser,
+                embedded,
             })
         }
         Some("disconnect") => Command::Disconnect,
+        Some("killswitch") => {
+            let mode = match words.next().as_deref() {
+                None => None,
+                Some("off") => Some(KillSwitchMode::Off),
+                Some("connected") => Some(KillSwitchMode::Connected),
+                Some("always") => Some(KillSwitchMode::Always),
+                Some(other) => {
+                    return Err(format!(
+                        "unknown kill switch mode '{other}': use off, connected or always"
+                    ));
+                }
+            };
+            Command::KillSwitch { mode, allow_lan }
+        }
         Some("status") => Command::Status,
         Some("gateways") => {
             if auth_only {
@@ -297,7 +331,34 @@ mod tests {
             realm: None,
             paste: false,
             browser: true,
+            embedded: false,
         }
+    }
+
+    #[test]
+    fn kill_switch_commands() {
+        assert_eq!(
+            p(&["killswitch"]),
+            Ok(Command::KillSwitch {
+                mode: None,
+                allow_lan: None
+            })
+        );
+        assert_eq!(
+            p(&["killswitch", "always", "--allow-lan"]),
+            Ok(Command::KillSwitch {
+                mode: Some(KillSwitchMode::Always),
+                allow_lan: Some(true)
+            })
+        );
+        assert_eq!(
+            p(&["killswitch", "--block-lan"]),
+            Ok(Command::KillSwitch {
+                mode: None,
+                allow_lan: Some(false)
+            })
+        );
+        assert!(p(&["killswitch", "sometimes"]).is_err());
     }
 
     #[test]

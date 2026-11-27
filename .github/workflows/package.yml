@@ -61,7 +61,7 @@ jobs:
             if ($services.Count -ne 1 -or $services[0].Status -ne 'Running') {
               throw "expected the Polytunnel service running, found: $($services | Out-String)"
             }
-            foreach ($file in 'polytunnel.exe', 'polytunnel-daemon.exe', 'wintun.dll', 'LICENSE.txt',
+            foreach ($file in 'polytunnel.exe', 'polytunnel-daemon.exe', 'polytunnel-sso.exe', 'wintun.dll', 'LICENSE.txt',
                               'THIRD-PARTY-NOTICES.txt', 'wintun-LICENSE.txt') {
               if (-not (Test-Path "$dir\$file")) { throw "missing $file" }
             }
@@ -148,7 +148,7 @@ jobs:
         run: |
           cargo build --locked --release
           mkdir -p target/universal-apple-darwin/release
-          cp target/release/polytunnel target/release/polytunnel-daemon target/universal-apple-darwin/release/
+          cp target/release/polytunnel target/release/polytunnel-daemon target/release/polytunnel-sso             target/universal-apple-darwin/release/
       - name: Package
         run: packaging/build.sh universal-apple-darwin 0.0.1 dist
       - name: Install and check

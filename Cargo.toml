@@ -58,6 +58,7 @@ polytunnel-gp.workspace = true
 polytunnel-http.workspace = true
 rpassword.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 socket2.workspace = true
 toml.workspace = true
 tray-icon.workspace = true
@@ -107,6 +108,7 @@ members = [
     "crates/polytunnel-http",
     "crates/polytunnel-ike",
     "crates/polytunnel-net",
+    "crates/polytunnel-sso",
     "xtask",
 ]
 default-members = [
@@ -119,6 +121,7 @@ default-members = [
     "crates/polytunnel-http",
     "crates/polytunnel-ike",
     "crates/polytunnel-net",
+    "crates/polytunnel-sso",
 ]
 
 [workspace.package]

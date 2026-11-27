@@ -108,6 +108,9 @@ pub struct GlobalProtectProfile {
     /// How gateway response times are measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<ProbeMethod>,
+    /// Sign in in Polytunnel's own login window instead of the default browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedded_login: Option<bool>,
 }
 
 /// How priority and speed are combined when picking the best GlobalProtect gateway.

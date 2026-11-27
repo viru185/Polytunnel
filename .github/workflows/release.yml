@@ -74,7 +74,8 @@ jobs:
       TARGET: ${{ matrix.target }}
       GH_TOKEN: ${{ github.token }}
       CARGO_TERM_COLOR: always
-      BINS: polytunnel polytunnel-daemon
+      # Everything that is packaged; the --author smoke test covers the two main programs.
+      BINS: polytunnel polytunnel-daemon polytunnel-sso
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -110,7 +111,7 @@ jobs:
       - name: Smoke test
         shell: bash
         run: |
-          for name in $BINS; do
+          for name in polytunnel polytunnel-daemon; do
             bin=target/$TARGET/release/$name
             [ -f "$bin.exe" ] && bin="$bin.exe"
             "$bin" --version

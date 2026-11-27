@@ -57,6 +57,10 @@
                         Wait="yes" />
       </Component>
 
+      <Component Id="Sso" Directory="INSTALLFOLDER">
+        <File Id="SsoExe" Source="$(var.BinDir)/polytunnel-sso.exe" KeyPath="yes" />
+      </Component>
+
       <Component Id="Wintun" Directory="INSTALLFOLDER">
         <File Id="WintunDll" Name="wintun.dll" Source="$(var.WintunDll)" KeyPath="yes" />
       </Component>

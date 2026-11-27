@@ -1,0 +1,19 @@
+[package]
+name = "polytunnel-sso"
+version = "0.0.0"
+description = "Polytunnel's optional embedded login window for single sign-on (GlobalProtect SAML)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tao = { version = "0.38.0", default-features = false, features = ["rwh_06"] }
+wry = { version = "0.58.2", default-features = false, features = ["os-webview"] }
+
+[lints]
+workspace = true

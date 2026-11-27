@@ -90,6 +90,9 @@ polytunnel auth fortinet vpn.example.net:10443 --user me --emit cookie \
 - The first browser login registers Polytunnel for `globalprotectcallback:` links for your
   user account (`polytunnel uri status|register|unregister`). If the browser cannot hand the
   login back, add `--paste` and paste the link (or the final page's source) into the terminal.
+- On Windows and macOS, `--embedded` (or `embedded-login = true` in the profile, or the
+  checkbox in the window) signs in in Polytunnel's own small login window instead of the
+  browser; it catches the result by itself.
 - Without `--gateway`, Polytunnel measures every gateway's TLS handshake time in parallel and
   picks the best one the way the official app does (source region, then the Highest/High/Medium
   pool before Low/Lowest, then speed). `--prefer <name>` uses a gateway when it answers and
@@ -167,6 +170,15 @@ eap = "mschapv2"
 server-auth = "certificate"
 transport = "tcp"
 ```
+
+### Kill switch
+
+`polytunnel killswitch connected` blocks traffic outside the tunnel while a tunnel is up;
+`always` also blocks while disconnected (lockdown: then only the Polytunnel programs on Windows,
+the last VPN servers and, with `--allow-lan`, the local network get through); `off` lifts it.
+The VPN servers, loopback, DHCP and IPv6 neighbour discovery always pass. It uses the Windows
+Filtering Platform (the rules vanish if the service stops, except in lockdown), nftables on
+Linux and a pf anchor on macOS. The window has the same switches under Settings.
 
 ## Building from source
 

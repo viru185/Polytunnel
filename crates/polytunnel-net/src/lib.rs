@@ -11,6 +11,7 @@
 //! * [`tun`]: opens the TUN device (Wintun on Windows).
 
 pub mod journal;
+pub mod killswitch;
 pub mod plan;
 pub mod prefix;
 pub mod system;

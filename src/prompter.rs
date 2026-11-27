@@ -23,6 +23,8 @@ pub enum SsoMode {
     Callback,
     /// Read the login result pasted into the terminal.
     Paste,
+    /// Show the login in Polytunnel's own window (the `polytunnel-sso` helper).
+    Embedded,
 }
 
 pub struct CliPrompter {
@@ -125,6 +127,11 @@ impl Prompter for CliPrompter {
         if self.mode == SsoMode::Paste {
             self.show_login_page(request)?;
             return self.read_pasted();
+        }
+        if self.mode == SsoMode::Embedded {
+            eprintln!("Sign in in the login window...");
+            return crate::embedded::login(request, &format!("Sign in to {host}"))
+                .map_err(GpError::SsoFailed);
         }
 
         if self.listener.is_none() {
