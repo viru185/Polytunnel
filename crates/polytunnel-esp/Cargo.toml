@@ -1,0 +1,23 @@
+[package]
+name = "polytunnel-esp"
+version = "0.0.0"
+description = "ESP (RFC 4303) for Polytunnel: security associations, replay window, UDP encapsulation."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+aes.workspace = true
+aes-gcm.workspace = true
+cbc.workspace = true
+getrandom.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true
