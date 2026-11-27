@@ -1,0 +1,14 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+description = "Repository tasks for Polytunnel (cargo xtask <task>)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true
