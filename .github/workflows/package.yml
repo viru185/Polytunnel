@@ -1,0 +1,161 @@
+name: Packages
+
+# Builds the installers and checks that they install, start the service, upgrade and
+# uninstall cleanly. Releases build the same packages with packaging/build.sh.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: MSI install, upgrade, uninstall
+    runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9
+      - name: Build
+        run: cargo build --locked --release --target $env:TARGET
+      - name: Build two MSIs (for the upgrade test)
+        shell: bash
+        run: |
+          packaging/build.sh "$TARGET" 0.0.1 dist
+          packaging/build.sh "$TARGET" 0.0.2 dist
+      - name: Install, upgrade and uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = "$env:ProgramFiles\Polytunnel"
+          function Invoke-Msi($action, $msi, $log) {
+            $path = (Resolve-Path $msi).Path
+            $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+              $action, "`"$path`"", '/qn', '/norestart', '/l*v', "`"$env:RUNNER_TEMP\$log`"")
+            if ($p.ExitCode -ne 0) {
+              Get-Content "$env:RUNNER_TEMP\$log" -Tail 80
+              throw "msiexec $action $msi failed with $($p.ExitCode)"
+            }
+          }
+          function Assert-Installed($version) {
+            $entries = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' |
+              Where-Object { $_.PSObject.Properties['DisplayName'] -and $_.DisplayName -eq 'Polytunnel' })
+            if ($entries.Count -ne 1 -or $entries[0].DisplayVersion -ne $version) {
+              throw "expected one Polytunnel $version in Apps, found: $($entries | Format-List | Out-String)"
+            }
+            $services = @(Get-Service | Where-Object Name -eq 'Polytunnel')
+            if ($services.Count -ne 1 -or $services[0].Status -ne 'Running') {
+              throw "expected the Polytunnel service running, found: $($services | Out-String)"
+            }
+            foreach ($file in 'polytunnel.exe', 'polytunnel-daemon.exe', 'wintun.dll', 'LICENSE.txt',
+                              'THIRD-PARTY-NOTICES.txt', 'wintun-LICENSE.txt') {
+              if (-not (Test-Path "$dir\$file")) { throw "missing $file" }
+            }
+            if (-not (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Polytunnel.lnk")) {
+              throw 'missing Start menu shortcut'
+            }
+            # The app reaches the service over its pipe, with no elevation.
+            $out = ''
+            for ($i = 0; $i -lt 30; $i++) {
+              $out = (& "$dir\polytunnel.exe" status 2>&1 | Out-String)
+              if ($out -match 'Not connected\.') { break }
+              Start-Sleep -Seconds 1
+            }
+            if ($out -notmatch 'Not connected\.') { throw "polytunnel status: $out" }
+            if ((& "$dir\polytunnel.exe" --author | Out-String) -notmatch 'Viren Hirpara') { throw '--author' }
+            Write-Host "Polytunnel $version installed, service running, status: $($out.Trim())"
+          }
+
+          Invoke-Msi '/i' 'dist\polytunnel-0.0.1-windows-x64.msi' 'install.log'
+          Assert-Installed '0.0.1'
+          Invoke-Msi '/i' 'dist\polytunnel-0.0.2-windows-x64.msi' 'upgrade.log'
+          Assert-Installed '0.0.2'
+          Invoke-Msi '/x' 'dist\polytunnel-0.0.2-windows-x64.msi' 'uninstall.log'
+          if (Get-Service | Where-Object Name -eq 'Polytunnel') { throw 'service left behind' }
+          if (Test-Path $dir) { throw "$dir left behind" }
+          Write-Host 'Uninstalled cleanly.'
+          exit 0
+      - name: Upload the installer logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: msi-logs
+          path: ${{ runner.temp }}/*.log
+
+  linux:
+    name: deb install and remove, rpm contents
+    runs-on: ubuntu-24.04
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libssl-dev rpm
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9,cargo-deb@3,cargo-generate-rpm@0.21
+      - name: Build
+        run: cargo build --locked --release --target "$TARGET"
+      - name: Package
+        run: packaging/build.sh "$TARGET" 0.0.1 dist
+      - name: Install, check and remove the .deb
+        run: |
+          sudo apt-get install -y ./dist/polytunnel_0.0.1_amd64.deb
+          for _ in $(seq 30); do systemctl is-active --quiet polytunnel-daemon && break; sleep 1; done
+          systemctl status --no-pager polytunnel-daemon
+          for _ in $(seq 30); do out=$(polytunnel status 2>&1) && break; sleep 1; done
+          echo "$out"
+          grep -q 'Not connected\.' <<< "$out"
+          polytunnel --author | grep -q 'Viren Hirpara'
+          test -f /usr/share/applications/polytunnel.desktop
+          sudo apt-get remove -y polytunnel
+          if systemctl is-active --quiet polytunnel-daemon; then echo 'service still running' >&2; exit 1; fi
+          test ! -e /usr/bin/polytunnel-daemon
+      - name: Check the .rpm
+        run: |
+          rpm -qip dist/*.rpm
+          rpm -qlp dist/*.rpm | tee files.txt
+          grep -qx /usr/bin/polytunnel-daemon files.txt
+          grep -qx /usr/lib/systemd/system/polytunnel-daemon.service files.txt
+
+  macos:
+    name: macOS pkg install (beta)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9
+      - name: Build (this machine's architecture; releases are universal)
+        run: |
+          cargo build --locked --release
+          mkdir -p target/universal-apple-darwin/release
+          cp target/release/polytunnel target/release/polytunnel-daemon target/universal-apple-darwin/release/
+      - name: Package
+        run: packaging/build.sh universal-apple-darwin 0.0.1 dist
+      - name: Install and check
+        run: |
+          sudo installer -pkg dist/polytunnel-0.0.1-macos-universal.pkg -target /
+          app=/Applications/Polytunnel.app/Contents/MacOS
+          for _ in $(seq 30); do out=$("$app/polytunnel" status 2>&1) && break; sleep 1; done
+          echo "$out"
+          grep -q 'Not connected\.' <<< "$out"
+          sudo launchctl print system/com.github.viru185.polytunnel.daemon | head -20

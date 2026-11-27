@@ -1,7 +1,8 @@
 name: Release
 
 # release-please keeps a "chore(main): release x.y.z" PR up to date from the Conventional
-# Commits on main. Merging it tags the release; the build job then attaches the binaries.
+# Commits on main. Merging it tags the release; the build jobs then attach the installers
+# (packaging/build.sh), checksums and third-party notices.
 on:
   push:
     branches: [main]
@@ -24,32 +25,53 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
-  build:
-    name: build ${{ matrix.asset }}
+  notices:
+    name: third-party notices
     needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.release-please.outputs.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9
+      - name: Generate THIRD-PARTY-NOTICES.txt
+        run: cargo about generate --fail packaging/about.hbs -o THIRD-PARTY-NOTICES.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: notices
+          path: THIRD-PARTY-NOTICES.txt
+      - name: Upload to the GitHub release
+        run: gh release upload "$TAG" THIRD-PARTY-NOTICES.txt --clobber
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: [release-please, notices]
     if: needs.release-please.outputs.release_created == 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Windows: MSI installer + portable zip. Linux: .deb, .rpm and tarball.
+          # macOS (beta): universal .pkg.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            asset: polytunnel-windows-x86_64.zip
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
-            asset: polytunnel-windows-aarch64.zip
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            asset: polytunnel-linux-x86_64.tar.gz
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-            asset: polytunnel-linux-aarch64.tar.gz
           - os: macos-latest
             target: universal-apple-darwin
-            asset: polytunnel-macos-universal.tar.gz
     runs-on: ${{ matrix.os }}
     env:
       TAG: ${{ needs.release-please.outputs.tag_name }}
+      TARGET: ${{ matrix.target }}
       GH_TOKEN: ${{ github.token }}
       CARGO_TERM_COLOR: always
       BINS: polytunnel polytunnel-daemon
@@ -61,28 +83,35 @@ jobs:
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libssl-dev
+      - name: Install Linux packaging tools
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb@3,cargo-generate-rpm@0.21
+      - uses: actions/download-artifact@v8
+        with:
+          name: notices
+          path: ${{ runner.temp }}/notices
       - name: Build
         shell: bash
         run: |
           # Keep build-machine paths out of the binaries (panic messages embed source paths).
           export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/polytunnel --remap-path-prefix=$HOME=/home"
-          if [ "${{ matrix.target }}" = universal-apple-darwin ]; then
+          if [ "$TARGET" = universal-apple-darwin ]; then
             cargo build --locked --release --target aarch64-apple-darwin
             cargo build --locked --release --target x86_64-apple-darwin
             mkdir -p target/universal-apple-darwin/release
             for name in $BINS; do
-              lipo -create -output "target/universal-apple-darwin/release/$name" \
-                "target/aarch64-apple-darwin/release/$name" \
-                "target/x86_64-apple-darwin/release/$name"
+              lipo -create -output "target/universal-apple-darwin/release/$name"                 "target/aarch64-apple-darwin/release/$name"                 "target/x86_64-apple-darwin/release/$name"
             done
           else
-            cargo build --locked --release --target ${{ matrix.target }}
+            cargo build --locked --release --target "$TARGET"
           fi
       - name: Smoke test
         shell: bash
         run: |
           for name in $BINS; do
-            bin=target/${{ matrix.target }}/release/$name
+            bin=target/$TARGET/release/$name
             [ -f "$bin.exe" ] && bin="$bin.exe"
             "$bin" --version
             out=$("$bin" --author)
@@ -94,24 +123,9 @@ jobs:
           done
       - name: Package
         shell: bash
-        run: |
-          stage="$RUNNER_TEMP/polytunnel"
-          mkdir -p "$stage" dist
-          for name in $BINS; do
-            bin=target/${{ matrix.target }}/release/$name
-            [ -f "$bin.exe" ] && bin="$bin.exe"
-            cp "$bin" "$stage/"
-          done
-          cp README.md LICENSE "$stage/"
-          case "${{ matrix.asset }}" in
-            *.zip) (cd "$RUNNER_TEMP" && 7z a -tzip "$GITHUB_WORKSPACE/dist/${{ matrix.asset }}" polytunnel > /dev/null) ;;
-            *.tar.gz) tar -C "$RUNNER_TEMP" -czf "dist/${{ matrix.asset }}" polytunnel ;;
-          esac
-          cd dist
-          for f in *; do
-            if command -v sha256sum > /dev/null; then sha256sum "$f"; else shasum -a 256 "$f"; fi > "$f.sha256"
-          done
-          ls -l
+        env:
+          NOTICES: ${{ runner.temp }}/notices/THIRD-PARTY-NOTICES.txt
+        run: packaging/build.sh "$TARGET" "${TAG#v}" dist
       - name: Upload to the GitHub release
         shell: bash
         run: gh release upload "$TAG" dist/* --clobber
