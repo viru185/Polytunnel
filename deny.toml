@@ -27,6 +27,11 @@ allow = [
   "CDLA-Permissive-2.0",
   "MPL-2.0",
 ]
+# The GUI ships egui's bundled fonts; Linux builds use ksni for the tray icon.
+exceptions = [
+  { allow = ["OFL-1.1", "Ubuntu-font-1.0"], crate = "epaint_default_fonts" },
+  { allow = ["Unlicense"], crate = "ksni" },
+]
 
 [licenses.private]
 # The workspace's own crates are never published; their licence is the repository's MIT.
