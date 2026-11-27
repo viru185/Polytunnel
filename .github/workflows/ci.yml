@@ -114,9 +114,18 @@ jobs:
       - name: TUN, routes and DNS round trip (Windows runners are administrators)
         if: runner.os == 'Windows'
         run: cargo test --locked -p polytunnel-net --test system -- --ignored --test-threads=1
+      - name: Kill switch (Windows Filtering Platform)
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p polytunnel-net --test killswitch -- --ignored
       - name: TUN, routes and DNS round trip (as root)
         if: runner.os == 'Linux'
         run: |
           bin=$(cargo test --locked -p polytunnel-net --test system --no-run 2>&1             | grep -oE 'target/debug/deps/system-[0-9a-f]+' | head -1)
           sudo "$bin" --ignored --test-threads=1
+      - name: Kill switch (nftables, as root)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y nftables
+          bin=$(cargo test --locked -p polytunnel-net --test killswitch --no-run 2>&1             | grep -oE 'target/debug/deps/killswitch-[0-9a-f]+' | head -1)
+          sudo "$bin" --ignored
 
