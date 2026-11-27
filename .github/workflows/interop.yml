@@ -166,7 +166,8 @@ jobs:
           gateway=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' swan)
           echo "POLYTUNNEL_INTEROP_GATEWAY=$gateway" >> "$GITHUB_ENV"
       - name: Connect, ping, rekey, disconnect; wrong keys and passwords
-        run: sudo -E "$TEST_BIN" --ignored --test-threads=1 --nocapture ikev1_ ikev2_
+        # The filters are substrings: skip tcp_ikev2_*, which runs against libreswan below.
+        run: sudo -E "$TEST_BIN" --ignored --test-threads=1 --nocapture --skip tcp_ ikev1_ ikev2_
       - name: strongSwan log
         if: always()
         run: docker logs swan 2>&1 | tail -400
