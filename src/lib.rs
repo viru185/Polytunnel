@@ -4,12 +4,16 @@
 
 pub mod auth;
 pub mod author;
+pub mod autostart;
 pub mod browser;
 pub mod callback;
 pub mod cli;
 pub mod connect;
 pub mod emit;
+pub mod forticlient;
 pub mod gateways;
+pub mod gui;
+pub mod instance;
 pub mod paths;
 pub mod probe;
 pub mod prompter;
@@ -50,6 +54,8 @@ pub fn run(argv: Vec<OsString>, hooks: &Hooks) -> i32 {
         }
     };
     match command {
+        Command::Window => gui::run_window(),
+        Command::Tray => gui::agent::run(),
         Command::Help => {
             print!("{}", cli::help());
             0
