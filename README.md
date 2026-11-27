@@ -104,7 +104,8 @@ The GlobalProtect tunnel uses ESP over UDP when the gateway offers it and falls 
 TLS tunnel. Routes, DNS (split DNS via NRPT on Windows, systemd-resolved on Linux) and IPv6
 leak protection are applied by the service and rolled back on disconnect, even after a crash.
 If the gateway asks for a host information (HIP) report, Polytunnel sends only real facts about
-the machine. Fortinet tunnels follow in the next milestone.
+the machine. Fortinet SSL VPN runs PPP over TLS
+([protocol notes](docs/protocols/fortinet-ssl.md)).
 
 ## Building from source
 
