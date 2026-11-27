@@ -36,8 +36,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - name: Build the test
         run: |
-          cargo test --locked -p polytunnel-daemon --test ipsec_interop --no-run 2>&1 | tee build.log
-          bin=$(grep -oE 'target/debug/deps/ipsec_interop-[0-9a-f]+' build.log | head -1)
+          # Cargo reports where it put the test program (not always target/debug/deps).
+          bin=$(cargo test --locked -p polytunnel-daemon --test ipsec_interop --no-run --message-format=json | jq -r 'select(.executable != null and .target.name == "ipsec_interop") | .executable' | tail -1)
+          test -x "$bin"
           echo "TEST_BIN=$bin" >> "$GITHUB_ENV"
       - name: Start strongSwan
         run: |
@@ -184,8 +185,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
       - name: Build the test
         run: |
-          cargo test --locked -p polytunnel-daemon --test ipsec_interop --no-run 2>&1 | tee build.log
-          bin=$(grep -oE 'target/debug/deps/ipsec_interop-[0-9a-f]+' build.log | head -1)
+          # Cargo reports where it put the test program (not always target/debug/deps).
+          bin=$(cargo test --locked -p polytunnel-daemon --test ipsec_interop --no-run --message-format=json | jq -r 'select(.executable != null and .target.name == "ipsec_interop") | .executable' | tail -1)
+          test -x "$bin"
           echo "TEST_BIN=$bin" >> "$GITHUB_ENV"
       - name: Start libreswan
         run: |
@@ -204,7 +206,7 @@ jobs:
               plutodebug=base
 
           conn tcp-psk
-              keyexchange=ikev2
+              # IKEv2 is libreswan's default; 4.x (Ubuntu 24.04) rejects keyexchange=ikev2.
               authby=secret
               left=%defaultroute
               leftid=@gateway.test
