@@ -18,7 +18,7 @@ mod windows;
 pub mod args;
 
 /// The operating system's network configuration.
-pub trait System {
+pub trait System: Send {
     /// Makes `change`. `Ok(false)`: it was already there (so it is not ours to undo).
     fn apply(&mut self, change: &Change) -> io::Result<bool>;
 
