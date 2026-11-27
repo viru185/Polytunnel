@@ -248,7 +248,7 @@ fn login_fortinet(
         "Logging in to {}...",
         base.trim_start_matches("https://")
     ));
-    let realm = p.realm.clone().unwrap_or_default();
+    let realm = crate::auth::forti_realm(p);
     let cookie = polytunnel_forti::login(
         &crate::trace::transport(p.server_cert),
         &base,

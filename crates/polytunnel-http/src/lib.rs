@@ -99,11 +99,13 @@ impl Transport for UreqTransport {
         let headers = response
             .headers()
             .iter()
-            .filter_map(|(name, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|v| (name.as_str().to_string(), v.to_string()))
+            // Kept even if a value has bytes outside visible ASCII (a cookie must never be
+            // dropped because of one odd character).
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
             })
             .collect();
         let body = response

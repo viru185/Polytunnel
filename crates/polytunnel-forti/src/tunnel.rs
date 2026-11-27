@@ -1,7 +1,7 @@
 //! The FortiGate SSL VPN tunnel: its configuration and the framing of PPP over TLS.
 //!
-//! 1. `GET /remote/fortisslvpn_xml` (with the `SVPNCOOKIE`) returns the assigned address,
-//!    DNS servers, DNS suffixes and split-tunnel networks.
+//! 1. `GET /remote/fortisslvpn_xml?dual_stack=1` (with the session's cookies) returns the
+//!    assigned address, DNS servers, DNS suffixes and split-tunnel networks.
 //! 2. `GET /remote/sslvpn-tunnel` on a fresh TLS connection turns it into a PPP link. Every
 //!    PPP packet is framed with a 6-byte header: total length, `0x5050`, PPP length.
 //! 3. `GET /remote/logout` ends the session.
@@ -15,25 +15,32 @@ use polytunnel_core::Secret;
 use polytunnel_core::http::{Request, Response};
 use polytunnel_core::xml::Element;
 
-use crate::login::{COOKIE_NAME, FortiError};
+use crate::login::{FortiError, USER_AGENT};
 
-fn cookie_header(cookie: &Secret) -> String {
-    format!("{COOKIE_NAME}={}", cookie.expose())
+/// `cookies` is the session's `Cookie` header value (from [`crate::login::login`]).
+fn session_request(url: String, cookies: &Secret) -> Request {
+    Request::get(url)
+        .header("User-Agent", USER_AGENT)
+        .header("Cookie", cookies.expose())
 }
 
-pub fn config_request(base: &str, cookie: &Secret) -> Request {
-    Request::get(format!("{base}/remote/fortisslvpn_xml")).header("Cookie", &cookie_header(cookie))
+pub fn config_request(base: &str, cookies: &Secret) -> Request {
+    session_request(
+        format!("{base}/remote/fortisslvpn_xml?dual_stack=1"),
+        cookies,
+    )
 }
 
-pub fn logout_request(base: &str, cookie: &Secret) -> Request {
-    Request::get(format!("{base}/remote/logout")).header("Cookie", &cookie_header(cookie))
+pub fn logout_request(base: &str, cookies: &Secret) -> Request {
+    session_request(format!("{base}/remote/logout"), cookies)
 }
 
 /// The bytes that turn a fresh TLS connection into the PPP tunnel.
-pub fn tunnel_request(host: &str, cookie: &Secret) -> Vec<u8> {
+pub fn tunnel_request(host: &str, cookies: &Secret) -> Vec<u8> {
     format!(
-        "GET /remote/sslvpn-tunnel HTTP/1.1\r\nHost: {host}\r\nCookie: {}\r\n\r\n",
-        cookie_header(cookie)
+        "GET /remote/sslvpn-tunnel HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {USER_AGENT}\r\n\
+         Cookie: {}\r\n\r\n",
+        cookies.expose()
     )
     .into_bytes()
 }
@@ -154,6 +161,15 @@ pub mod frame {
             if self.buf.len() < HEADER_LEN {
                 return Ok(None);
             }
+            // A refusal comes back as an HTTP answer instead of PPP (openconnect reports it).
+            if self.buf.starts_with(b"HTTP/") {
+                let line = self.buf.split(|b| *b == b'\r' || *b == b'\n').next();
+                let line = String::from_utf8_lossy(line.unwrap_or_default());
+                return Err(FortiError::BadResponse(format!(
+                    "the server refused the tunnel: {}",
+                    line.trim()
+                )));
+            }
             let total = usize::from(u16::from_be_bytes([self.buf[0], self.buf[1]]));
             let len = usize::from(u16::from_be_bytes([self.buf[4], self.buf[5]]));
             if self.buf[2..4] != MAGIC || total != len + HEADER_LEN {
@@ -229,22 +245,38 @@ mod tests {
     }
 
     #[test]
-    fn requests_carry_the_cookie() {
-        let cookie = Secret::new("FAKE+cookie==");
-        let req = config_request("https://vpn.example.net:10443", &cookie);
+    fn requests_carry_the_cookies() {
+        let cookies = Secret::new("lang=en; SVPNCOOKIE=FAKE+cookie==");
+        let req = config_request("https://vpn.example.net:10443", &cookies);
         assert_eq!(
             req.url,
-            "https://vpn.example.net:10443/remote/fortisslvpn_xml"
+            "https://vpn.example.net:10443/remote/fortisslvpn_xml?dual_stack=1"
         );
         assert!(
             req.headers
-                .contains(&("Cookie".into(), "SVPNCOOKIE=FAKE+cookie==".into()))
+                .contains(&("Cookie".into(), "lang=en; SVPNCOOKIE=FAKE+cookie==".into()))
         );
-        let tunnel = String::from_utf8(tunnel_request("vpn.example.net:10443", &cookie)).unwrap();
+        assert!(
+            req.headers
+                .contains(&("User-Agent".into(), "Mozilla/5.0 SV1".into()))
+        );
+        let tunnel = String::from_utf8(tunnel_request("vpn.example.net:10443", &cookies)).unwrap();
         assert_eq!(
             tunnel,
             "GET /remote/sslvpn-tunnel HTTP/1.1\r\nHost: vpn.example.net:10443\r\n\
-             Cookie: SVPNCOOKIE=FAKE+cookie==\r\n\r\n"
+             User-Agent: Mozilla/5.0 SV1\r\nCookie: lang=en; SVPNCOOKIE=FAKE+cookie==\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn an_http_refusal_of_the_tunnel_is_reported() {
+        let mut decoder = Decoder::default();
+        decoder.feed(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+        let err = decoder.next_packet().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("the server refused the tunnel: HTTP/1.1 403 Forbidden"),
+            "{err}"
         );
     }
 

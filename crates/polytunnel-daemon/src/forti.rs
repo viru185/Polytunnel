@@ -11,7 +11,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use polytunnel_core::Secret;
-use polytunnel_core::http::Transport;
+use polytunnel_core::http::{CookieJar, Transport};
 use polytunnel_core::ipc::{FortiConnect, Status};
 use polytunnel_core::pin::CertFingerprint;
 use polytunnel_forti::ppp::{Event, IpConfig, Ppp};
@@ -52,15 +52,25 @@ pub async fn run(c: FortiConnect, status: StatusCell, mut stop: watch::Receiver<
             return;
         }
     };
-    let result = connect_and_run(&c, &status, &mut stop, &mut journal, system.as_mut()).await;
+    // The session's cookies, refreshed by the configuration answer.
+    let mut cookies = c.cookie.clone();
+    let result = connect_and_run(
+        &c,
+        &mut cookies,
+        &status,
+        &mut stop,
+        &mut journal,
+        system.as_mut(),
+    )
+    .await;
     crate::killswitch::tunnel_down();
     if let Err(e) = journal.rollback(system.as_mut()) {
         warn!("could not undo every network change: {e}");
     }
-    let (server, cookie, pin) = (c.server.clone(), c.cookie.clone(), c.server_cert);
+    let (server, pin) = (c.server.clone(), c.server_cert);
     let _ = blocking(move || {
         crate::trace::transport(pin)
-            .send(&tunnel::logout_request(&server, &cookie))
+            .send(&tunnel::logout_request(&server, &cookies))
             .map(|_| ())
             .map_err(|e| e.to_string())
     })
@@ -94,7 +104,7 @@ pub fn tunnel_config(
     }
     TunnelConfig {
         addresses: vec![Prefix::host(IpAddr::V4(ip.address))],
-        mtu: MRU,
+        mtu: ip.mtu,
         routes: prefixes(&settings.routes),
         exclude_routes: prefixes(&settings.exclude_routes),
         dns_servers,
@@ -105,6 +115,7 @@ pub fn tunnel_config(
 
 async fn connect_and_run(
     c: &FortiConnect,
+    cookies: &mut Secret,
     status: &StatusCell,
     stop: &mut watch::Receiver<bool>,
     journal: &mut Journal,
@@ -112,14 +123,20 @@ async fn connect_and_run(
 ) -> Result<(), String> {
     info!("connecting to {}", c.server);
     let settings = {
-        let (server, cookie, pin) = (c.server.clone(), c.cookie.clone(), c.server_cert);
-        blocking(move || {
+        let (server, sent, pin) = (c.server.clone(), cookies.clone(), c.server_cert);
+        let (settings, refreshed) = blocking(move || {
             let response = crate::trace::transport(pin)
-                .send(&tunnel::config_request(&server, &cookie))
+                .send(&tunnel::config_request(&server, &sent))
                 .map_err(|e| e.to_string())?;
-            tunnel::parse_config(&response).map_err(|e| e.to_string())
+            // The server may renew the session cookie here (openconnect keeps the new one).
+            let mut jar = CookieJar::from_header(sent.expose());
+            jar.update(&response);
+            let settings = tunnel::parse_config(&response).map_err(|e| e.to_string())?;
+            Ok::<_, String>((settings, Secret::new(jar.header())))
         })
-        .await?
+        .await?;
+        *cookies = refreshed;
+        settings
     };
 
     let (host, port) = host_port(&c.server);
@@ -129,9 +146,11 @@ async fn connect_and_run(
             .map_err(|_| "resolving the server timed out".to_string())?
             .map_err(|e| format!("cannot resolve the server: {e}"))?
             .collect();
-    let addr = *addrs.first().ok_or("the server has no address")?;
+    if addrs.is_empty() {
+        return Err("the server has no address".into());
+    }
 
-    let stream = open_tunnel(&host, port, addr, &c.cookie, c.server_cert.as_ref()).await?;
+    let stream = open_tunnel(&host, port, &addrs, cookies, c.server_cert.as_ref()).await?;
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut decoder = frame::Decoder::default();
     let magic = {
@@ -140,7 +159,12 @@ async fn connect_and_run(
         // Never zero (PPP reserves it), even if the OS gave no randomness.
         (u32::from_be_bytes(bytes) ^ now_unix() as u32) | 1
     };
-    let mut ppp = Ppp::new(magic, MRU, settings.address);
+    let mut ppp = Ppp::new(
+        magic,
+        MRU,
+        settings.address,
+        settings.dns_servers.is_empty(),
+    );
     let ip = negotiate(&mut ppp, &mut reader, &mut writer, &mut decoder).await?;
     info!("PPP is up with address {}", ip.address);
 
@@ -168,17 +192,27 @@ async fn connect_and_run(
     }
 }
 
+/// Opens the tunnel connection, trying each of the server's addresses in turn.
 async fn open_tunnel(
     host: &str,
     port: u16,
-    addr: SocketAddr,
-    cookie: &Secret,
+    addrs: &[SocketAddr],
+    cookies: &Secret,
     pin: Option<&CertFingerprint>,
 ) -> Result<tokio_native_tls::TlsStream<TcpStream>, String> {
-    let tcp = timeout(STEP_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .map_err(|_| "connecting to the server timed out".to_string())?
-        .map_err(|e| format!("cannot connect to the server: {e}"))?;
+    let mut last_error = String::from("the server has no address");
+    let mut connected = None;
+    for addr in addrs {
+        match timeout(STEP_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(tcp)) => {
+                connected = Some(tcp);
+                break;
+            }
+            Ok(Err(e)) => last_error = format!("cannot connect to the server ({addr}): {e}"),
+            Err(_) => last_error = format!("connecting to the server ({addr}) timed out"),
+        }
+    }
+    let tcp = connected.ok_or(last_error)?;
     let connector = polytunnel_http::tls_connector(pin)?;
     let mut tls = timeout(
         STEP_TIMEOUT,
@@ -191,12 +225,18 @@ async fn open_tunnel(
     if let Some(pin) = pin {
         polytunnel_http::check_pin(tls.get_ref(), pin)?;
     }
-    let host_header = if port == 443 {
+    // IPv6 literals keep their brackets in the Host header.
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
         host.to_string()
+    };
+    let host_header = if port == 443 {
+        host
     } else {
         format!("{host}:{port}")
     };
-    tls.write_all(&tunnel::tunnel_request(&host_header, cookie))
+    tls.write_all(&tunnel::tunnel_request(&host_header, cookies))
         .await
         .map_err(|e| e.to_string())?;
     Ok(tls)
@@ -362,6 +402,8 @@ mod tests {
             }
             decoder.feed(&buf[..n]);
             while let Ok(Some(p)) = decoder.next_packet() {
+                // Polytunnel sends the address/control field FF 03 first, as openconnect does.
+                let p = p.strip_prefix(&[0xff, 0x03]).unwrap_or(&p).to_vec();
                 let protocol = u16::from_be_bytes([p[0], p[1]]);
                 let (code, id) = (p[2], p[3]);
                 let reply: Vec<Vec<u8>> = match (protocol, code) {
@@ -399,7 +441,7 @@ mod tests {
         tokio::spawn(fake_fortigate(server));
         let (mut reader, mut writer) = tokio::io::split(client);
         let mut decoder = frame::Decoder::default();
-        let mut ppp = Ppp::new(0x1234_5679, MRU, None);
+        let mut ppp = Ppp::new(0x1234_5679, MRU, None, true);
         let ip = negotiate(&mut ppp, &mut reader, &mut writer, &mut decoder)
             .await
             .unwrap();
@@ -447,10 +489,12 @@ mod tests {
         let ip = IpConfig {
             address: Ipv4Addr::new(10, 212, 134, 200),
             dns: vec![Ipv4Addr::new(10, 0, 0, 53)],
+            mtu: 1300,
         };
         let config = tunnel_config(&settings, &ip, vec!["203.0.113.10".parse().unwrap()]);
         assert_eq!(config.addresses, vec!["10.212.134.200/32".parse().unwrap()]);
         assert_eq!(config.routes, vec!["10.0.0.0/8".parse().unwrap()]);
+        assert_eq!(config.mtu, 1300, "the negotiated MTU");
         // DNS from IPCP wins over the XML.
         assert_eq!(
             config.dns_servers,

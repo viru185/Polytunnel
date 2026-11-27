@@ -175,7 +175,7 @@ fn login_gp(profile: &GlobalProtectProfile, args: &AuthArgs) -> Result<LoginOutp
 pub(crate) struct FortiLogin {
     pub base: String,
     pub username: String,
-    /// The `SVPNCOOKIE` value.
+    /// The session's cookies (a `Cookie` header value with `SVPNCOOKIE`).
     pub cookie: Secret,
 }
 
@@ -201,6 +201,35 @@ pub(crate) fn forti_error(base: &str, pin: Option<CertFingerprint>, error: Forti
     error.to_string()
 }
 
+/// The realm to log in to: the profile's, else one named in its server address
+/// (`vpn.example.com/Staff` or `...?realm=Staff`, as openconnect accepts), else none.
+pub(crate) fn forti_realm(profile: &FortinetSslProfile) -> String {
+    if let Some(realm) = profile.realm.as_deref().filter(|r| !r.is_empty()) {
+        return realm.to_string();
+    }
+    let server = profile.server.trim();
+    let rest = server
+        .strip_prefix("https://")
+        .or_else(|| server.strip_prefix("http://"))
+        .unwrap_or(server);
+    let Some((_, path)) = rest.split_once(['/', '?']) else {
+        return String::new();
+    };
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
+    let from_query = query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == "realm" && !v.is_empty()).then(|| v.to_string())
+    });
+    from_query
+        .or_else(|| {
+            path.split('/')
+                .find(|s| !s.is_empty())
+                .filter(|s| *s != "remote")
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
 /// `(host, port)` of an `https://host[:port]` base address.
 fn host_port(base: &str) -> Option<(String, u16)> {
     let authority = base.strip_prefix("https://")?.split('/').next()?;
@@ -221,7 +250,7 @@ pub(crate) fn forti_login(profile: &FortinetSslProfile) -> Result<FortiLogin, St
         None => prompter::ask("Username: ").map_err(|e| e.to_string())?,
     };
     let password = prompter::ask_secret("Password: ").map_err(|e| e.to_string())?;
-    let realm = profile.realm.clone().unwrap_or_default();
+    let realm = forti_realm(profile);
     eprintln!("Logging in to {}...", base.trim_start_matches("https://"));
     let cookie = polytunnel_forti::login(
         &crate::trace::transport(profile.server_cert),
@@ -260,10 +289,13 @@ fn login_fortinet(profile: &FortinetSslProfile) -> Result<LoginOutput, String> {
         protocol: "fortinet",
         host: base,
         os: None,
+        // openconnect takes the session cookie alone.
         cookie: Secret::new(format!(
             "{}={}",
             polytunnel_forti::login::COOKIE_NAME,
-            cookie.expose()
+            polytunnel_core::http::CookieJar::from_header(cookie.expose())
+                .get(polytunnel_forti::login::COOKIE_NAME)
+                .unwrap_or_default()
         )),
         username: Some(username),
         gateway: None,
@@ -310,6 +342,22 @@ pub fn list_profiles() -> i32 {
 mod tests {
     use super::*;
     use crate::cli::Emit;
+
+    #[test]
+    fn the_realm_can_come_from_the_server_address() {
+        let realm = |server: &str, realm: Option<&str>| {
+            forti_realm(&FortinetSslProfile {
+                server: server.into(),
+                realm: realm.map(str::to_string),
+                ..Default::default()
+            })
+        };
+        assert_eq!(realm("vpn.example.net:10443", None), "");
+        assert_eq!(realm("vpn.example.net:10443/Staff", None), "Staff");
+        assert_eq!(realm("https://vpn.example.net/?realm=Lab", None), "Lab");
+        assert_eq!(realm("vpn.example.net/remote/login?realm=Ops", None), "Ops");
+        assert_eq!(realm("vpn.example.net/Staff", Some("Admins")), "Admins");
+    }
 
     #[test]
     fn host_and_port_of_base_addresses() {
