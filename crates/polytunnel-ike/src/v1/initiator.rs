@@ -1086,13 +1086,15 @@ impl Initiator {
                 .octets()
                 .to_vec(),
         };
-        let everything = Id {
+        let (net, len) = self.config.remote_network;
+        let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
+        let remote = Id {
             kind: id_type::IPV4_ADDR_SUBNET,
             protocol: 0,
             port: 0,
-            data: vec![0; 8],
+            data: [(u32::from(net) & mask).to_be_bytes(), mask.to_be_bytes()].concat(),
         };
-        (ours, everything)
+        (ours, remote)
     }
 
     fn start_quick(&mut self, now: Instant) -> Result<(), String> {

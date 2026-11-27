@@ -64,6 +64,7 @@ fn config() -> Config {
             password: Zeroizing::new(password()),
         }),
         mode_config: ModeConfigMode::Pull,
+        remote_network: (Ipv4Addr::UNSPECIFIED, 0),
         dpd: Some(Duration::from_secs(20)),
         local: local_addr(),
         remote: gateway_addr(),
@@ -362,6 +363,11 @@ impl Gateway {
         let ids: Vec<Vec<u8>> = chain.all(payload::ID).map(<[u8]>::to_vec).collect();
         assert_eq!(ids.len(), 2);
         assert_eq!(Id::parse(&ids[0]).unwrap().data, vec![10, 212, 134, 200]);
+        let remote = Id::parse(&ids[1]).unwrap();
+        assert_eq!(
+            (remote.kind, remote.data),
+            (id_type::IPV4_ADDR_SUBNET, vec![0; 8])
+        );
         let dh = KeyPair::generate(Group::Modp2048).unwrap();
         let gqm = dh.agree(&ke).unwrap();
         let nr = vec![0x99; 32];

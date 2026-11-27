@@ -233,6 +233,8 @@ pub struct Config {
     /// `None`: plain pre-shared key authentication, no XAuth.
     pub xauth: Option<Credentials>,
     pub mode_config: ModeConfigMode,
+    /// The remote side of the quick-mode selectors (`0.0.0.0/0`: everything).
+    pub remote_network: (Ipv4Addr, u8),
     /// Dead-peer detection interval; `None` turns it off.
     pub dpd: Option<Duration>,
     /// Our UDP address (as bound) and the gateway's IKE address (port 500).
@@ -278,6 +280,9 @@ impl Config {
             || self.esp_lifetime < Duration::from_secs(60)
         {
             return Err("lifetimes are too short".into());
+        }
+        if self.remote_network.1 > 32 {
+            return Err("the remote network's prefix length is over 32".into());
         }
         if !self.remote.is_ipv4() {
             return Err("IKEv1 gateways are reached over IPv4".into());
