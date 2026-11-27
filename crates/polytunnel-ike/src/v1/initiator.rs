@@ -10,6 +10,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use polytunnel_esp::{Cipher, Integrity, Keys};
+
+use crate::session::Session;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -91,35 +93,7 @@ const RETIRE_AFTER: Duration = Duration::from_secs(20);
 const PUSH_WAIT: Duration = Duration::from_secs(4);
 const NONCE_LEN: usize = 32;
 
-/// What the caller must do.
-#[derive(Debug)]
-pub enum Output {
-    /// Send an IKE message to the gateway: to its NAT-T port (4500, after the four-byte
-    /// non-ESP marker) when `natt`, else to the IKE port (500).
-    Send { natt: bool, message: Vec<u8> },
-    /// The gateway wants more XAuth input; reply with [`Initiator::answer`].
-    Prompt(XauthPrompt),
-    /// Our address, DNS servers and split networks.
-    Configured(ModeConfig),
-    /// A pair of ESP SAs is ready (the first, or a rekeyed one): send with it from now on.
-    ChildSa(ChildSa),
-    /// Stop accepting packets for this inbound SPI.
-    Retire { inbound_spi: u32 },
-    /// The session is over. `retry`: a fresh connection may well succeed (the gateway went
-    /// away or the session expired); otherwise it was refused (wrong key, password, ...).
-    Closed { reason: String, retry: bool },
-}
-
-/// One ESP SA in each direction.
-#[derive(Debug)]
-pub struct ChildSa {
-    pub inbound_spi: u32,
-    pub inbound: Keys,
-    pub outbound_spi: u32,
-    pub outbound: Keys,
-    pub proposal: EspProposal,
-    pub lifetime: Duration,
-}
+pub use crate::session::{ChildSa, Output};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -1555,4 +1529,34 @@ pub(crate) fn nat_hash(hash: HashAlg, cky_i: [u8; 8], cky_r: [u8; 8], addr: Sock
         IpAddr::V6(a) => a.octets().to_vec(),
     };
     hash.hash(&[&cky_i, &cky_r, &ip, &addr.port().to_be_bytes()])
+}
+
+impl Session for Initiator {
+    fn start(&mut self, now: Instant) -> Vec<Output> {
+        Initiator::start(self, now)
+    }
+
+    fn receive(&mut self, now: Instant, message: &[u8]) -> Vec<Output> {
+        Initiator::receive(self, now, message)
+    }
+
+    fn answer(&mut self, values: Vec<Zeroizing<String>>) -> Vec<Output> {
+        Initiator::answer(self, values)
+    }
+
+    fn note_alive(&mut self, now: Instant) {
+        Initiator::note_alive(self, now);
+    }
+
+    fn poll(&mut self, now: Instant) -> Vec<Output> {
+        Initiator::poll(self, now)
+    }
+
+    fn close(&mut self) -> Vec<Output> {
+        Initiator::close(self)
+    }
+
+    fn is_closed(&self) -> bool {
+        Initiator::is_closed(self)
+    }
 }

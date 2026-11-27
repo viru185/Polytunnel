@@ -10,18 +10,25 @@ publish = false
 
 [dependencies]
 aes.workspace = true
+aes-gcm.workspace = true
 cbc.workspace = true
 crypto-bigint.workspace = true
+des.workspace = true
 elliptic-curve.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
+md4.workspace = true
 md5.workspace = true
 p256.workspace = true
 p384.workspace = true
 polytunnel-esp.workspace = true
+ring.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
 sha1.workspace = true
 sha2.workspace = true
 subtle.workspace = true
+webpki.workspace = true
 zeroize.workspace = true
 
 [lints]
