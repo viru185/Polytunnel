@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::net::IpAddr;
 use std::process::{Command, Stdio};
 
-use super::{System, args, if_index, if_name, run};
+use super::{System, args, if_index, if_name, route_already_gone, run};
 use crate::plan::{Change, Via};
 
 pub struct MacOs;
@@ -66,6 +66,9 @@ impl System for MacOs {
     }
 
     fn revert(&mut self, change: &Change) -> io::Result<()> {
+        if route_already_gone(change) {
+            return Ok(());
+        }
         if let Some(args) = route_args(false, change)? {
             return match run("route", &args) {
                 Ok(_) => Ok(()),

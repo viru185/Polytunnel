@@ -109,6 +109,22 @@ pub(crate) fn if_name(index: u32) -> io::Result<String> {
     Ok(name.to_string_lossy().into_owned())
 }
 
+/// Whether no interface has this index any more (it went away, e.g. with the tunnel). The
+/// kernel drops an interface's routes with it, so there is nothing left to undo on it.
+#[cfg(unix)]
+pub(crate) fn interface_gone(index: u32) -> bool {
+    matches!(
+        if_name(index).map_err(|e| e.raw_os_error()),
+        Err(Some(libc::ENXIO | libc::ENODEV))
+    )
+}
+
+/// Undoing a route on an interface that no longer exists: already done.
+#[cfg(unix)]
+pub(crate) fn route_already_gone(change: &Change) -> bool {
+    matches!(change, Change::Route { via, .. } if interface_gone(via.if_index()))
+}
+
 /// The interface index for a name.
 #[cfg(unix)]
 pub(crate) fn if_index(name: &str) -> io::Result<u32> {
@@ -117,5 +133,40 @@ pub(crate) fn if_index(name: &str) -> io::Result<u32> {
     match unsafe { libc::if_nametoindex(name.as_ptr()) } {
         0 => Err(io::Error::last_os_error()),
         index => Ok(index),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::plan::Via;
+
+    #[test]
+    fn only_missing_interfaces_are_gone() {
+        let lo = if_index(if cfg!(target_os = "macos") {
+            "lo0"
+        } else {
+            "lo"
+        })
+        .unwrap();
+        assert!(!interface_gone(lo));
+        let missing = u32::MAX - 7;
+        assert!(interface_gone(missing));
+
+        let route = |if_index| Change::Route {
+            prefix: "203.0.113.0/24".parse().unwrap(),
+            via: Via::Tunnel { if_index },
+        };
+        assert!(route_already_gone(&route(missing)));
+        assert!(!route_already_gone(&route(lo)));
+        let dns = Change::Dns {
+            if_index: missing,
+            servers: Vec::new(),
+            domains: Vec::new(),
+        };
+        assert!(
+            !route_already_gone(&dns),
+            "only routes vanish with the interface"
+        );
     }
 }
