@@ -60,8 +60,8 @@ The binaries are `target/release/polytunnel` (app and CLI) and
 ## Project layout
 
 ```
+src/                       `polytunnel` (root crate): tray agent, window, command line
 crates/polytunnel-core     shared types, validation, IPC schema
-crates/polytunnel-app      `polytunnel`: tray agent, window, command line
 crates/polytunnel-daemon   `polytunnel-daemon`: privileged background service
 xtask                      repository tasks (`cargo xtask lint-fixtures`)
 docs/                      architecture notes and decision records

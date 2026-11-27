@@ -35,7 +35,7 @@ exists while you look at it.
 | Crate | Contents |
 |---|---|
 | `polytunnel-core` | Validated values, secrets, profile schema, IPC schema, redaction. No I/O. |
-| `polytunnel-app` | The `polytunnel` binary. |
+| `polytunnel` (root crate, `src/`) | The `polytunnel` binary. It is the workspace root because release-please needs a package there to bump all crates together. |
 | `polytunnel-daemon` | The `polytunnel-daemon` binary. |
 | `polytunnel-gp` *(M1)* | GlobalProtect: prelogin, SSO callback, portal and gateway exchanges, gateway ranking and probing, HIP report, tunnel framing. |
 | `polytunnel-forti` *(M1)* | Fortinet: SSL VPN login, PPP over TLS, FortiClient profile import. |
