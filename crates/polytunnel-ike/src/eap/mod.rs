@@ -3,6 +3,7 @@
 //! [RFC 3748]: https://www.rfc-editor.org/rfc/rfc3748
 
 pub mod mschapv2;
+pub mod ttls;
 
 use std::fmt;
 
@@ -34,12 +35,15 @@ mod opcode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EapMethod {
     MsChapV2,
+    /// EAP-TTLS with PAP inside.
+    TtlsPap,
 }
 
 impl EapMethod {
     pub fn kind(self) -> u8 {
         match self {
             EapMethod::MsChapV2 => kind::MSCHAPV2,
+            EapMethod::TtlsPap => kind::TTLS,
         }
     }
 }
@@ -67,6 +71,9 @@ pub struct EapClient {
     password: Zeroizing<String>,
     mschap: Option<MsChap>,
     msk: Option<Zeroizing<Vec<u8>>>,
+    /// Who may run the TTLS server.
+    trust: Option<crate::v2::auth::Trust>,
+    ttls: Option<ttls::Ttls>,
 }
 
 impl fmt::Debug for EapClient {
@@ -95,7 +102,15 @@ impl EapClient {
             password,
             mschap: None,
             msk: None,
+            trust: None,
+            ttls: None,
         }
+    }
+
+    /// The CA certificates and name an EAP-TTLS server must present.
+    pub fn with_trust(mut self, trust: crate::v2::auth::Trust) -> Self {
+        self.trust = Some(trust);
+        self
     }
 
     /// The master session key, once the method has finished.
@@ -115,8 +130,18 @@ impl EapClient {
         }
         let p = &packet_in[..len];
         match code {
-            code::SUCCESS if self.msk.is_some() => Step::Success,
-            code::SUCCESS => Step::Failure("EAP succeeded before authentication finished".into()),
+            code::SUCCESS => {
+                if self.msk.is_none()
+                    && let Some(t) = self.ttls.as_ref().filter(|t| t.finished())
+                {
+                    self.msk = t.msk();
+                }
+                if self.msk.is_some() {
+                    Step::Success
+                } else {
+                    Step::Failure("EAP succeeded before authentication finished".into())
+                }
+            }
             code::FAILURE => Step::Failure(
                 "the gateway rejected the sign-in (check the username and password)".into(),
             ),
@@ -130,6 +155,7 @@ impl EapClient {
                         self.username.as_bytes(),
                     )),
                     kind::MSCHAPV2 if self.method == EapMethod::MsChapV2 => self.mschapv2(id, data),
+                    kind::TTLS if self.method == EapMethod::TtlsPap => self.ttls(id, data),
                     // Ask for the method we were configured with.
                     _ => {
                         Step::Respond(packet(code::RESPONSE, id, kind::NAK, &[self.method.kind()]))
@@ -137,6 +163,22 @@ impl EapClient {
                 }
             }
             _ => Step::Failure("an unexpected EAP packet".into()),
+        }
+    }
+
+    fn ttls(&mut self, id: u8, data: &[u8]) -> Step {
+        if self.ttls.is_none() {
+            let Some(trust) = &self.trust else {
+                return Step::Failure("EAP-TTLS needs trusted CA certificates".into());
+            };
+            match ttls::Ttls::new(trust, self.username.clone(), self.password.clone()) {
+                Ok(t) => self.ttls = Some(t),
+                Err(e) => return Step::Failure(e),
+            }
+        }
+        match self.ttls.as_mut().expect("just made").handle(data) {
+            Ok(response) => Step::Respond(packet(code::RESPONSE, id, kind::TTLS, &response)),
+            Err(e) => Step::Failure(e),
         }
     }
 

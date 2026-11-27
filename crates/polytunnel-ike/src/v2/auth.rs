@@ -90,6 +90,11 @@ impl Trust {
         Ok(Self { anchors, name })
     }
 
+    /// The trusted CA certificates.
+    pub fn anchors(&self) -> &[TrustAnchor<'static>] {
+        &self.anchors
+    }
+
     /// Verifies the gateway's certificate chain (end-entity first, DER) and its AUTH
     /// signature over `octets`.
     pub fn verify(

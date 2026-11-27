@@ -221,6 +221,8 @@ pub struct FortinetIpsecProfile {
 #[serde(rename_all = "kebab-case")]
 pub enum EapMethodName {
     Mschapv2,
+    /// EAP-TTLS with PAP inside.
+    TtlsPap,
 }
 
 /// How an IKEv2 gateway authenticates itself.

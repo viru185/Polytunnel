@@ -335,7 +335,14 @@ impl Initiator {
                 method,
                 username,
                 password,
-            } => Some(EapClient::new(*method, username.clone(), password.clone())),
+                trust,
+            } => {
+                let client = EapClient::new(*method, username.clone(), password.clone());
+                Some(match trust {
+                    Some(t) => client.with_trust(t.clone()),
+                    None => client,
+                })
+            }
             ClientAuth::Psk(_) => None,
         };
         Ok(Self {

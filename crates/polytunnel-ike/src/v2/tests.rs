@@ -559,6 +559,7 @@ fn eap_mschapv2_with_a_certificate_gateway() {
         method: EapMethod::MsChapV2,
         username: "alice".into(),
         password: Zeroizing::new(password()),
+        trust: None,
     };
     let mut client =
         Initiator::new(config(client_auth, ServerAuth::Certificate(trust)), now).unwrap();

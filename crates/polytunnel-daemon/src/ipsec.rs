@@ -179,22 +179,32 @@ pub fn ike2_config(
     remote: SocketAddr,
 ) -> Result<v2::Config, String> {
     let psk = || Zeroizing::new(c.psk.expose().as_bytes().to_vec());
+    // The gateway's (and an EAP-TTLS server's) certificate: system roots plus the profile's
+    // CA, issued for remote-id or the server name.
+    let trust = || {
+        let name = c.remote_id.clone().unwrap_or_else(|| c.server.clone());
+        let pem = c.ca_pem.as_deref().unwrap_or_default();
+        Trust::new(pem.as_bytes(), true, name)
+    };
     let client_auth = match (c.eap, &c.xauth) {
-        (Some(EapMethodName::Mschapv2), Some(login)) => ClientAuth::Eap {
-            method: EapMethod::MsChapV2,
+        (Some(method), Some(login)) => ClientAuth::Eap {
+            method: match method {
+                EapMethodName::Mschapv2 => EapMethod::MsChapV2,
+                EapMethodName::TtlsPap => EapMethod::TtlsPap,
+            },
             username: login.username.clone(),
             password: Zeroizing::new(login.password.expose().to_string()),
+            trust: match method {
+                EapMethodName::TtlsPap => Some(trust()?),
+                EapMethodName::Mschapv2 => None,
+            },
         },
         (Some(_), None) => return Err("EAP needs a username and password".into()),
         (None, _) => ClientAuth::Psk(psk()),
     };
     let server_auth = match c.server_auth {
         ServerAuthStyle::Psk => ServerAuth::Psk(psk()),
-        ServerAuthStyle::Certificate => {
-            let name = c.remote_id.clone().unwrap_or_else(|| c.server.clone());
-            let pem = c.ca_pem.as_deref().unwrap_or_default();
-            ServerAuth::Certificate(Trust::new(pem.as_bytes(), true, name)?)
-        }
+        ServerAuthStyle::Certificate => ServerAuth::Certificate(trust()?),
     };
     let config = v2::Config {
         ike: proposals(&c.ike_proposals, IkeSuite::parse, "IKE")?,

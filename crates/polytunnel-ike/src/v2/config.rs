@@ -20,6 +20,8 @@ pub enum ClientAuth {
         method: EapMethod,
         username: String,
         password: Zeroizing<String>,
+        /// For EAP-TTLS: who may run the TLS server.
+        trust: Option<Trust>,
     },
 }
 
