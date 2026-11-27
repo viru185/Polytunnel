@@ -4,19 +4,22 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use polytunnel_core::ipc::{Connect, PROTOCOL_VERSION, Request, Response, Status};
+use polytunnel_core::Secret;
+use polytunnel_core::ipc::{Connect, PROTOCOL_VERSION, Request, Response, Status, validate_answer};
 use polytunnel_net::journal::Journal;
 use tokio::runtime::Runtime;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::common::StatusCell;
-use crate::gp;
+use crate::{gp, ipsec};
 use crate::{info, paths, warn};
 
 struct Running {
     stop: watch::Sender<bool>,
     task: JoinHandle<()>,
+    /// Where answers to the connection's prompts go (IPsec only).
+    answers: Option<mpsc::Sender<ipsec::Answer>>,
 }
 
 pub struct Manager {
@@ -79,6 +82,20 @@ impl Manager {
                 self.stop_current();
                 Response::Accepted {}
             }
+            Request::Answer { id, values } => self.answer(id, values),
+        }
+    }
+
+    fn answer(&self, id: u32, values: Vec<Secret>) -> Response {
+        if let Err(message) = validate_answer(&values) {
+            return Response::Error { message };
+        }
+        let current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        match current.as_ref().and_then(|r| r.answers.as_ref()) {
+            Some(tx) if tx.try_send((id, values)).is_ok() => Response::Accepted {},
+            _ => Response::Error {
+                message: "the connection is not waiting for an answer".into(),
+            },
         }
     }
 
@@ -93,6 +110,7 @@ impl Manager {
         };
         let (stop, stop_rx) = watch::channel(false);
         let status = self.status.clone();
+        let mut answers = None;
         let task = match connect {
             Connect::GlobalProtect(gp) => {
                 info!("connect request for profile '{profile}' (GlobalProtect)");
@@ -103,8 +121,18 @@ impl Manager {
                 self.runtime
                     .spawn(crate::forti::run(forti, status, stop_rx))
             }
+            Connect::FortinetIpsec(c) => {
+                info!("connect request for profile '{profile}' (Fortinet IPsec)");
+                let (tx, rx) = mpsc::channel(4);
+                answers = Some(tx);
+                self.runtime.spawn(ipsec::run(*c, status, stop_rx, rx))
+            }
         };
-        *self.current.lock().unwrap_or_else(|e| e.into_inner()) = Some(Running { stop, task });
+        *self.current.lock().unwrap_or_else(|e| e.into_inner()) = Some(Running {
+            stop,
+            task,
+            answers,
+        });
         Response::Accepted {}
     }
 
@@ -115,9 +143,10 @@ impl Manager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some(Running { stop, task }) = running {
-            if let Status::Connected { profile, .. } | Status::Connecting { profile } =
-                self.status()
+        if let Some(Running { stop, task, .. }) = running {
+            if let Status::Connected { profile, .. }
+            | Status::Connecting { profile }
+            | Status::NeedsInput { profile, .. } = self.status()
             {
                 *self.status.lock().unwrap_or_else(|e| e.into_inner()) =
                     Status::Disconnecting { profile };

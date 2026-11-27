@@ -69,8 +69,8 @@ Fortinet, **Connect**, the connection status, and for GlobalProtect a gateway ta
 measured response times, **Find best gateway** and a preferred gateway. Sign-in prompts
 (password, verification code, browser login with a paste box) appear in the window. A tiny tray
 icon (`polytunnel tray`, about 2 MB of memory) shows whether you are connected; the window only
-runs while it is open. FortiClient SSL VPN profiles can be imported on Windows (passwords and
-keys are never read from FortiClient).
+runs while it is open. FortiClient SSL VPN and IPsec profiles can be imported on Windows
+(passwords and pre-shared keys are never read from FortiClient).
 
 ## Usage (early preview)
 
@@ -107,6 +107,11 @@ portal = "vpn.example.com"
 type = "fortinet-ssl"
 server = "vpn.example.net:10443"
 username = "me"
+
+[profile.office-ipsec]
+type = "fortinet-ipsec"
+server = "vpn.example.net"
+username = "me"
 ```
 
 GlobalProtect profiles also accept `preferred-gateway = "<name>"`,
@@ -123,6 +128,7 @@ install it once as administrator / root. Then connect as a normal user:
 polytunnel-daemon install        # portable builds only; Windows: wintun.dll next to the exe
 polytunnel connect work          # GlobalProtect: browser SSO, best gateway, tunnel up
 polytunnel connect office        # Fortinet SSL VPN: password (+ code), PPP tunnel up
+polytunnel connect office-ipsec  # Fortinet IPsec: pre-shared key, password (+ code)
 polytunnel status
 polytunnel disconnect
 ```
@@ -133,6 +139,17 @@ leak protection are applied by the service and rolled back on disconnect, even a
 If the gateway asks for a host information (HIP) report, Polytunnel sends only real facts about
 the machine. Fortinet SSL VPN runs PPP over TLS
 ([protocol notes](docs/protocols/fortinet-ssl.md)).
+
+Fortinet IPsec profiles follow FortiClient's dial-up tunnels: IKEv1 aggressive mode with a
+pre-shared key and XAuth, mode-config, PFS, dead-peer detection and NAT traversal (always on, so
+ESP travels in UDP port 4500 and nothing clashes with FortiClient or the system's IKE service).
+They also accept `dh-group` (14 by default), `local-id` and `local-id-type`
+(`fqdn`, `user-fqdn`, `key-id`, `ipv4`), `ike-proposals` (`["aes256-sha256", ...]`),
+`esp-proposals` (`["aes256-sha256", "aes256gcm16", ...]`), `pfs-group` (`0` turns PFS off),
+`ike-lifetime`, `esp-lifetime`, `esp-lifetime-kb`, `xauth = false`, `mode-config = "push"`,
+`remote-network = "a.b.c.d/len"`, `dpd` and `nat-keepalive` (seconds). One-time codes the
+gateway asks for during sign-in are prompted for in the terminal or the window
+([protocol notes](docs/protocols/fortigate-ikev1.md)).
 
 ## Building from source
 

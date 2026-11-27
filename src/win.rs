@@ -10,9 +10,9 @@ use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList, GetConsoleWindow};
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ, RRF_RT_REG_SZ, RegCloseKey,
-    RegDeleteKeyValueW, RegDeleteKeyW, RegDeleteTreeW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW,
-    RegSetKeyValueW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+    RegCloseKey, RegDeleteKeyValueW, RegDeleteKeyW, RegDeleteTreeW, RegEnumKeyExW, RegGetValueW,
+    RegOpenKeyExW, RegSetKeyValueW,
 };
 use windows_sys::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -155,6 +155,27 @@ pub fn reg_get_string(hive: Hive, key: &str, name: &str) -> Option<String> {
     }
     let units = (bytes as usize / 2).saturating_sub(1);
     Some(String::from_utf16_lossy(&buf[..units.min(buf.len())]))
+}
+
+/// Reads a DWORD value.
+pub fn reg_get_dword(hive: Hive, key: &str, name: &str) -> Option<u32> {
+    let key = wide(key);
+    let name = wide(name);
+    let mut value = 0u32;
+    let mut bytes = 4u32;
+    // SAFETY: `value` holds `bytes` (4) bytes; strings are NUL-terminated.
+    let code = unsafe {
+        RegGetValueW(
+            hive.handle(),
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_DWORD,
+            null_mut(),
+            (&raw mut value).cast(),
+            &mut bytes,
+        )
+    };
+    (code == ERROR_SUCCESS).then_some(value)
 }
 
 /// Deletes `HKEY_CURRENT_USER\key` and everything below it; a missing key is not an error.

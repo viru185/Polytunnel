@@ -1,0 +1,133 @@
+name: Interop
+
+# Polytunnel's protocol engines against independent implementations.
+# - IKEv1 (Fortinet dial-up IPsec): strongSwan in a container plays the FortiGate:
+#   aggressive mode, pre-shared key + XAuth, mode-config, DPD, 60 s phase-2 lifetime.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: interop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  strongswan-ikev1:
+    name: IKEv1 against strongSwan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Documentation ranges: the gateway's protected network and the client address pool.
+      POLYTUNNEL_INTEROP_NETWORK: 198.51.100.0/24
+      POLYTUNNEL_INTEROP_PING: 198.51.100.1
+      POOL: 203.0.113.64/26
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Build the test
+        run: |
+          # Cargo reports where it put the test program (not always target/debug/deps).
+          bin=$(cargo test --locked -p polytunnel-daemon --test ipsec_interop --no-run --message-format=json | jq -r 'select(.executable != null and .target.name == "ipsec_interop") | .executable' | tail -1)
+          test -x "$bin"
+          echo "TEST_BIN=$bin" >> "$GITHUB_ENV"
+      - name: Start strongSwan
+        run: |
+          # Fresh random credentials for every run.
+          psk=$(openssl rand -hex 16)
+          user="interop$(openssl rand -hex 2)"
+          password=$(openssl rand -hex 12)
+          {
+            echo "POLYTUNNEL_INTEROP_PSK=$psk"
+            echo "POLYTUNNEL_INTEROP_USER=$user"
+            echo "POLYTUNNEL_INTEROP_PASSWORD=$password"
+          } >> "$GITHUB_ENV"
+          dir="$RUNNER_TEMP/swan"
+          mkdir -p "$dir"
+          cat > "$dir/ipsec.conf" <<EOF
+          config setup
+              charondebug="ike 2, cfg 1, knl 1, net 1"
+              uniqueids=no
+
+          conn fortigate-standin
+              keyexchange=ikev1
+              aggressive=yes
+              ike=aes256-sha256-modp2048!
+              esp=aes256-sha256-modp2048!
+              ikelifetime=1h
+              lifetime=60s
+              margintime=5s
+              rekey=no
+              reauth=no
+              left=%any
+              leftid=@gateway.test
+              leftsubnet=$POLYTUNNEL_INTEROP_NETWORK
+              leftauth=psk
+              right=%any
+              rightid=@client.test
+              rightauth=psk
+              rightauth2=xauth
+              rightsourceip=$POOL
+              modeconfig=pull
+              dpdaction=clear
+              dpddelay=10s
+              auto=add
+          EOF
+          printf '@gateway.test @client.test : PSK "%s"\n%s : XAUTH "%s"\n' \
+            "$psk" "$user" "$password" > "$dir/ipsec.secrets"
+          cat > "$dir/charon-local.conf" <<'EOF'
+          charon {
+              # A FortiGate dial-up tunnel is exactly this (weak) combination.
+              i_dont_care_about_security_and_use_aggressive_mode_psk = yes
+              # No syslog in the container: log to stderr (docker logs).
+              filelog {
+                  stderr {
+                      default = 1
+                      ike = 2
+                      cfg = 1
+                      knl = 1
+                  }
+              }
+          }
+          EOF
+          cat > "$dir/start.sh" <<EOF
+          set -e
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq strongswan \
+            libcharon-extra-plugins libcharon-extauth-plugins iproute2 > /dev/null
+          ip link add dummy0 type dummy
+          ip addr add $POLYTUNNEL_INTEROP_PING/24 dev dummy0
+          ip link set dummy0 up
+          cp /swan/ipsec.conf /etc/ipsec.conf
+          install -m 600 /swan/ipsec.secrets /etc/ipsec.secrets
+          cp /swan/charon-local.conf /etc/strongswan.d/charon-local.conf
+          echo "strongswan configured"
+          exec ipsec start --nofork
+          EOF
+          docker run -d --name swan --cap-add NET_ADMIN -v "$dir:/swan:ro" ubuntu:24.04 bash /swan/start.sh
+          # Ready once charon listens on UDP 500 (the package install comes first).
+          ready=
+          for _ in $(seq 240); do
+            if docker exec swan sh -c 'ss -lun 2>/dev/null | grep -q ":500 "'; then ready=1; break; fi
+            if [ -z "$(docker ps -q --filter name=swan)" ]; then docker logs swan; exit 1; fi
+            sleep 1
+          done
+          [ -n "$ready" ] || { docker logs swan 2>&1 | tail -50; exit 1; }
+          sleep 3
+          docker logs swan 2>&1 | tail -5
+          gateway=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' swan)
+          echo "POLYTUNNEL_INTEROP_GATEWAY=$gateway" >> "$GITHUB_ENV"
+      - name: Connect, ping, rekey, disconnect; wrong key and password
+        run: sudo -E "$TEST_BIN" --ignored --test-threads=1 --nocapture
+      - name: strongSwan log
+        if: always()
+        run: docker logs swan 2>&1 | tail -300

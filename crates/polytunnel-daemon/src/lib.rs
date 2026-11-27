@@ -12,6 +12,7 @@ pub mod common;
 pub mod forti;
 pub mod gp;
 pub mod ipc_server;
+pub mod ipsec;
 pub mod log;
 pub mod manager;
 pub mod packets;

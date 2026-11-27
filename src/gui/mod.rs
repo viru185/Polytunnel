@@ -14,8 +14,8 @@ use eframe::egui;
 use polytunnel_core::Secret;
 use polytunnel_core::ipc::Status;
 use polytunnel_core::profile::{
-    FortinetSslProfile, GatewayPolicy, GlobalProtectProfile, ProbeMethod, Profile, Profiles,
-    normalize_server,
+    FortinetIpsecProfile, FortinetSslProfile, GatewayPolicy, GlobalProtectProfile, ProbeMethod,
+    Profile, Profiles, normalize_server, valid_host,
 };
 use polytunnel_gp::rank::{self, Probe, Ranking};
 
@@ -89,6 +89,7 @@ pub fn run_window() -> i32 {
 enum Kind {
     GlobalProtect,
     FortinetSsl,
+    FortinetIpsec,
 }
 
 /// The profile form.
@@ -103,6 +104,12 @@ struct Editor {
     realm: String,
     strict_tiers: bool,
     tcp_probe: bool,
+    local_id: String,
+    dh_group: String,
+    pfs: bool,
+    xauth: bool,
+    /// The IPsec profile being edited: settings the form does not show are kept.
+    ipsec_base: FortinetIpsecProfile,
     error: Option<String>,
 }
 
@@ -119,6 +126,11 @@ impl Editor {
             realm: String::new(),
             strict_tiers: false,
             tcp_probe: false,
+            local_id: String::new(),
+            dh_group: crate::ipsec::DEFAULT_DH_GROUP.to_string(),
+            pfs: true,
+            xauth: true,
+            ipsec_base: FortinetIpsecProfile::default(),
             error: None,
         }
     }
@@ -145,6 +157,21 @@ impl Editor {
                 realm: text(&p.realm),
                 ..Editor::new(Kind::FortinetSsl)
             },
+            Profile::FortinetIpsec(p) => Editor {
+                original: Some(name.to_string()),
+                name: name.to_string(),
+                server: p.server.clone(),
+                username: text(&p.username),
+                local_id: text(&p.local_id),
+                dh_group: p
+                    .dh_group
+                    .unwrap_or(crate::ipsec::DEFAULT_DH_GROUP)
+                    .to_string(),
+                pfs: p.pfs_group != Some(0),
+                xauth: crate::ipsec::uses_xauth(p),
+                ipsec_base: p.clone(),
+                ..Editor::new(Kind::FortinetIpsec)
+            },
         }
     }
 
@@ -157,7 +184,15 @@ impl Editor {
         {
             return Err("Use letters, digits, '-' or '_' for the name.".into());
         }
-        normalize_server(&self.server).map_err(|e| e.to_string())?;
+        if self.kind == Kind::FortinetIpsec {
+            if !valid_host(self.server.trim()) {
+                return Err(
+                    "Enter the gateway's host name or IPv4 address (no https:// or port).".into(),
+                );
+            }
+        } else {
+            normalize_server(&self.server).map_err(|e| e.to_string())?;
+        }
         let opt = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
         let profile = match self.kind {
             Kind::GlobalProtect => Profile::GlobalProtect(GlobalProtectProfile {
@@ -174,6 +209,29 @@ impl Editor {
                 username: opt(&self.username),
                 realm: opt(&self.realm),
             }),
+            Kind::FortinetIpsec => {
+                let group: u16 = self
+                    .dh_group
+                    .trim()
+                    .parse()
+                    .ok()
+                    .filter(|g| polytunnel_core::ipc::ike_group_name(*g).is_some())
+                    .ok_or("Use DH group 2, 5, 14, 15, 16, 19 or 20.")?;
+                let base = &self.ipsec_base;
+                Profile::FortinetIpsec(FortinetIpsecProfile {
+                    server: self.server.trim().to_string(),
+                    username: opt(&self.username),
+                    local_id: opt(&self.local_id),
+                    dh_group: (group != crate::ipsec::DEFAULT_DH_GROUP).then_some(group),
+                    pfs_group: match (self.pfs, base.pfs_group) {
+                        (false, _) => Some(0),
+                        (true, Some(0)) => None,
+                        (true, other) => other,
+                    },
+                    xauth: (!self.xauth).then_some(false),
+                    ..base.clone()
+                })
+            }
         };
         Ok((name, profile))
     }
@@ -190,6 +248,7 @@ enum PromptUi {
         reply: Sender<Option<(String, Secret)>>,
     },
     Code {
+        title: String,
         message: String,
         code: String,
         reply: Sender<Option<Secret>>,
@@ -361,8 +420,13 @@ impl App {
                             reply,
                         });
                     }
-                    worker::Event::Prompt(worker::Prompt::Code { message, reply }) => {
+                    worker::Event::Prompt(worker::Prompt::Code {
+                        title,
+                        message,
+                        reply,
+                    }) => {
                         self.prompt = Some(PromptUi::Code {
+                            title,
                             message,
                             code: String::new(),
                             reply,
@@ -470,7 +534,9 @@ impl App {
             ui.colored_label(color, text);
             let connected = matches!(
                 &self.status,
-                Ok(Status::Connected { .. } | Status::Connecting { .. })
+                Ok(Status::Connected { .. }
+                    | Status::Connecting { .. }
+                    | Status::NeedsInput { .. })
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if connected && ui.button("Disconnect").clicked() {
@@ -514,20 +580,37 @@ impl App {
         if ui.button("Add Fortinet SSL VPN").clicked() {
             self.editor = Some(Editor::new(Kind::FortinetSsl));
         }
+        if ui.button("Add Fortinet IPsec").clicked() {
+            self.editor = Some(Editor::new(Kind::FortinetIpsec));
+        }
         if cfg!(windows) && ui.button("Import from FortiClient").clicked() {
-            let found = forticlient::ssl_tunnels();
-            if found.is_empty() {
-                self.log("No FortiClient SSL VPN profiles found.");
+            let mut found: Vec<(String, Profile)> = forticlient::ssl_tunnels()
+                .into_iter()
+                .map(|t| (t.name, Profile::FortinetSsl(t.profile)))
+                .collect();
+            let ipsec = forticlient::ipsec_tunnels();
+            for skipped in &ipsec.skipped {
+                self.log(skipped.clone());
             }
-            for item in found {
-                let mut name = item.name.clone();
+            found.extend(
+                ipsec
+                    .tunnels
+                    .into_iter()
+                    .map(|t| (t.name, Profile::FortinetIpsec(t.profile))),
+            );
+            if found.is_empty() {
+                self.log("No FortiClient VPN profiles found.");
+            }
+            for (base, profile) in found {
+                let mut name = base;
                 while self.profiles.profiles.contains_key(&name) {
                     name.push('-');
                 }
-                self.log(format!("Imported FortiClient profile as '{name}'."));
-                self.profiles
-                    .profiles
-                    .insert(name, Profile::FortinetSsl(item.profile));
+                self.log(format!(
+                    "Imported the FortiClient {} profile as '{name}'.",
+                    profile.kind()
+                ));
+                self.profiles.profiles.insert(name, profile);
             }
             if let Err(e) = save_profiles(&self.profiles) {
                 self.log(format!("Could not save the profiles: {e}"));
@@ -542,6 +625,7 @@ impl App {
         ui.heading(match editor.kind {
             Kind::GlobalProtect => "GlobalProtect profile",
             Kind::FortinetSsl => "Fortinet SSL VPN profile",
+            Kind::FortinetIpsec => "Fortinet IPsec profile",
         });
         egui::Grid::new("editor")
             .num_columns(2)
@@ -553,6 +637,7 @@ impl App {
                 ui.label(match editor.kind {
                     Kind::GlobalProtect => "Portal",
                     Kind::FortinetSsl => "Server",
+                    Kind::FortinetIpsec => "Gateway",
                 });
                 ui.text_edit_singleline(&mut editor.server);
                 ui.end_row();
@@ -583,6 +668,23 @@ impl App {
                     Kind::FortinetSsl => {
                         ui.label("Realm (optional)");
                         ui.text_edit_singleline(&mut editor.realm);
+                        ui.end_row();
+                    }
+                    Kind::FortinetIpsec => {
+                        ui.label("Local ID (optional)");
+                        ui.text_edit_singleline(&mut editor.local_id);
+                        ui.end_row();
+                        ui.label("DH group");
+                        ui.text_edit_singleline(&mut editor.dh_group);
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(&mut editor.pfs, "Perfect forward secrecy");
+                        ui.end_row();
+                        ui.label("");
+                        ui.checkbox(
+                            &mut editor.xauth,
+                            "Sign in with username and password (XAuth)",
+                        );
                         ui.end_row();
                     }
                 }
@@ -649,6 +751,7 @@ impl App {
         match &profile {
             Profile::GlobalProtect(p) => ui.label(format!("GlobalProtect portal {}", p.portal)),
             Profile::FortinetSsl(p) => ui.label(format!("Fortinet SSL VPN {}", p.server)),
+            Profile::FortinetIpsec(p) => ui.label(format!("Fortinet IPsec {}", p.server)),
         };
         ui.horizontal(|ui| {
             let busy = self.busy();
@@ -801,11 +904,12 @@ impl App {
                         });
                     }
                     PromptUi::Code {
+                        title,
                         message,
                         code,
                         reply,
                     } => {
-                        ui.heading("Verification code");
+                        ui.heading(title.as_str());
                         ui.label(message.as_str());
                         let field = ui.add(egui::TextEdit::singleline(code).password(true));
                         let enter =
@@ -941,6 +1045,38 @@ mod tests {
             Editor::from_profile("office", &forti).to_profile(),
             Ok(("office".to_string(), forti))
         );
+
+        // Settings the form does not show survive an edit.
+        let ipsec = Profile::FortinetIpsec(FortinetIpsecProfile {
+            server: "vpn.example.net".into(),
+            dh_group: Some(5),
+            pfs_group: Some(0),
+            esp_proposals: Some(vec!["aes128-sha1".into()]),
+            nat_keepalive: Some(10),
+            ..Default::default()
+        });
+        assert_eq!(
+            Editor::from_profile("ipsec", &ipsec).to_profile(),
+            Ok(("ipsec".to_string(), ipsec))
+        );
+        let mut e = Editor::new(Kind::FortinetIpsec);
+        e.name = "new".into();
+        e.server = "203.0.113.9".into();
+        assert_eq!(
+            e.to_profile(),
+            Ok((
+                "new".to_string(),
+                Profile::FortinetIpsec(FortinetIpsecProfile {
+                    server: "203.0.113.9".into(),
+                    ..Default::default()
+                })
+            ))
+        );
+        e.dh_group = "1".into();
+        assert!(e.to_profile().is_err());
+        e.dh_group = "14".into();
+        e.server = "https://vpn.example.net".into();
+        assert!(e.to_profile().is_err());
     }
 
     #[test]

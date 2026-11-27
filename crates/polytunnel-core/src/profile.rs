@@ -9,6 +9,11 @@
 //! type = "fortinet-ssl"
 //! server = "vpn.example.net:10443"
 //! username = "user"
+//!
+//! [profile.office-ipsec]
+//! type = "fortinet-ipsec"
+//! server = "vpn.example.net"
+//! dh-group = 14
 //! ```
 //!
 //! Secrets are never stored here: they live in the operating system's keyring.
@@ -64,6 +69,7 @@ impl ClientOs {
 pub enum Profile {
     GlobalProtect(GlobalProtectProfile),
     FortinetSsl(FortinetSslProfile),
+    FortinetIpsec(FortinetIpsecProfile),
 }
 
 impl Profile {
@@ -71,6 +77,7 @@ impl Profile {
         match self {
             Profile::GlobalProtect(_) => "GlobalProtect",
             Profile::FortinetSsl(_) => "Fortinet SSL VPN",
+            Profile::FortinetIpsec(_) => "Fortinet IPsec",
         }
     }
 }
@@ -135,6 +142,85 @@ pub struct FortinetSslProfile {
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realm: Option<String>,
+}
+
+/// A FortiGate dial-up IPsec tunnel (IKEv1 aggressive mode, pre-shared key, XAuth,
+/// mode-config), as FortiClient configures it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct FortinetIpsecProfile {
+    /// The FortiGate's host name or IPv4 address (IKE uses UDP 500 and 4500).
+    pub server: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// FortiClient's "Local ID" (the FortiGate's peer ID). Unset: our IP address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_id_type: Option<LocalIdType>,
+    /// Diffie-Hellman group for phase 1: 2, 5, 14 (default), 15, 16, 19 or 20.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dh_group: Option<u16>,
+    /// Phase-1 proposals such as `aes256-sha256` (default: FortiGate's dial-up set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ike_proposals: Option<Vec<String>>,
+    /// Phase-2 proposals such as `aes256-sha256` or `aes256gcm16`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub esp_proposals: Option<Vec<String>>,
+    /// PFS group for phase 2; 0 turns PFS off. Default: the phase-1 group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pfs_group: Option<u16>,
+    /// Phase-1 lifetime in seconds (default 86400).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ike_lifetime: Option<u32>,
+    /// Phase-2 lifetime in seconds (default 43200).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub esp_lifetime: Option<u32>,
+    /// Also limit each phase-2 SA by traffic, in kilobytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub esp_lifetime_kb: Option<u32>,
+    /// XAuth username and password after phase 1 (default: on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xauth: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_config: Option<ModeConfigStyle>,
+    /// The remote side of the phase-2 selector, `a.b.c.d/len` (default `0.0.0.0/0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_network: Option<String>,
+    /// Dead-peer detection after this many idle seconds; 0 turns it off (default 20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpd: Option<u32>,
+    /// NAT keepalive interval in seconds; 0 turns it off (default 5, like FortiClient).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nat_keepalive: Option<u32>,
+}
+
+/// How the local ID is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalIdType {
+    #[default]
+    Fqdn,
+    UserFqdn,
+    KeyId,
+    Ipv4,
+}
+
+/// Whether the client asks for its settings (pull) or the gateway sends them (push).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModeConfigStyle {
+    #[default]
+    Pull,
+    Push,
+}
+
+/// `a.b.c.d/len` as an IPv4 network.
+pub fn parse_ipv4_network(text: &str) -> Option<(std::net::Ipv4Addr, u8)> {
+    let (addr, len) = text.trim().split_once('/')?;
+    let addr: std::net::Ipv4Addr = addr.parse().ok()?;
+    let len: u8 = len.parse().ok().filter(|l| *l <= 32)?;
+    Some((addr, len))
 }
 
 /// The whole `profiles.toml`.
@@ -276,6 +362,39 @@ username = "user"
             Some("Fortinet SSL VPN")
         );
         assert_eq!(Profiles::parse(&profiles.to_toml()).unwrap(), profiles);
+    }
+
+    #[test]
+    fn parses_ipsec_profiles() {
+        let text = r#"
+[profile.ipsec]
+type = "fortinet-ipsec"
+server = "vpn.example.net"
+username = "user"
+local-id = "laptop"
+local-id-type = "key-id"
+dh-group = 5
+esp-proposals = ["aes128-sha1"]
+pfs-group = 0
+mode-config = "push"
+remote-network = "198.51.100.0/24"
+nat-keepalive = 5
+"#;
+        let profiles = Profiles::parse(text).unwrap();
+        let Some(Profile::FortinetIpsec(p)) = profiles.get("ipsec") else {
+            panic!("not an IPsec profile");
+        };
+        assert_eq!(p.local_id_type, Some(LocalIdType::KeyId));
+        assert_eq!(p.dh_group, Some(5));
+        assert_eq!(p.mode_config, Some(ModeConfigStyle::Push));
+        assert_eq!(p.pfs_group, Some(0));
+        assert_eq!(
+            parse_ipv4_network(p.remote_network.as_deref().unwrap()),
+            Some(("198.51.100.0".parse().unwrap(), 24))
+        );
+        assert_eq!(Profiles::parse(&profiles.to_toml()).unwrap(), profiles);
+        assert_eq!(parse_ipv4_network("10.0.0.0/33"), None);
+        assert_eq!(parse_ipv4_network("10.0.0.0"), None);
     }
 
     #[test]
