@@ -10,8 +10,9 @@ use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList, GetConsoleWindow};
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyW,
-    RegDeleteTreeW, RegGetValueW, RegSetKeyValueW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ, RRF_RT_REG_SZ, RegCloseKey,
+    RegDeleteKeyValueW, RegDeleteKeyW, RegDeleteTreeW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW,
+    RegSetKeyValueW,
 };
 use windows_sys::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -164,6 +165,45 @@ pub fn reg_delete_tree(key: &str) {
         RegDeleteTreeW(HKEY_CURRENT_USER, key.as_ptr());
         RegDeleteKeyW(HKEY_CURRENT_USER, key.as_ptr());
     }
+}
+
+/// Deletes one value under `HKEY_CURRENT_USER\key`; a missing value is not an error.
+pub fn reg_delete_value(key: &str, name: &str) {
+    // SAFETY: NUL-terminated strings.
+    unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, wide(key).as_ptr(), wide(name).as_ptr()) };
+}
+
+/// The names of the subkeys of `key`.
+pub fn reg_subkeys(hive: Hive, key: &str) -> Vec<String> {
+    let key = wide(key);
+    let mut handle: HKEY = null_mut();
+    let mut names = Vec::new();
+    // SAFETY: valid out-pointers; the buffer holds `len` UTF-16 units; the key is closed.
+    unsafe {
+        if RegOpenKeyExW(hive.handle(), key.as_ptr(), 0, KEY_READ, &mut handle) != ERROR_SUCCESS {
+            return names;
+        }
+        for index in 0.. {
+            let mut buf = [0u16; 256];
+            let mut len = buf.len() as u32;
+            let rc = RegEnumKeyExW(
+                handle,
+                index,
+                buf.as_mut_ptr(),
+                &mut len,
+                null(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            );
+            if rc != ERROR_SUCCESS {
+                break;
+            }
+            names.push(String::from_utf16_lossy(&buf[..len as usize]));
+        }
+        RegCloseKey(handle);
+    }
+    names
 }
 
 /// Opens a URL in the default browser.

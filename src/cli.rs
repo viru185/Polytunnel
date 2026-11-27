@@ -5,6 +5,10 @@ use std::ffi::OsString;
 /// What the user asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    /// Open the window (no arguments).
+    Window,
+    /// Run the tray agent.
+    Tray,
     Help,
     Version,
     Auth(AuthArgs),
@@ -72,6 +76,8 @@ Polytunnel {version}
 Lightweight VPN client for Palo Alto GlobalProtect and Fortinet (SSL VPN and IPsec).
 
 Usage:
+  polytunnel                                   Open the Polytunnel window
+  polytunnel tray                              Run the tray icon
   polytunnel auth <PROFILE> [OPTIONS]          Log in with a saved profile
   polytunnel auth gp <PORTAL> [OPTIONS]        Log in to a GlobalProtect portal
   polytunnel auth fortinet <SERVER> [OPTIONS]  Log in to a FortiGate SSL VPN
@@ -205,7 +211,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
 
     let mut words = positionals.into_iter();
     let command = match words.next().as_deref() {
-        None => return Ok(Command::Help),
+        None => return Ok(Command::Window),
+        Some("tray") => Command::Tray,
+        Some("window") => Command::Window,
         Some("auth") => {
             if gateways_only {
                 return Err("--refresh and --json are for `gateways`".into());
@@ -293,8 +301,10 @@ mod tests {
     }
 
     #[test]
-    fn no_arguments_prints_help() {
-        assert_eq!(p(&[]), Ok(Command::Help));
+    fn no_arguments_opens_the_window() {
+        assert_eq!(p(&[]), Ok(Command::Window));
+        assert_eq!(p(&["tray"]), Ok(Command::Tray));
+        assert_eq!(p(&["--help"]), Ok(Command::Help));
     }
 
     #[test]

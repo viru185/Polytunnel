@@ -5,11 +5,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use interprocess::local_socket::{Stream, prelude::*};
+use polytunnel_core::Secret;
 use polytunnel_core::ipc::{
     self, ClientFacts, Connect, FortiConnect, GpConnect, PROTOCOL_VERSION, Request, Response,
     Status,
 };
 use polytunnel_core::profile::Profile;
+use polytunnel_gp::ClientInfo;
+use polytunnel_gp::login::GatewaySession;
 
 use crate::auth::{self, FortiLogin, GpLogin};
 use crate::cli::AuthArgs;
@@ -63,7 +66,7 @@ pub fn request(request: &Request) -> Result<Response, String> {
     ipc::read_frame(&mut reader).map_err(io)
 }
 
-fn status() -> Result<Status, String> {
+pub fn status() -> Result<Status, String> {
     match request(&Request::Status {})? {
         Response::Status { status } => Ok(status),
         Response::Error { message } => Err(message),
@@ -98,41 +101,79 @@ fn label(args: &AuthArgs) -> String {
     }
 }
 
+/// The service request for a finished GlobalProtect login.
+pub fn gp_connect(profile: String, client: ClientInfo, session: GatewaySession) -> Connect {
+    Connect::GlobalProtect(Box::new(GpConnect {
+        profile,
+        gateway: session.gateway,
+        authcookie: session.authcookie,
+        user: session.user,
+        portal: session.portal,
+        domain: session.domain,
+        preferred_ip: session.preferred_ip,
+        preferred_ipv6: session.preferred_ipv6,
+        client: ClientFacts {
+            os: client.os,
+            os_version: client.os_version,
+            computer: client.computer,
+            host_id: client.host_id,
+            app_version: client.app_version,
+        },
+        allow_esp: true,
+    }))
+}
+
+/// The service request for a finished Fortinet login.
+pub fn forti_connect(profile: String, server: String, cookie: Secret) -> Connect {
+    Connect::FortinetSsl(FortiConnect {
+        profile,
+        server,
+        cookie,
+    })
+}
+
 /// Builds the service request from a finished login.
 fn connect_request(args: &AuthArgs) -> Result<Connect, String> {
     let profile = label(args);
     Ok(match auth::resolve(args)? {
         Profile::GlobalProtect(p) => {
             let GpLogin { client, result } = auth::gp_login(&p, args)?;
-            let s = result.session;
-            Connect::GlobalProtect(Box::new(GpConnect {
-                profile,
-                gateway: s.gateway,
-                authcookie: s.authcookie,
-                user: s.user,
-                portal: s.portal,
-                domain: s.domain,
-                preferred_ip: s.preferred_ip,
-                preferred_ipv6: s.preferred_ipv6,
-                client: ClientFacts {
-                    os: client.os,
-                    os_version: client.os_version,
-                    computer: client.computer,
-                    host_id: client.host_id,
-                    app_version: client.app_version,
-                },
-                allow_esp: true,
-            }))
+            gp_connect(profile, client, result.session)
         }
         Profile::FortinetSsl(p) => {
             let FortiLogin { base, cookie, .. } = auth::forti_login(&p)?;
-            Connect::FortinetSsl(FortiConnect {
-                profile,
-                server: base,
-                cookie,
-            })
+            forti_connect(profile, base, cookie)
         }
     })
+}
+
+/// Hands `connect` to the service.
+pub fn send_connect(connect: Connect) -> Result<(), String> {
+    match request(&Request::Connect { connect })? {
+        Response::Accepted {} => Ok(()),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected answer from the service: {other:?}")),
+    }
+}
+
+/// Polls the service until the tunnel is up or has failed.
+pub fn wait_connected(on_status: &mut dyn FnMut(&Status)) -> Result<Status, String> {
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    loop {
+        let s = status()?;
+        on_status(&s);
+        match s {
+            Status::Connected { .. } => return Ok(s),
+            Status::Failed { .. } => return Err(describe(&s)),
+            _ if Instant::now() < deadline => thread::sleep(Duration::from_millis(500)),
+            _ => {
+                return Err(format!(
+                    "still not connected after {CONNECT_TIMEOUT:?}: {}",
+                    describe(&s)
+                ));
+            }
+        }
+    }
 }
 
 /// `polytunnel connect`.
@@ -149,64 +190,43 @@ pub fn run_connect(args: &AuthArgs) -> i32 {
             return 1;
         }
     };
-    match request(&Request::Connect { connect }) {
-        Ok(Response::Accepted {}) => {}
-        Ok(Response::Error { message }) => {
-            eprintln!("polytunnel: {message}");
-            return 1;
-        }
-        Ok(other) => {
-            eprintln!("polytunnel: unexpected answer from the service: {other:?}");
-            return 1;
+    if let Err(e) = send_connect(connect) {
+        eprintln!("polytunnel: {e}");
+        return 1;
+    }
+    eprintln!("Bringing the tunnel up...");
+    match wait_connected(&mut |_| {}) {
+        Ok(s) => {
+            println!("{}", describe(&s));
+            0
         }
         Err(e) => {
             eprintln!("polytunnel: {e}");
-            return 1;
-        }
-    }
-    eprintln!("Bringing the tunnel up...");
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
-    loop {
-        match status() {
-            Ok(s @ Status::Connected { .. }) => {
-                println!("{}", describe(&s));
-                return 0;
-            }
-            Ok(s @ Status::Failed { .. }) => {
-                eprintln!("polytunnel: {}", describe(&s));
-                return 1;
-            }
-            Ok(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(500)),
-            Ok(s) => {
-                eprintln!(
-                    "polytunnel: still not connected after {CONNECT_TIMEOUT:?}: {}",
-                    describe(&s)
-                );
-                return 1;
-            }
-            Err(e) => {
-                eprintln!("polytunnel: {e}");
-                return 1;
-            }
+            1
         }
     }
 }
 
 /// `polytunnel disconnect`.
 pub fn run_disconnect() -> i32 {
-    match request(&Request::Disconnect {}) {
-        Ok(Response::Accepted {}) => {
+    match disconnect() {
+        Ok(()) => {
             println!("Disconnected.");
             0
         }
-        Ok(Response::Error { message }) | Err(message) => {
+        Err(message) => {
             eprintln!("polytunnel: {message}");
             1
         }
-        Ok(other) => {
-            eprintln!("polytunnel: unexpected answer from the service: {other:?}");
-            1
-        }
+    }
+}
+
+/// Asks the service to end the connection.
+pub fn disconnect() -> Result<(), String> {
+    match request(&Request::Disconnect {})? {
+        Response::Accepted {} => Ok(()),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected answer from the service: {other:?}")),
     }
 }
 

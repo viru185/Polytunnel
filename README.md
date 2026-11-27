@@ -45,6 +45,16 @@ Platforms: Windows (x64, ARM64) first, Linux (x64, ARM64), macOS (beta).
 | M10–M11 | Embedded login window, kill switch |
 | M12–M13 | Code signing, auto-update |
 
+## The app
+
+Run `polytunnel` (or open it from the Start menu) for the window: profiles for GlobalProtect and
+Fortinet, **Connect**, the connection status, and for GlobalProtect a gateway table with
+measured response times, **Find best gateway** and a preferred gateway. Sign-in prompts
+(password, verification code, browser login with a paste box) appear in the window. A tiny tray
+icon (`polytunnel tray`, about 2 MB of memory) shows whether you are connected; the window only
+runs while it is open. FortiClient SSL VPN profiles can be imported on Windows (passwords and
+keys are never read from FortiClient).
+
 ## Usage (early preview)
 
 Log in from the command line. Until Polytunnel's own tunnels land (M4), you can hand the
