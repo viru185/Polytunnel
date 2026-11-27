@@ -8,8 +8,10 @@ pub mod browser;
 pub mod callback;
 pub mod cli;
 pub mod emit;
+pub mod gateways;
 pub mod http;
 pub mod paths;
+pub mod probe;
 pub mod prompter;
 pub mod sysinfo;
 pub mod uri;
@@ -58,6 +60,7 @@ pub fn run(argv: Vec<OsString>, hooks: &Hooks) -> i32 {
         }
         Command::Auth(args) => auth::run(&args),
         Command::Profiles => auth::list_profiles(),
+        Command::Gateways(args) => gateways::run(&args),
         Command::Uri(action) => uri::run(action),
         Command::Callback(link) => callback::run(&link),
     }

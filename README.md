@@ -63,7 +63,12 @@ polytunnel auth fortinet vpn.example.net:10443 --user me --emit cookie \
 - The first browser login registers Polytunnel for `globalprotectcallback:` links for your
   user account (`polytunnel uri status|register|unregister`). If the browser cannot hand the
   login back, add `--paste` and paste the link (or the final page's source) into the terminal.
-- `--gateway <name>` picks a gateway by address or description; `--emit json` prints JSON.
+- Without `--gateway`, Polytunnel measures every gateway's TLS handshake time in parallel and
+  picks the best one the way the official app does (source region, then the Highest/High/Medium
+  pool before Low/Lowest, then speed). `--prefer <name>` uses a gateway when it answers and
+  falls back to the best one; `--gateway <name>` always uses that gateway.
+- `polytunnel gateways <profile>` shows the ranking (the gateway list is saved at each login,
+  so this does not log in again; `--refresh` does). `--emit json` / `--json` print JSON.
 - Profiles in `profiles.toml` (`polytunnel profiles` shows where) save typing:
 
 ```toml
@@ -77,7 +82,9 @@ server = "vpn.example.net:10443"
 username = "me"
 ```
 
-Then `polytunnel auth work`.
+GlobalProtect profiles also accept `preferred-gateway = "<name>"`,
+`gateway-selection = "pools"` (default) or `"strict-tiers"`, and `probe = "tls"` (default) or
+`"tcp"`. Then `polytunnel auth work`.
 
 ## Building from source
 

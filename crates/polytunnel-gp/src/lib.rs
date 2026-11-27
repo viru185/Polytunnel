@@ -26,6 +26,7 @@ pub mod flow;
 pub mod login;
 pub mod portal;
 pub mod prelogin;
+pub mod rank;
 pub mod sso;
 
 pub use client::ClientInfo;

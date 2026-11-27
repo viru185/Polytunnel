@@ -19,7 +19,8 @@ pub enum PortalAuth {
 }
 
 /// A gateway as listed by the portal.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Gateway {
     /// `https://host[:port]`.
     pub address: String,

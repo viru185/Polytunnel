@@ -11,6 +11,7 @@ use polytunnel_gp::flow::{self, LoginOptions};
 
 use crate::cli::{AuthArgs, AuthTarget};
 use crate::emit::{self, LoginOutput};
+use crate::gateways::GatewayPrefs;
 use crate::http::UreqTransport;
 use crate::prompter::{self, CliPrompter, SsoMode};
 use crate::{paths, sysinfo};
@@ -53,10 +54,13 @@ fn resolve(args: &AuthArgs) -> Result<Profile, String> {
             }
             override_with(&mut p.username, &args.user);
             override_with(&mut p.gateway, &args.gateway);
+            override_with(&mut p.preferred_gateway, &args.prefer);
         }
         Profile::FortinetSsl(p) => {
-            if args.gateway.is_some() || args.paste || !args.browser {
-                return Err("--gateway, --paste and --no-browser are for GlobalProtect".into());
+            if args.gateway.is_some() || args.prefer.is_some() || args.paste || !args.browser {
+                return Err(
+                    "--gateway, --prefer, --paste and --no-browser are for GlobalProtect".into(),
+                );
             }
             override_with(&mut p.username, &args.user);
             override_with(&mut p.realm, &args.realm);
@@ -71,7 +75,7 @@ fn override_with(slot: &mut Option<String>, value: &Option<String>) {
     }
 }
 
-fn load_profile(name: &str) -> Result<Profile, String> {
+pub(crate) fn load_profile(name: &str) -> Result<Profile, String> {
     let path = paths::profiles_file().ok_or("cannot find the configuration directory")?;
     let text = fs::read_to_string(&path).map_err(|e| {
         format!(
@@ -108,7 +112,12 @@ fn login_gp(profile: &GlobalProtectProfile, args: &AuthArgs) -> Result<LoginOutp
     } else {
         SsoMode::Callback
     };
-    let mut prompter = CliPrompter::new(mode, args.browser);
+    let prefs = GatewayPrefs {
+        preferred: profile.preferred_gateway.clone(),
+        policy: profile.gateway_selection.unwrap_or_default(),
+        method: profile.probe.unwrap_or_default(),
+    };
+    let mut prompter = CliPrompter::new(mode, args.browser, prefs);
     let transport = UreqTransport::new();
     let result =
         flow::login(&transport, &client, &options, &mut prompter).map_err(|e| e.to_string())?;
@@ -213,6 +222,7 @@ mod tests {
             emit: Emit::Openconnect,
             user: None,
             gateway: None,
+            prefer: None,
             realm: None,
             paste: false,
             browser: true,
