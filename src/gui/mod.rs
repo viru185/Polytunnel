@@ -306,6 +306,8 @@ struct App {
     ipc_rx: Receiver<Message>,
     autostart: bool,
     link_status: String,
+    /// The kill switch setting, when the service could be asked.
+    killswitch: Option<polytunnel_core::ipc::KillSwitchSettings>,
     _instance: Option<Instance>,
 }
 
@@ -378,6 +380,7 @@ impl App {
             ipc_rx,
             autostart: autostart::enabled(),
             link_status: link_status_text(),
+            killswitch: connect::killswitch(None).ok().map(|(s, _, _)| s),
             _instance: instance,
         }
     }
@@ -895,6 +898,32 @@ impl App {
             {
                 self.autostart = autostart::enabled();
                 self.log(format!("Could not change the start-up setting: {e}"));
+            }
+            if let Some(mut ks) = self.killswitch {
+                use polytunnel_core::ipc::KillSwitchMode;
+                ui.separator();
+                ui.label("Kill switch: block traffic outside the tunnel");
+                let before = ks;
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut ks.mode, KillSwitchMode::Off, "Off");
+                    ui.radio_value(&mut ks.mode, KillSwitchMode::Connected, "While connected");
+                    ui.radio_value(&mut ks.mode, KillSwitchMode::Always, "Always (lockdown)");
+                });
+                ui.checkbox(&mut ks.allow_lan, "Allow the local network");
+                if ks != before {
+                    match connect::killswitch(Some(ks)) {
+                        Ok((settings, active, problem)) => {
+                            self.killswitch = Some(settings);
+                            self.log(connect::describe_killswitch(
+                                &settings,
+                                active,
+                                problem.as_deref(),
+                            ));
+                        }
+                        Err(e) => self.log(format!("Could not change the kill switch: {e}")),
+                    }
+                }
+                ui.separator();
             }
             ui.label(&self.link_status);
             ui.horizontal(|ui| {

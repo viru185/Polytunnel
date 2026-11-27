@@ -70,6 +70,7 @@ pub fn run(argv: Vec<OsString>, hooks: &Hooks) -> i32 {
         Command::Connect(args) => connect::run_connect(&args),
         Command::Disconnect => connect::run_disconnect(),
         Command::Status => connect::run_status(),
+        Command::KillSwitch { mode, allow_lan } => connect::run_killswitch(mode, allow_lan),
         Command::Profiles => auth::list_profiles(),
         Command::Gateways(args) => gateways::run(&args),
         Command::Uri(action) => uri::run(action),

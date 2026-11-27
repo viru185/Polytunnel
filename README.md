@@ -171,6 +171,15 @@ server-auth = "certificate"
 transport = "tcp"
 ```
 
+### Kill switch
+
+`polytunnel killswitch connected` blocks traffic outside the tunnel while a tunnel is up;
+`always` also blocks while disconnected (lockdown: then only the Polytunnel programs on Windows,
+the last VPN servers and, with `--allow-lan`, the local network get through); `off` lifts it.
+The VPN servers, loopback, DHCP and IPv6 neighbour discovery always pass. It uses the Windows
+Filtering Platform (the rules vanish if the service stops, except in lockdown), nftables on
+Linux and a pf anchor on macOS. The window has the same switches under Settings.
+
 ## Building from source
 
 Requires the stable Rust toolchain (see `rust-toolchain.toml`).

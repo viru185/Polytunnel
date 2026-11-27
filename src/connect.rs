@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use interprocess::local_socket::{Stream, prelude::*};
 use polytunnel_core::Secret;
 use polytunnel_core::ipc::{
-    self, ClientFacts, Connect, FortiConnect, GpConnect, PROTOCOL_VERSION, Prompt, Request,
-    Response, Status,
+    self, ClientFacts, Connect, FortiConnect, GpConnect, KillSwitchMode, KillSwitchSettings,
+    PROTOCOL_VERSION, Prompt, Request, Response, Status,
 };
 use polytunnel_core::profile::Profile;
 use polytunnel_gp::ClientInfo;
@@ -301,6 +301,69 @@ pub fn disconnect() -> Result<(), String> {
     }
 }
 
+/// Reads the kill switch, changing it first when `set` is given.
+pub fn killswitch(
+    set: Option<KillSwitchSettings>,
+) -> Result<(KillSwitchSettings, bool, Option<String>), String> {
+    match request(&Request::KillSwitch { set })? {
+        Response::KillSwitch {
+            settings,
+            active,
+            problem,
+        } => Ok((settings, active, problem)),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected answer from the service: {other:?}")),
+    }
+}
+
+pub fn describe_killswitch(
+    settings: &KillSwitchSettings,
+    active: bool,
+    problem: Option<&str>,
+) -> String {
+    let mode = match settings.mode {
+        KillSwitchMode::Off => return "Kill switch: off.".into(),
+        KillSwitchMode::Connected => "on while connected",
+        KillSwitchMode::Always => "always on (lockdown)",
+    };
+    let lan = if settings.allow_lan {
+        ", local network allowed"
+    } else {
+        ""
+    };
+    match problem {
+        Some(p) => format!("Kill switch: {mode}{lan}, but it could not be applied: {p}"),
+        None if active => format!("Kill switch: {mode}{lan}; blocking traffic outside the tunnel."),
+        None => format!("Kill switch: {mode}{lan}; nothing to block right now."),
+    }
+}
+
+/// `polytunnel killswitch [mode] [--allow-lan|--block-lan]`.
+pub fn run_killswitch(mode: Option<KillSwitchMode>, allow_lan: Option<bool>) -> i32 {
+    let result = killswitch(None).and_then(|(current, active, problem)| {
+        if mode.is_none() && allow_lan.is_none() {
+            return Ok((current, active, problem));
+        }
+        killswitch(Some(KillSwitchSettings {
+            mode: mode.unwrap_or(current.mode),
+            allow_lan: allow_lan.unwrap_or(current.allow_lan),
+        }))
+    });
+    match result {
+        Ok((settings, active, problem)) => {
+            println!(
+                "{}",
+                describe_killswitch(&settings, active, problem.as_deref())
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("polytunnel: {e}");
+            1
+        }
+    }
+}
+
 /// `polytunnel status`.
 pub fn run_status() -> i32 {
     match status() {
@@ -318,6 +381,22 @@ pub fn run_status() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_switch_reads_well() {
+        let mut s = KillSwitchSettings::default();
+        assert_eq!(describe_killswitch(&s, false, None), "Kill switch: off.");
+        s.mode = KillSwitchMode::Connected;
+        assert!(describe_killswitch(&s, true, None).contains("blocking"));
+        s.allow_lan = true;
+        s.mode = KillSwitchMode::Always;
+        let text = describe_killswitch(&s, false, Some("access denied"));
+        assert!(
+            text.contains("lockdown")
+                && text.contains("local network")
+                && text.contains("access denied")
+        );
+    }
 
     #[test]
     fn statuses_read_well() {
