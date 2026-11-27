@@ -101,6 +101,7 @@ pub fn bring_up(
     journal
         .apply_all(system, plan(config, &context))
         .map_err(|e| format!("cannot configure the network: {e}"))?;
+    crate::killswitch::tunnel_up(tunnel_if, config.servers.clone());
     Ok(device)
 }
 

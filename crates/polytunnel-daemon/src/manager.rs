@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::common::StatusCell;
-use crate::{gp, ipsec};
+use crate::{gp, ipsec, killswitch};
 use crate::{info, paths, warn};
 
 struct Running {
@@ -49,6 +49,7 @@ impl Manager {
             Ok(_) => {}
             Err(e) => warn!("cannot read the network journal: {e}"),
         }
+        killswitch::load();
         Ok(Arc::new(Manager {
             runtime,
             status: Arc::new(Mutex::new(Status::Idle {})),
@@ -83,6 +84,21 @@ impl Manager {
                 Response::Accepted {}
             }
             Request::Answer { id, values } => self.answer(id, values),
+            Request::KillSwitch { set } => {
+                if let Some(settings) = set {
+                    info!(
+                        "kill switch set to {:?} (LAN allowed: {})",
+                        settings.mode, settings.allow_lan
+                    );
+                    killswitch::set(settings);
+                }
+                let (settings, active, problem) = killswitch::status();
+                Response::KillSwitch {
+                    settings,
+                    active,
+                    problem,
+                }
+            }
         }
     }
 
@@ -160,5 +176,6 @@ impl Manager {
 
     pub fn shutdown(&self) {
         self.stop_current();
+        killswitch::shutdown();
     }
 }

@@ -85,6 +85,7 @@ pub async fn run(
         system.as_mut(),
     )
     .await;
+    crate::killswitch::tunnel_down();
     if let Err(e) = journal.rollback(system.as_mut()) {
         warn!("could not undo every network change: {e}");
     }

@@ -53,6 +53,7 @@ pub async fn run(c: FortiConnect, status: StatusCell, mut stop: watch::Receiver<
         }
     };
     let result = connect_and_run(&c, &status, &mut stop, &mut journal, system.as_mut()).await;
+    crate::killswitch::tunnel_down();
     if let Err(e) = journal.rollback(system.as_mut()) {
         warn!("could not undo every network change: {e}");
     }

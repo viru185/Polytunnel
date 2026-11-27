@@ -47,6 +47,31 @@ pub enum Request {
         id: u32,
         values: Vec<Secret>,
     },
+    /// Reads the kill switch, or changes it first.
+    KillSwitch {
+        set: Option<KillSwitchSettings>,
+    },
+}
+
+/// When traffic outside the tunnel is blocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KillSwitchMode {
+    #[default]
+    Off,
+    /// While a tunnel is up.
+    Connected,
+    /// Always, even while disconnected (lockdown): only the Polytunnel programs, the last
+    /// VPN servers and (optionally) the LAN get through then.
+    Always,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KillSwitchSettings {
+    pub mode: KillSwitchMode,
+    /// Let the local network through.
+    pub allow_lan: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +222,13 @@ pub enum Response {
     Accepted {},
     Error {
         message: String,
+    },
+    KillSwitch {
+        settings: KillSwitchSettings,
+        /// Whether blocking rules are in force right now.
+        active: bool,
+        /// Why the rules could not be applied, if they could not.
+        problem: Option<String>,
     },
 }
 
