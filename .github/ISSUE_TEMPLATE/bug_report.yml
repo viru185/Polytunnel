@@ -1,0 +1,50 @@
+name: Bug report
+description: Something does not work as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **This repository is public.** Do not paste real hostnames, IP addresses, usernames,
+        cookies, pre-shared keys or unredacted logs. Replace them with `vpn.example.com`,
+        `192.0.2.1`, `user`, `FAKE` and so on.
+  - type: checkboxes
+    id: redacted
+    attributes:
+      label: Privacy
+      options:
+        - label: I removed every real hostname, IP address, username, cookie and key from this report.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: Polytunnel version
+      placeholder: polytunnel --version
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [Windows, Linux, macOS]
+    validations:
+      required: true
+  - type: dropdown
+    id: protocol
+    attributes:
+      label: VPN type
+      options: [GlobalProtect, Fortinet SSL VPN, Fortinet IPsec, Not VPN-specific]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs
+      description: Only redacted output (polytunnel diag --redact, once available).
+      render: text

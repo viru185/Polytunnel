@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  lint-fixtures:
+    name: lint-fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: No real hostnames or IPs in test data
+        run: cargo xtask lint-fixtures
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  check:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --workspace
+      - name: Build release
+        run: cargo build --locked --release
+      - name: Smoke test
+        shell: bash
+        run: |
+          for name in polytunnel polytunnel-daemon; do
+            bin=target/release/$name
+            [ -f "$bin.exe" ] && bin="$bin.exe"
+            "$bin" --version
+            out=$("$bin" --author)
+            grep -q "Viren Hirpara" <<< "$out"
+            if LC_ALL=C grep -q '[^[:print:][:space:]]' <<< "$out"; then
+              echo "$name --author printed non-ASCII output when piped" >&2
+              exit 1
+            fi
+          done
+      - name: Report binary sizes
+        shell: bash
+        run: |
+          for name in polytunnel polytunnel-daemon; do
+            bin=target/release/$name
+            [ -f "$bin.exe" ] && bin="$bin.exe"
+            size=$(wc -c < "$bin")
+            echo "$RUNNER_OS $name: $((size / 1024)) KB"
+            echo "**$RUNNER_OS** \`$name\`: $((size / 1024)) KB" >> "$GITHUB_STEP_SUMMARY"
+          done
