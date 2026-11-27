@@ -1,0 +1,47 @@
+#!/bin/sh
+# Blocks commits that would publish private identifiers (company hostnames, office IPs,
+# usernames, ...). This repository is public, so the list itself is never committed: it lives
+# inside .git, one fixed string per line (case-insensitive, # starts a comment):
+#
+#   $(git rev-parse --git-path info/polytunnel-denylist)
+#
+# or in the file named by $POLYTUNNEL_DENYLIST. Also runs gitleaks on the staged changes when
+# it is installed. Enable once per clone:  git config core.hooksPath .githooks
+
+status=0
+list=${POLYTUNNEL_DENYLIST:-$(git rev-parse --git-path info/polytunnel-denylist)}
+
+if [ -f "$list" ]; then
+  patterns=$(mktemp)
+  grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$list" > "$patterns"
+  if [ -s "$patterns" ]; then
+    files=$(git diff --cached --name-only --diff-filter=ACMR)
+    while IFS= read -r file; do
+      [ -n "$file" ] || continue
+      if printf '%s\n' "$file" | grep -i -q -F -f "$patterns"; then
+        echo "pre-commit: file name matches your local denylist: $file" >&2
+        status=1
+      fi
+      if git diff --cached -U0 --no-color -- "$file" | grep '^+' | grep -v '^+++ ' \
+        | grep -i -q -F -f "$patterns"; then
+        echo "pre-commit: staged changes in $file contain a string from your local denylist" >&2
+        status=1
+      fi
+    done <<EOF
+$files
+EOF
+  fi
+  rm -f "$patterns"
+fi
+
+if command -v gitleaks > /dev/null 2>&1; then
+  if ! gitleaks git --pre-commit --staged --redact --no-banner --config .gitleaks.toml; then
+    echo "pre-commit: gitleaks found a possible secret in the staged changes" >&2
+    status=1
+  fi
+fi
+
+if [ "$status" -ne 0 ]; then
+  echo "pre-commit: commit blocked. Remove the private values (use example.com / 192.0.2.x in tests)." >&2
+fi
+exit "$status"

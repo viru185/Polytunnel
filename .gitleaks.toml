@@ -1,0 +1,51 @@
+# gitleaks configuration: the default rules plus VPN session secrets.
+#
+# Test fixtures use obviously fake values (containing "fake", "test", "example", ...), which
+# the allowlist below lets through. A real cookie or key never contains those words.
+
+title = "Polytunnel"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "globalprotect-authcookie"
+description = "GlobalProtect gateway authcookie"
+regex = '''(?i)\bauthcookie["']?\s*[=:>]\s*["']?([0-9a-z]{20,})'''
+secretGroup = 1
+keywords = ["authcookie"]
+
+[[rules]]
+id = "globalprotect-prelogin-cookie"
+description = "GlobalProtect SAML prelogin-cookie"
+regex = '''(?i)\bprelogin-cookie["']?\s*[=:>]\s*["']?([0-9a-z+/=_-]{16,})'''
+secretGroup = 1
+keywords = ["prelogin-cookie"]
+
+[[rules]]
+id = "globalprotect-portal-cookie"
+description = "GlobalProtect portal (prelogon) user auth cookie"
+regex = '''(?i)\bportal-(?:prelogon)?userauthcookie["']?\s*[=:>]\s*["']?([0-9a-z+/=_-]{16,})'''
+secretGroup = 1
+keywords = ["userauthcookie"]
+
+[[rules]]
+id = "fortinet-svpncookie"
+description = "Fortinet SSL VPN session cookie"
+regex = '''(?i)\bSVPNCOOKIE\s*=\s*([0-9a-z+/=%_-]{16,})'''
+secretGroup = 1
+keywords = ["svpncookie"]
+
+[[rules]]
+id = "ipsec-pre-shared-key"
+description = "IPsec pre-shared key"
+regex = '''(?i)\b(?:psk|pre[-_ ]?shared[-_ ]?key|authkey)["']?\s*[=:]\s*["']?([^\s"']{8,})'''
+secretGroup = 1
+keywords = ["psk", "shared", "authkey"]
+
+[allowlist]
+description = "Obviously fake values used in tests and docs"
+regexTarget = "secret"
+regexes = [
+  '''(?i)(fake|dummy|example|test|sample|placeholder|redacted|changeme|xxxx|0000|\.\.\.)''',
+]

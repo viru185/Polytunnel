@@ -1,0 +1,33 @@
+#!/bin/sh
+# Enforces Conventional Commits (https://www.conventionalcommits.org) and keeps private
+# identifiers out of commit messages (see .githooks/pre-commit for the local denylist).
+# Enable once per clone:  git config core.hooksPath .githooks
+
+msg=$(head -n 1 "$1")
+pattern='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([a-z0-9._/-]+\))?!?: .{1,100}$'
+
+case "$msg" in
+  Merge\ *|Revert\ *|fixup!\ *|squash!\ *) ;;
+  *)
+    if ! printf '%s' "$msg" | grep -Eq "$pattern"; then
+      echo "commit-msg: not a Conventional Commit:" >&2
+      echo "  $msg" >&2
+      echo "expected: <type>(<scope>)?: <description>, e.g. 'feat(gp): add gateway ranking'" >&2
+      echo "types: build chore ci docs feat fix perf refactor revert style test" >&2
+      exit 1
+    fi
+    ;;
+esac
+
+list=${POLYTUNNEL_DENYLIST:-$(git rev-parse --git-path info/polytunnel-denylist)}
+if [ -f "$list" ]; then
+  patterns=$(mktemp)
+  grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$list" > "$patterns"
+  if [ -s "$patterns" ] && grep -v '^#' "$1" | grep -i -q -F -f "$patterns"; then
+    rm -f "$patterns"
+    echo "commit-msg: the message contains a string from your local denylist ($list)." >&2
+    exit 1
+  fi
+  rm -f "$patterns"
+fi
+exit 0
