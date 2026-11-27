@@ -16,6 +16,7 @@ sha2.workspace = true
 ureq.workspace = true
 
 [dev-dependencies]
+polytunnel-forti.workspace = true
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 rustls.workspace = true
 
