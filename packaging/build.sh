@@ -102,8 +102,20 @@ macos() {
     iconutil -c icns "$iconset" -o "$app/Resources/polytunnel.icns"
     cp packaging/macos/com.github.viru185.polytunnel.daemon.plist "$work/root/Library/LaunchDaemons/"
     chmod +x packaging/macos/scripts/preinstall packaging/macos/scripts/postinstall
+    # Developer ID signing, when the release workflow provides the identities.
+    local sign_pkg=()
+    if [ -n "${MACOS_APP_IDENTITY:-}" ]; then
+        for exe in polytunnel-daemon polytunnel-sso; do
+            codesign --force --options runtime --timestamp --sign "$MACOS_APP_IDENTITY" "$app/MacOS/$exe"
+        done
+        codesign --force --options runtime --timestamp --sign "$MACOS_APP_IDENTITY" \
+            "$work/root/Applications/Polytunnel.app"
+    fi
+    if [ -n "${MACOS_INSTALLER_IDENTITY:-}" ]; then
+        sign_pkg=(--sign "$MACOS_INSTALLER_IDENTITY" --timestamp)
+    fi
     pkgbuild --root "$work/root" --identifier com.github.viru185.polytunnel --version "$version" \
-        --scripts packaging/macos/scripts --install-location / \
+        --scripts packaging/macos/scripts --install-location / "${sign_pkg[@]}" \
         "$out/polytunnel-$version-macos-universal.pkg"
 }
 
