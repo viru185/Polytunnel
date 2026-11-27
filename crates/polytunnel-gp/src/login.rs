@@ -115,10 +115,8 @@ pub fn parse(base: &str, computer: &str, response: &Response) -> Result<GatewayS
         }
         status => return Err(GpError::Status { step: STEP, status }),
     }
-    let root = Element::parse(&response.body).map_err(|e| GpError::BadResponse {
-        step: STEP,
-        detail: format!("not XML: {e}"),
-    })?;
+    let root =
+        Element::parse(&response.body).map_err(|e| GpError::not_xml(STEP, &response.body, e))?;
     if root.name == "response" && root.attr("status") == Some("error") {
         let msg = root.text_at("error").unwrap_or("unknown error").to_string();
         return Err(GpError::Server(msg));

@@ -98,10 +98,8 @@ pub fn parse(iface: Interface, response: &Response) -> Result<Prelogin, GpError>
             status: response.status,
         });
     }
-    let root = Element::parse(&response.body).map_err(|e| GpError::BadResponse {
-        step,
-        detail: format!("not XML: {e}"),
-    })?;
+    let root =
+        Element::parse(&response.body).map_err(|e| GpError::not_xml(step, &response.body, e))?;
     if let Some(status) = root.text_at("status")
         && !status.eq_ignore_ascii_case("success")
     {

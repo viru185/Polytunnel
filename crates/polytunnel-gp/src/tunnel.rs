@@ -199,10 +199,8 @@ pub fn parse_getconfig(response: &Response) -> Result<TunnelSettings, GpError> {
         512 | 401 | 403 => return Err(GpError::AuthFailed("the gateway session expired".into())),
         status => return Err(GpError::Status { step: STEP, status }),
     }
-    let root = Element::parse(&response.body).map_err(|e| GpError::BadResponse {
-        step: STEP,
-        detail: format!("not XML: {e}"),
-    })?;
+    let root =
+        Element::parse(&response.body).map_err(|e| GpError::not_xml(STEP, &response.body, e))?;
     if root.attr("status").is_some_and(|s| s != "success") {
         let msg = root
             .text_at("error")
