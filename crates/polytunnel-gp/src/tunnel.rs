@@ -20,7 +20,6 @@ use polytunnel_core::xml::Element;
 use crate::client::{self, ClientInfo};
 use crate::error::GpError;
 use crate::login::GatewaySession;
-use crate::portal::host_of;
 
 /// The session's fields, once each, in the order the gateway login returned them (as
 /// openconnect documents): authcookie, portal, user, domain, preferred addresses, computer.
@@ -283,13 +282,9 @@ pub fn tunnel_request(session: &GatewaySession, path: &str) -> Vec<u8> {
     let mut query = form_urlencoded::Serializer::new(String::new());
     query.append_pair("user", &session.user);
     query.append_pair("authcookie", session.authcookie.expose());
-    format!(
-        "GET {path}?{} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\n\r\n",
-        query.finish(),
-        host_of(&session.gateway),
-        client::USER_AGENT
-    )
-    .into_bytes()
+    // Only the request line, exactly as openconnect sends it; the gateway answers
+    // "START_TUNNEL".
+    format!("GET {path}?{} HTTP/1.1\r\n\r\n", query.finish()).into_bytes()
 }
 
 /// What the gateway sends when the TLS tunnel is up.
@@ -526,8 +521,7 @@ mod tests {
             String::from_utf8(tunnel_request(&session(), "/ssl-tunnel-connect.sslvpn")).unwrap();
         assert_eq!(
             tunnel,
-            "GET /ssl-tunnel-connect.sslvpn?user=user%40example.com&authcookie=FAKEcookie HTTP/1.1\r\n\
-             Host: gw.example.com\r\nUser-Agent: PAN GlobalProtect\r\n\r\n"
+            "GET /ssl-tunnel-connect.sslvpn?user=user%40example.com&authcookie=FAKEcookie HTTP/1.1\r\n\r\n"
         );
     }
 

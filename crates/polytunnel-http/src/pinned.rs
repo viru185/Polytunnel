@@ -256,6 +256,24 @@ mod tests {
     }
 
     #[test]
+    fn a_fixed_address_is_used_for_the_server_name() {
+        let (port, pin) = self_signed_server();
+        // `.test` names never resolve: only the fixed address can reach the server.
+        let transport = UreqTransport::configured(
+            Some(pin),
+            Some((
+                "VPN.example.test".into(),
+                vec!["127.0.0.1".parse().unwrap()],
+            )),
+        );
+        let body = transport
+            .send(&Request::get(format!("https://vpn.example.test:{port}/x")))
+            .map(|r| r.body)
+            .map_err(|e| e.0);
+        assert_eq!(body.as_deref(), Ok("hello"));
+    }
+
+    #[test]
     fn untrusted_certificates_are_identified_for_the_user() {
         let (port, pin) = self_signed_server();
         assert_eq!(untrusted_certificate("127.0.0.1", port), Some(pin));

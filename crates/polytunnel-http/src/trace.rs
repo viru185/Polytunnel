@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use polytunnel_core::http::{HttpError, Method, Request, Response, Transport};
 
 /// Bodies are cut after this many characters (after redaction).
-const MAX_BODY: usize = 2000;
+const MAX_BODY: usize = 8000;
 /// The trace file is started afresh (the old one kept as `.old`) beyond this size.
 const MAX_FILE: u64 = 4 * 1024 * 1024;
 

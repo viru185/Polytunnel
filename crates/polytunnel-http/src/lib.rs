@@ -4,15 +4,18 @@
 mod pinned;
 pub mod trace;
 
+use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use polytunnel_core::http::{HttpError, Method, Request, Response, Transport};
 use polytunnel_core::pin::CertFingerprint;
 use ureq::Agent;
 use ureq::config::Config;
+use ureq::http::Uri;
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
-use ureq::unversioned::resolver::DefaultResolver;
-use ureq::unversioned::transport::{Connector, TcpConnector};
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{Connector, DefaultConnector, NextTimeout, TcpConnector};
 
 pub use pinned::{check_pin, fingerprint, tls_connector, untrusted_certificate};
 
@@ -26,21 +29,72 @@ pub struct UreqTransport {
 impl UreqTransport {
     /// HTTPS checked by the system's TLS stack and trust store.
     pub fn new() -> Self {
-        UreqTransport {
-            agent: Agent::new_with_config(config()),
-        }
+        Self::configured(None, None)
     }
 
     /// With a pin, HTTPS that accepts exactly that certificate (see [`pinned`]); without
     /// one, the same as [`UreqTransport::new`].
     pub fn with_server_cert(pin: Option<CertFingerprint>) -> Self {
-        let Some(pin) = pin else {
-            return Self::new();
+        Self::configured(pin, None)
+    }
+
+    /// `server`: a host name and the addresses to use for it instead of asking DNS. The
+    /// service resolves the VPN server once, before a tunnel points DNS at servers that may
+    /// only be reachable through it, and keeps talking to that same server.
+    pub fn configured(pin: Option<CertFingerprint>, server: Option<(String, Vec<IpAddr>)>) -> Self {
+        let resolver = FixedResolver {
+            fixed: server.filter(|(_, addrs)| !addrs.is_empty()),
+            system: DefaultResolver::default(),
         };
-        let connector = TcpConnector::default().chain(pinned::PinnedTls { pin });
-        UreqTransport {
-            agent: Agent::with_parts(config(), connector, DefaultResolver::default()),
+        let agent = match pin {
+            Some(pin) => Agent::with_parts(
+                config(),
+                TcpConnector::default().chain(pinned::PinnedTls { pin }),
+                resolver,
+            ),
+            None => Agent::with_parts(config(), DefaultConnector::new(), resolver),
+        };
+        UreqTransport { agent }
+    }
+}
+
+/// Answers one host name with fixed addresses and asks the system for any other.
+struct FixedResolver {
+    fixed: Option<(String, Vec<IpAddr>)>,
+    system: DefaultResolver,
+}
+
+impl fmt::Debug for FixedResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FixedResolver")
+            .field("fixed", &self.fixed)
+            .finish()
+    }
+}
+
+impl Resolver for FixedResolver {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        config: &Config,
+        timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        if let Some((host, addrs)) = &self.fixed {
+            let asked = uri
+                .host()
+                .unwrap_or_default()
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+            if asked.eq_ignore_ascii_case(host) {
+                let port = uri.port_u16().unwrap_or(443);
+                let mut out = self.empty();
+                for ip in addrs.iter().take(16) {
+                    out.push(SocketAddr::new(*ip, port));
+                }
+                return Ok(out);
+            }
         }
+        self.system.resolve(uri, config, timeout)
     }
 }
 

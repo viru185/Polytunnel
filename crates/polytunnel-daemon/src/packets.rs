@@ -98,7 +98,7 @@ pub fn echo_request(src: Ipv4Addr, dst: Ipv4Addr, id: u16, seq: u16, payload: &[
     let mut ip = vec![0x45, 0];
     ip.extend_from_slice(&total.to_be_bytes());
     ip.extend_from_slice(&id.to_be_bytes()); // identification
-    ip.extend_from_slice(&[0, 0, 64, 1, 0, 0]); // no fragments, TTL 64, ICMP, checksum
+    ip.extend_from_slice(&[0x40, 0, 64, 1, 0, 0]); // don't fragment, TTL 64, ICMP, checksum
     ip.extend_from_slice(&src.octets());
     ip.extend_from_slice(&dst.octets());
     let c = checksum(&ip);

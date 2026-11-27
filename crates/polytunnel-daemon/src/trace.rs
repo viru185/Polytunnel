@@ -1,6 +1,7 @@
 //! The service's troubleshooting trace (see `polytunnel_http::trace`): `trace.log` in the
 //! state directory, written for connections the app starts while its trace is on.
 
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use polytunnel_core::pin::CertFingerprint;
@@ -18,10 +19,19 @@ pub fn set(on: bool) {
 
 /// The HTTPS transport for tunnel setup: traced while tracing is on.
 pub fn transport(pin: Option<CertFingerprint>) -> Traced<UreqTransport> {
+    transport_to(pin, None)
+}
+
+/// Like [`transport`], with `server`'s host name answered by fixed addresses (resolved once,
+/// before the tunnel changes DNS).
+pub fn transport_to(
+    pin: Option<CertFingerprint>,
+    server: Option<(String, Vec<IpAddr>)>,
+) -> Traced<UreqTransport> {
     let path = ON
         .load(Ordering::Relaxed)
         .then(|| paths::ensure_state_dir().ok())
         .flatten()
         .map(|dir| dir.join("trace.log"));
-    Traced::new(UreqTransport::with_server_cert(pin), path)
+    Traced::new(UreqTransport::configured(pin, server), path)
 }
