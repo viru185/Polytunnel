@@ -2,7 +2,7 @@
 # real package at the root; it then bumps every workspace member to the same version.
 [package]
 name = "polytunnel"
-version = "0.0.0"
+version = "0.1.0"
 description = "Lightweight VPN client for GlobalProtect and Fortinet: tray, window and CLI."
 edition.workspace = true
 rust-version.workspace = true
