@@ -114,9 +114,13 @@ macos() {
     if [ -n "${MACOS_INSTALLER_IDENTITY:-}" ]; then
         sign_pkg=(--sign "$MACOS_INSTALLER_IDENTITY" --timestamp)
     fi
+    # macOS ships bash 3.2, where "${a[@]}" of an empty array is an unbound-variable error
+    # under set -u that does not stop the script; the ${a[@]+...} form expands to nothing.
+    local pkg="$out/polytunnel-$version-macos-universal.pkg"
     pkgbuild --root "$work/root" --identifier com.github.viru185.polytunnel --version "$version" \
-        --scripts packaging/macos/scripts --install-location / "${sign_pkg[@]}" \
-        "$out/polytunnel-$version-macos-universal.pkg"
+        --scripts packaging/macos/scripts --install-location / ${sign_pkg[@]+"${sign_pkg[@]}"} \
+        "$pkg"
+    [ -f "$pkg" ] || { echo "build.sh: $pkg was not built" >&2; exit 1; }
 }
 
 case "$target" in
