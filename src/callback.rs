@@ -31,6 +31,30 @@ fn socket_name() -> io::Result<Name<'static>> {
     }
 }
 
+/// Windows: the pipe admits only this user (elevated or not), SYSTEM and administrators.
+/// Without an explicit DACL, a pipe created from an elevated terminal is owned by the
+/// Administrators group, and the browser-started (non-elevated) `--callback` process could
+/// not write to it; other users could read it.
+#[cfg(windows)]
+fn listener_options() -> io::Result<ListenerOptions<'static>> {
+    use interprocess::os::windows::local_socket::ListenerOptionsExt;
+    use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+
+    let sid = crate::win::current_user_sid()?;
+    let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{sid})");
+    let sddl = widestring::U16CString::from_str(&sddl)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    Ok(ListenerOptions::new()
+        .name(socket_name()?)
+        .security_descriptor(SecurityDescriptor::deserialize(&sddl)?))
+}
+
+/// Unix: the socket lives in a directory only this user can enter.
+#[cfg(not(windows))]
+fn listener_options() -> io::Result<ListenerOptions<'static>> {
+    Ok(ListenerOptions::new().name(socket_name()?))
+}
+
 /// Receives callback links while it lives.
 pub struct Listener {
     rx: Receiver<String>,
@@ -49,7 +73,7 @@ impl Listener {
             // A leftover socket from a crashed run would make binding fail.
             let _ = fs::remove_file(socket_file());
         }
-        let listener = ListenerOptions::new().name(socket_name()?).create_sync()?;
+        let listener = listener_options()?.create_sync()?;
         let (tx, rx) = mpsc::channel();
         thread::Builder::new()
             .name("callback-listener".into())

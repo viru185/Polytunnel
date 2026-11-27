@@ -1,16 +1,20 @@
 //! Small Win32 helpers: console, message boxes, registry, shell (adapted from AutoTyper).
 
 use std::ffi::OsStr;
+use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree};
+use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList, GetConsoleWindow};
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyW,
     RegDeleteTreeW, RegGetValueW, RegSetKeyValueW,
 };
 use windows_sys::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MessageBoxW, SW_HIDE, SW_SHOWNORMAL,
@@ -20,6 +24,35 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// NUL-terminated UTF-16 for Win32 `W` functions.
 pub fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
     s.as_ref().encode_wide().chain(Some(0)).collect()
+}
+
+/// The current user's SID as a string (`S-1-5-21-...`). The same with or without elevation.
+pub fn current_user_sid() -> io::Result<String> {
+    // SAFETY: standard token query. The buffer is u64-aligned (TOKEN_USER holds pointers) and
+    // sized as GetTokenInformation asked; the token handle and the SID string are released.
+    unsafe {
+        let mut token: HANDLE = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut len = 0u32;
+        GetTokenInformation(token, TokenUser, null_mut(), 0, &mut len);
+        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+        let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len);
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let user = &*(buf.as_ptr().cast::<TOKEN_USER>());
+        let mut text = null_mut();
+        if ConvertSidToStringSidW(user.User.Sid, &mut text) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let units = (0..).take_while(|&i| *text.add(i) != 0).count();
+        let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, units));
+        LocalFree(text.cast());
+        Ok(sid)
+    }
 }
 
 pub fn message_box(title: &str, text: &str, error: bool) {

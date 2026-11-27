@@ -349,6 +349,7 @@ dependencies = [
  "polytunnel-gp",
  "rpassword",
  "ureq",
+ "widestring",
  "windows-sys",
 ]
 
