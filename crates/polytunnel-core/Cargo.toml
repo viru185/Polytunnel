@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 form_urlencoded.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 zeroize.workspace = true
 

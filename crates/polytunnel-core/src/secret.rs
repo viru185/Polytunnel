@@ -36,6 +36,19 @@ impl From<&str> for Secret {
     }
 }
 
+/// Secrets cross the IPC boundary as plain strings (the channel itself is access-controlled).
+impl serde::Serialize for Secret {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Secret {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Secret)
+    }
+}
+
 impl Drop for Secret {
     fn drop(&mut self) {
         self.0.zeroize();
