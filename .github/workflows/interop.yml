@@ -1,8 +1,10 @@
 name: Interop
 
-# Polytunnel's protocol engines against independent implementations.
-# - IKEv1 (Fortinet dial-up IPsec): strongSwan in a container plays the FortiGate:
-#   aggressive mode, pre-shared key + XAuth, mode-config, DPD, 60 s phase-2 lifetime.
+# Polytunnel's IPsec engines against independent implementations, each in a container on the
+# runner while the daemon's engine connects from the runner itself (as root: TUN, routes).
+# - strongSwan stands in for a FortiGate: IKEv1 aggressive mode with PSK + XAuth, IKEv2 with
+#   a PSK, and IKEv2 with an ECDSA gateway certificate + EAP-MSCHAPv2.
+# - libreswan: IKEv2 with IKE and ESP over TCP (RFC 9329).
 on:
   push:
     branches: [main]
@@ -17,17 +19,15 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Documentation ranges: the gateway's protected network and the client address pools.
+  POLYTUNNEL_INTEROP_NETWORK: 198.51.100.0/24
+  POLYTUNNEL_INTEROP_PING: 198.51.100.1
 
 jobs:
-  strongswan-ikev1:
-    name: IKEv1 against strongSwan
+  strongswan:
+    name: IKEv1 and IKEv2 against strongSwan
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    env:
-      # Documentation ranges: the gateway's protected network and the client address pool.
-      POLYTUNNEL_INTEROP_NETWORK: 198.51.100.0/24
-      POLYTUNNEL_INTEROP_PING: 198.51.100.1
-      POOL: 203.0.113.64/26
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -45,47 +45,76 @@ jobs:
           psk=$(openssl rand -hex 16)
           user="interop$(openssl rand -hex 2)"
           password=$(openssl rand -hex 12)
+          dir="$RUNNER_TEMP/swan"
+          mkdir -p "$dir/out"
           {
             echo "POLYTUNNEL_INTEROP_PSK=$psk"
             echo "POLYTUNNEL_INTEROP_USER=$user"
             echo "POLYTUNNEL_INTEROP_PASSWORD=$password"
+            echo "POLYTUNNEL_INTEROP_CA_FILE=$dir/out/ca.pem"
           } >> "$GITHUB_ENV"
-          dir="$RUNNER_TEMP/swan"
-          mkdir -p "$dir"
           cat > "$dir/ipsec.conf" <<EOF
           config setup
               charondebug="ike 2, cfg 1, knl 1, net 1"
               uniqueids=no
 
-          conn fortigate-standin
+          conn %default
+              left=%any
+              leftid=@gateway.test
+              leftsubnet=$POLYTUNNEL_INTEROP_NETWORK
+              right=%any
+              ikelifetime=1h
+              margintime=5s
+              rekey=no
+              reauth=no
+              dpdaction=clear
+              dpddelay=10s
+              auto=add
+
+          # IKEv1 aggressive mode, PSK + XAuth, mode-config pull, 60 s phase 2.
+          conn ikev1-xauth
               keyexchange=ikev1
               aggressive=yes
               ike=aes256-sha256-modp2048!
               esp=aes256-sha256-modp2048!
-              ikelifetime=1h
               lifetime=60s
-              margintime=5s
-              rekey=no
-              reauth=no
-              left=%any
-              leftid=@gateway.test
-              leftsubnet=$POLYTUNNEL_INTEROP_NETWORK
               leftauth=psk
-              right=%any
               rightid=@client.test
               rightauth=psk
               rightauth2=xauth
-              rightsourceip=$POOL
+              rightsourceip=203.0.113.0/26
               modeconfig=pull
-              dpdaction=clear
-              dpddelay=10s
-              auto=add
+
+          # IKEv2, PSK both ways, 60 s children (rekeyed with PFS).
+          conn ikev2-psk
+              keyexchange=ikev2
+              ike=aes256-sha256-modp2048!
+              esp=aes256-sha256-modp2048!
+              lifetime=60s
+              leftauth=psk
+              rightid=@client-psk.test
+              rightauth=psk
+              rightsourceip=203.0.113.64/26
+
+          # IKEv2, ECDSA gateway certificate, EAP-MSCHAPv2 for the user.
+          conn ikev2-eap
+              keyexchange=ikev2
+              ike=aes256-sha256-modp2048!
+              esp=aes256-sha256!
+              lifetime=1h
+              leftauth=pubkey
+              leftcert=gateway.pem
+              leftsendcert=always
+              rightid=%any
+              rightauth=eap-mschapv2
+              eap_identity=%identity
+              rightsourceip=203.0.113.128/26
           EOF
-          printf '@gateway.test @client.test : PSK "%s"\n%s : XAUTH "%s"\n' \
-            "$psk" "$user" "$password" > "$dir/ipsec.secrets"
+          printf '@gateway.test @client.test : PSK "%s"\n@gateway.test @client-psk.test : PSK "%s"\n: ECDSA gateway.key\n%s : XAUTH "%s"\n%s : EAP "%s"\n' \
+            "$psk" "$psk" "$user" "$password" "$user" "$password" > "$dir/ipsec.secrets"
           cat > "$dir/charon-local.conf" <<'EOF'
           charon {
-              # A FortiGate dial-up tunnel is exactly this (weak) combination.
+              # A FortiGate IKEv1 dial-up tunnel is exactly this (weak) combination.
               i_dont_care_about_security_and_use_aggressive_mode_psk = yes
               # No syslog in the container: log to stderr (docker logs).
               filelog {
@@ -101,18 +130,28 @@ jobs:
           cat > "$dir/start.sh" <<EOF
           set -e
           apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq strongswan \
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq strongswan strongswan-pki \
             libcharon-extra-plugins libcharon-extauth-plugins iproute2 > /dev/null
           ip link add dummy0 type dummy
           ip addr add $POLYTUNNEL_INTEROP_PING/24 dev dummy0
           ip link set dummy0 up
+          cd /etc/ipsec.d
+          pki --gen --type ecdsa --size 256 --outform pem > private/ca.key
+          pki --self --ca --lifetime 30 --in private/ca.key --type ecdsa \
+            --dn "CN=Polytunnel interop CA" --outform pem > cacerts/ca.pem
+          pki --gen --type ecdsa --size 256 --outform pem > private/gateway.key
+          pki --pub --in private/gateway.key --type ecdsa | pki --issue --lifetime 30 \
+            --cacert cacerts/ca.pem --cakey private/ca.key --dn "CN=gateway.test" \
+            --san gateway.test --flag serverAuth --outform pem > certs/gateway.pem
+          cp cacerts/ca.pem /out/ca.pem
           cp /swan/ipsec.conf /etc/ipsec.conf
           install -m 600 /swan/ipsec.secrets /etc/ipsec.secrets
           cp /swan/charon-local.conf /etc/strongswan.d/charon-local.conf
           echo "strongswan configured"
           exec ipsec start --nofork
           EOF
-          docker run -d --name swan --cap-add NET_ADMIN -v "$dir:/swan:ro" ubuntu:24.04 bash /swan/start.sh
+          docker run -d --name swan --cap-add NET_ADMIN \
+            -v "$dir:/swan:ro" -v "$dir/out:/out" ubuntu:24.04 bash /swan/start.sh
           # Ready once charon listens on UDP 500 (the package install comes first).
           ready=
           for _ in $(seq 240); do
@@ -122,11 +161,96 @@ jobs:
           done
           [ -n "$ready" ] || { docker logs swan 2>&1 | tail -50; exit 1; }
           sleep 3
-          docker logs swan 2>&1 | tail -5
+          test -s "$dir/out/ca.pem"
           gateway=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' swan)
           echo "POLYTUNNEL_INTEROP_GATEWAY=$gateway" >> "$GITHUB_ENV"
-      - name: Connect, ping, rekey, disconnect; wrong key and password
-        run: sudo -E "$TEST_BIN" --ignored --test-threads=1 --nocapture
+      - name: Connect, ping, rekey, disconnect; wrong keys and passwords
+        run: sudo -E "$TEST_BIN" --ignored --test-threads=1 --nocapture ikev1_ ikev2_
       - name: strongSwan log
+        if: always()
+        run: docker logs swan 2>&1 | tail -400
+
+  libreswan-tcp:
+    name: IKEv2 over TCP against libreswan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      POLYTUNNEL_INTEROP_TCP_PORT: "4500"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Build the test
+        run: |
+          cargo test --locked -p polytunnel-daemon --test ipsec_interop --no-run 2>&1 | tee build.log
+          bin=$(grep -oE 'target/debug/deps/ipsec_interop-[0-9a-f]+' build.log | head -1)
+          echo "TEST_BIN=$bin" >> "$GITHUB_ENV"
+      - name: Start libreswan
+        run: |
+          # ESP in TCP needs the kernel's espintcp support on the host.
+          sudo modprobe espintcp || echo "espintcp is built in or unavailable"
+          psk=$(openssl rand -hex 16)
+          echo "POLYTUNNEL_INTEROP_PSK=$psk" >> "$GITHUB_ENV"
+          # Unused by the TCP case, but the test helpers read them.
+          echo "POLYTUNNEL_INTEROP_USER=unused" >> "$GITHUB_ENV"
+          echo "POLYTUNNEL_INTEROP_PASSWORD=unused" >> "$GITHUB_ENV"
+          dir="$RUNNER_TEMP/libreswan"
+          mkdir -p "$dir"
+          cat > "$dir/ipsec.conf" <<EOF
+          config setup
+              listen-tcp=yes
+              plutodebug=base
+
+          conn tcp-psk
+              keyexchange=ikev2
+              authby=secret
+              left=%defaultroute
+              leftid=@gateway.test
+              leftsubnet=$POLYTUNNEL_INTEROP_NETWORK
+              right=%any
+              rightid=@client-tcp.test
+              rightaddresspool=203.0.113.192-203.0.113.250
+              narrowing=yes
+              ike=aes256-sha2_256-modp2048
+              esp=aes256-sha2_256
+              enable-tcp=yes
+              tcp-remoteport=$POLYTUNNEL_INTEROP_TCP_PORT
+              auto=add
+          EOF
+          printf '@gateway.test @client-tcp.test : PSK "%s"\n' "$psk" > "$dir/ipsec.secrets"
+          cat > "$dir/start.sh" <<EOF
+          set -e
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libreswan iproute2 > /dev/null
+          ip link add dummy0 type dummy
+          ip addr add $POLYTUNNEL_INTEROP_PING/24 dev dummy0
+          ip link set dummy0 up
+          cp /swan/ipsec.conf /etc/ipsec.conf
+          install -m 600 /swan/ipsec.secrets /etc/ipsec.secrets
+          mkdir -p /run/pluto
+          ipsec initnss > /dev/null 2>&1 || true
+          ipsec pluto --config /etc/ipsec.conf --nofork --stderrlog &
+          sleep 3
+          ipsec addconn --config /etc/ipsec.conf --autoall
+          echo "libreswan configured"
+          wait
+          EOF
+          docker run -d --name swan --cap-add NET_ADMIN --cap-add SYS_ADMIN \
+            -v "$dir:/swan:ro" ubuntu:24.04 bash /swan/start.sh
+          ready=
+          for _ in $(seq 240); do
+            if docker logs swan 2>&1 | grep -q "libreswan configured"; then ready=1; break; fi
+            if [ -z "$(docker ps -q --filter name=swan)" ]; then docker logs swan; exit 1; fi
+            sleep 1
+          done
+          [ -n "$ready" ] || { docker logs swan 2>&1 | tail -50; exit 1; }
+          sleep 2
+          gateway=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' swan)
+          echo "POLYTUNNEL_INTEROP_GATEWAY=$gateway" >> "$GITHUB_ENV"
+      - name: Connect over TCP, ping, disconnect
+        run: sudo -E "$TEST_BIN" --ignored --test-threads=1 --nocapture tcp_
+      - name: libreswan log
         if: always()
         run: docker logs swan 2>&1 | tail -300
