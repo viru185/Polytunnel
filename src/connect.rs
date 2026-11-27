@@ -364,6 +364,37 @@ pub fn run_killswitch(mode: Option<KillSwitchMode>, allow_lan: Option<bool>) -> 
     }
 }
 
+/// What the service found about updates: (current, latest, installing, message).
+pub type UpdateInfo = (String, Option<String>, bool, String);
+
+/// Asks the service to look for a newer release, and to install it when `install`.
+pub fn update(install: bool) -> Result<UpdateInfo, String> {
+    match request(&Request::Update { install })? {
+        Response::Update {
+            current,
+            latest,
+            installing,
+            message,
+        } => Ok((current, latest, installing, message)),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected answer from the service: {other:?}")),
+    }
+}
+
+/// `polytunnel update [--install]`.
+pub fn run_update(install: bool) -> i32 {
+    match update(install) {
+        Ok((_, latest, _, message)) => {
+            println!("{message}");
+            if latest.is_some() { 0 } else { 1 }
+        }
+        Err(e) => {
+            eprintln!("polytunnel: {e}");
+            1
+        }
+    }
+}
+
 /// `polytunnel status`.
 pub fn run_status() -> i32 {
     match status() {

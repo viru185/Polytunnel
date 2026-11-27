@@ -308,6 +308,8 @@ struct App {
     link_status: String,
     /// The kill switch setting, when the service could be asked.
     killswitch: Option<polytunnel_core::ipc::KillSwitchSettings>,
+    /// A newer release the service can install.
+    update: Option<String>,
     _instance: Option<Instance>,
 }
 
@@ -381,6 +383,7 @@ impl App {
             autostart: autostart::enabled(),
             link_status: link_status_text(),
             killswitch: connect::killswitch(None).ok().map(|(s, _, _)| s),
+            update: None,
             _instance: instance,
         }
     }
@@ -925,6 +928,29 @@ impl App {
                 }
                 ui.separator();
             }
+            ui.horizontal(|ui| {
+                if ui.button("Check for updates").clicked() {
+                    match connect::update(false) {
+                        Ok((current, latest, _, message)) => {
+                            self.update = latest.filter(|l| {
+                                polytunnel_core::is_newer_version(l, &current)
+                                    && (cfg!(windows) || cfg!(target_os = "macos"))
+                            });
+                            self.log(message);
+                        }
+                        Err(e) => self.log(format!("Could not check for updates: {e}")),
+                    }
+                }
+                if let Some(version) = self.update.clone()
+                    && ui.button(format!("Install Polytunnel {version}")).clicked()
+                {
+                    match connect::update(true) {
+                        Ok((_, _, _, message)) => self.log(message),
+                        Err(e) => self.log(format!("Could not install the update: {e}")),
+                    }
+                    self.update = None;
+                }
+            });
             ui.label(&self.link_status);
             ui.horizontal(|ui| {
                 if ui.button("Handle GlobalProtect browser logins").clicked() {
