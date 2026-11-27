@@ -5,6 +5,7 @@
 //! use on either side of the IPC boundary.
 
 pub mod http;
+pub mod ipc;
 pub mod profile;
 pub mod secret;
 pub mod xml;

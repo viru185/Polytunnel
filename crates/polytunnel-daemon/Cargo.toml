@@ -17,11 +17,26 @@ name = "polytunnel-daemon"
 path = "src/main.rs"
 
 [dependencies]
+interprocess.workspace = true
 lexopt.workspace = true
+native-tls.workspace = true
 polytunnel-core.workspace = true
+polytunnel-esp.workspace = true
+polytunnel-gp.workspace = true
+polytunnel-http.workspace = true
+polytunnel-net.workspace = true
+tokio.workspace = true
+tokio-native-tls.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }
+widestring.workspace = true
+windows-service.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Console",
+] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

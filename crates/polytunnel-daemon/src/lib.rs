@@ -8,6 +8,13 @@
 
 pub mod author;
 pub mod cli;
+pub mod gp;
+pub mod ipc_server;
+pub mod log;
+pub mod manager;
+pub mod packets;
+pub mod paths;
+pub mod service;
 
 use std::ffi::OsString;
 
@@ -48,6 +55,38 @@ pub fn run(argv: Vec<OsString>, hooks: &Hooks) -> i32 {
         Command::Version => {
             println!("polytunnel-daemon {}", polytunnel_core::VERSION);
             0
+        }
+        Command::Run { service } => {
+            let result = if service {
+                #[cfg(windows)]
+                {
+                    service::windows::run_service()
+                }
+                #[cfg(not(windows))]
+                {
+                    Err("--service is only for Windows; run in the foreground instead".to_string())
+                }
+            } else {
+                service::run_foreground()
+            };
+            report(result.map(|()| String::new()))
+        }
+        Command::Install => report(service::install()),
+        Command::Uninstall => report(service::uninstall()),
+    }
+}
+
+fn report(result: Result<String, String>) -> i32 {
+    match result {
+        Ok(message) => {
+            if !message.is_empty() {
+                println!("{message}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("polytunnel-daemon: {e}");
+            1
         }
     }
 }

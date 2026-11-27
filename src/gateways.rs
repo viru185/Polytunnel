@@ -15,9 +15,9 @@ use polytunnel_gp::rank::{self, Probe, RankInput, Ranking, Status};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{AuthTarget, GatewaysArgs};
-use crate::http::UreqTransport;
 use crate::prompter::{CliPrompter, SsoMode};
 use crate::{auth, paths, probe, sysinfo};
+use polytunnel_http::UreqTransport;
 
 /// How the user wants gateways picked.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

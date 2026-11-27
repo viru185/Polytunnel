@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use crate::prefix::Prefix;
 
-pub use tun_rs::SyncDevice;
+pub use tun_rs::{InterruptEvent, SyncDevice};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunOptions {

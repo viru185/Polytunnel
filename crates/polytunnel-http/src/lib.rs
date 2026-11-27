@@ -1,4 +1,5 @@
-//! The real HTTP transport: ureq with the operating system's TLS stack and trust store.
+//! The real HTTP transport for Polytunnel: ureq with the operating system's TLS stack and
+//! trust store. Shared by the app (logins) and the daemon (tunnel setup, HIP, logout).
 
 use std::time::Duration;
 
