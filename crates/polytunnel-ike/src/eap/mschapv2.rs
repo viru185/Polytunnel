@@ -138,13 +138,20 @@ mod tests {
     }
 
     // RFC 2759 section 9.2 sample data; RFC 3079 for the keys (recomputed independently).
-    const AUTH: &str = "5B5D7C7D7B3F2F3E3C2C602132262628";
-    const PEER: &str = "21402324255E262A28295F2B3A337C7E";
+    // The challenges are printable ASCII in the RFC; written as bytes here.
+    const AUTHENTICATOR_CHALLENGE: [u8; 16] = [
+        0x5B, 0x5D, 0x7C, 0x7D, 0x7B, 0x3F, 0x2F, 0x3E, 0x3C, 0x2C, 0x60, 0x21, 0x32, 0x26, 0x26,
+        0x28,
+    ];
+    const PEER_CHALLENGE: [u8; 16] = [
+        0x21, 0x40, 0x23, 0x24, 0x25, 0x5E, 0x26, 0x2A, 0x28, 0x29, 0x5F, 0x2B, 0x3A, 0x33, 0x7C,
+        0x7E,
+    ];
 
     #[test]
     fn rfc_2759_sample() {
-        let auth: [u8; 16] = hex(AUTH).try_into().unwrap();
-        let peer: [u8; 16] = hex(PEER).try_into().unwrap();
+        let auth = AUTHENTICATOR_CHALLENGE;
+        let peer = PEER_CHALLENGE;
         let password = "clientPass";
         assert_eq!(
             &*password_hash(password),
