@@ -26,9 +26,11 @@ polytunnel-esp.workspace = true
 polytunnel-forti.workspace = true
 polytunnel-gp.workspace = true
 polytunnel-http.workspace = true
+polytunnel-ike.workspace = true
 polytunnel-net.workspace = true
 tokio.workspace = true
 tokio-native-tls.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 widestring.workspace = true
