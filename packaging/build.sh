@@ -102,9 +102,25 @@ macos() {
     iconutil -c icns "$iconset" -o "$app/Resources/polytunnel.icns"
     cp packaging/macos/com.github.viru185.polytunnel.daemon.plist "$work/root/Library/LaunchDaemons/"
     chmod +x packaging/macos/scripts/preinstall packaging/macos/scripts/postinstall
+    # Developer ID signing, when the release workflow provides the identities.
+    local sign_pkg=()
+    if [ -n "${MACOS_APP_IDENTITY:-}" ]; then
+        for exe in polytunnel-daemon polytunnel-sso; do
+            codesign --force --options runtime --timestamp --sign "$MACOS_APP_IDENTITY" "$app/MacOS/$exe"
+        done
+        codesign --force --options runtime --timestamp --sign "$MACOS_APP_IDENTITY" \
+            "$work/root/Applications/Polytunnel.app"
+    fi
+    if [ -n "${MACOS_INSTALLER_IDENTITY:-}" ]; then
+        sign_pkg=(--sign "$MACOS_INSTALLER_IDENTITY" --timestamp)
+    fi
+    # macOS ships bash 3.2, where "${a[@]}" of an empty array is an unbound-variable error
+    # under set -u that does not stop the script; the ${a[@]+...} form expands to nothing.
+    local pkg="$out/polytunnel-$version-macos-universal.pkg"
     pkgbuild --root "$work/root" --identifier com.github.viru185.polytunnel --version "$version" \
-        --scripts packaging/macos/scripts --install-location / \
-        "$out/polytunnel-$version-macos-universal.pkg"
+        --scripts packaging/macos/scripts --install-location / ${sign_pkg[@]+"${sign_pkg[@]}"} \
+        "$pkg"
+    [ -f "$pkg" ] || { echo "build.sh: $pkg was not built" >&2; exit 1; }
 }
 
 case "$target" in

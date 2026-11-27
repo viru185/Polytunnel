@@ -26,6 +26,16 @@ enum UserEvent {
     Menu(MenuEvent),
     Ipc(Message),
     Status(Result<Status, String>),
+    /// An update check finished: the newer version, if any, or what went wrong.
+    UpdateChecked(Result<Option<String>, String>),
+    /// An installation was started (or could not be).
+    UpdateStarted(Result<String, String>),
+}
+
+/// Asks the service whether a newer release exists.
+fn check_for_update() -> Result<Option<String>, String> {
+    let (current, latest, _, _) = connect::update(false)?;
+    Ok(latest.filter(|l| polytunnel_core::is_newer_version(l, &current)))
 }
 
 type Proxy = Arc<Mutex<EventLoopProxy<UserEvent>>>;
@@ -114,6 +124,22 @@ pub fn run() -> i32 {
     if let Err(e) = instance.listen(Role::Agent, move |m| forward(&p, UserEvent::Ipc(m))) {
         eprintln!("polytunnel: agent IPC unavailable: {e}");
     }
+    if std::env::var_os("POLYTUNNEL_NO_UPDATE_CHECK").is_none() {
+        let p = proxy.clone();
+        thread::Builder::new()
+            .name("tray-updates".into())
+            .spawn(move || {
+                thread::sleep(Duration::from_secs(120));
+                loop {
+                    // Only offers; nothing is downloaded without a click.
+                    if let Ok(Some(v)) = check_for_update() {
+                        forward(&p, UserEvent::UpdateChecked(Ok(Some(v))));
+                    }
+                    thread::sleep(Duration::from_secs(24 * 3600));
+                }
+            })
+            .ok();
+    }
     let p = proxy.clone();
     thread::Builder::new()
         .name("tray-status".into())
@@ -129,6 +155,9 @@ pub fn run() -> i32 {
         tray: None,
         status_item: MenuItem::new("Not connected", false, None),
         disconnect_item: MenuItem::with_id(MenuId::new("disconnect"), "Disconnect", false, None),
+        update_item: MenuItem::with_id(MenuId::new("update"), "Check for updates", true, None),
+        available: None,
+        proxy: proxy.clone(),
         open_id: MenuId::new("open"),
         quit_id: MenuId::new("quit"),
         connected: None,
@@ -147,6 +176,10 @@ struct Agent {
     tray: Option<TrayIcon>,
     status_item: MenuItem,
     disconnect_item: MenuItem,
+    update_item: MenuItem,
+    /// A newer release found by the last check.
+    available: Option<String>,
+    proxy: Proxy,
     open_id: MenuId,
     quit_id: MenuId,
     connected: Option<bool>,
@@ -163,6 +196,7 @@ impl Agent {
             &PredefinedMenuItem::separator(),
             &open,
             &self.disconnect_item,
+            &self.update_item,
             &PredefinedMenuItem::separator(),
             &quit,
         ]);
@@ -199,6 +233,29 @@ impl Agent {
         self.connected = Some(connected);
     }
 
+    /// Checks for an update, or installs the one found.
+    fn update_clicked(&mut self) {
+        self.update_item.set_enabled(false);
+        let p = self.proxy.clone();
+        let install = self.available.is_some();
+        thread::spawn(move || {
+            let event = if install {
+                UserEvent::UpdateStarted(connect::update(true).and_then(
+                    |(_, _, installing, message)| {
+                        if installing {
+                            Ok(message)
+                        } else {
+                            Err(message)
+                        }
+                    },
+                ))
+            } else {
+                UserEvent::UpdateChecked(check_for_update())
+            };
+            forward(&p, event);
+        });
+    }
+
     fn open_window(&self) {
         if instance::send(Role::Gui, Message::Show).is_err()
             && let Ok(exe) = std::env::current_exe()
@@ -232,7 +289,28 @@ impl ApplicationHandler<UserEvent> for Agent {
             UserEvent::Menu(e) if e.id == *self.disconnect_item.id() => {
                 let _ = connect::disconnect();
             }
+            UserEvent::Menu(e) if e.id == *self.update_item.id() => self.update_clicked(),
             UserEvent::Menu(_) => {}
+            UserEvent::UpdateChecked(result) => {
+                self.update_item.set_enabled(true);
+                match result {
+                    Ok(Some(version)) => {
+                        self.update_item
+                            .set_text(format!("Install Polytunnel {version}"));
+                        self.available = Some(version);
+                    }
+                    Ok(None) => self.update_item.set_text("Polytunnel is up to date"),
+                    Err(_) => self.update_item.set_text("Could not check for updates"),
+                }
+            }
+            UserEvent::UpdateStarted(result) => {
+                self.available = None;
+                self.update_item.set_enabled(result.is_err());
+                self.update_item.set_text(match result {
+                    Ok(_) => "Installing the update...",
+                    Err(_) => "The update could not start",
+                });
+            }
             UserEvent::Ipc(Message::Quit) => event_loop.exit(),
             UserEvent::Ipc(Message::Show) => self.open_window(),
             UserEvent::Status(status) => self.update(status),

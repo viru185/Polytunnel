@@ -23,6 +23,10 @@ pub enum Command {
     Uri(UriAction),
     /// Deliver a `globalprotectcallback:` link to the waiting login.
     Callback(String),
+    /// Look for (or install) a newer release.
+    Update {
+        install: bool,
+    },
     /// Show or change the kill switch.
     KillSwitch {
         mode: Option<KillSwitchMode>,
@@ -96,6 +100,7 @@ Usage:
   polytunnel status                            Show the connection status
   polytunnel killswitch [off|connected|always] [--allow-lan|--block-lan]
                                                Show or set the kill switch
+  polytunnel update [--install]                Look for (and install) a newer release
   polytunnel gateways <PROFILE> [OPTIONS]      Rank a GlobalProtect portal's gateways
   polytunnel gateways gp <PORTAL> [OPTIONS]      (find the best gateway)
   polytunnel profiles                          Show the profiles file and its profiles
@@ -156,6 +161,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     let (mut paste, mut no_browser, mut refresh, mut json) = (false, false, false, false);
     let mut embedded = false;
     let mut allow_lan = None;
+    let mut install = false;
 
     let value = |parser: &mut lexopt::Parser| -> Result<String, String> {
         parser
@@ -193,6 +199,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             Long("embedded") => embedded = true,
             Long("allow-lan") => allow_lan = Some(true),
             Long("block-lan") => allow_lan = Some(false),
+            Long("install") => install = true,
             Long("refresh") => refresh = true,
             Long("json") => json = true,
             Value(v) => positionals.push(
@@ -265,6 +272,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             })
         }
         Some("disconnect") => Command::Disconnect,
+        Some("update") => Command::Update { install },
         Some("killswitch") => {
             let mode = match words.next().as_deref() {
                 None => None,

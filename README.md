@@ -180,6 +180,15 @@ The VPN servers, loopback, DHCP and IPv6 neighbour discovery always pass. It use
 Filtering Platform (the rules vanish if the service stops, except in lockdown), nftables on
 Linux and a pf anchor on macOS. The window has the same switches under Settings.
 
+### Updates
+
+`polytunnel update` asks the service whether a newer release exists; `polytunnel update
+--install` installs it (Windows and macOS; Linux updates come from the package manager). The
+service only trusts an update manifest signed with the project's update key, downloads the
+installer into its own administrators-only folder and checks its SHA-256 before running it.
+The tray checks once a day and offers the update in its menu (nothing is downloaded without a
+click); set `POLYTUNNEL_NO_UPDATE_CHECK=1` to turn the daily check off.
+
 ## Building from source
 
 Requires the stable Rust toolchain (see `rust-toolchain.toml`).

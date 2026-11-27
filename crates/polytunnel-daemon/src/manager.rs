@@ -84,6 +84,10 @@ impl Manager {
                 Response::Accepted {}
             }
             Request::Answer { id, values } => self.answer(id, values),
+            Request::Update { install } => {
+                info!("update request (install: {install})");
+                crate::update::handle(install)
+            }
             Request::KillSwitch { set } => {
                 if let Some(settings) = set {
                     info!(
