@@ -14,6 +14,8 @@
 //! browser there.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+// Elsewhere only the "unavailable" stub is built, so the window's helpers go unused.
+#![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 
 use std::io::Read;
 
