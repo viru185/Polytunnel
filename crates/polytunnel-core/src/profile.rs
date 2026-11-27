@@ -193,6 +193,54 @@ pub struct FortinetIpsecProfile {
     /// NAT keepalive interval in seconds; 0 turns it off (default 5, like FortiClient).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nat_keepalive: Option<u32>,
+    /// 1 (default: aggressive mode with XAuth) or 2 (IKEv2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ike_version: Option<u8>,
+    /// IKEv2: sign in with EAP (`mschapv2`) instead of the pre-shared key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eap: Option<EapMethodName>,
+    /// IKEv2: how the gateway proves itself, `psk` (default) or `certificate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_auth: Option<ServerAuthStyle>,
+    /// IKEv2 with a certificate: a PEM file with a CA to trust besides the system's roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_file: Option<String>,
+    /// The name the gateway's certificate must carry (default: the server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_id: Option<String>,
+    /// IKEv2: `udp` (default) or `tcp` (RFC 9329; FortiOS "transport tcp").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<IpsecTransport>,
+    /// The gateway's TCP port for `transport = "tcp"` (default 443).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_port: Option<u16>,
+}
+
+/// EAP methods for IKEv2 sign-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EapMethodName {
+    Mschapv2,
+    /// EAP-TTLS with PAP inside.
+    TtlsPap,
+}
+
+/// How an IKEv2 gateway authenticates itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServerAuthStyle {
+    #[default]
+    Psk,
+    Certificate,
+}
+
+/// How IKE and ESP reach the gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IpsecTransport {
+    #[default]
+    Udp,
+    Tcp,
 }
 
 /// How the local ID is sent.

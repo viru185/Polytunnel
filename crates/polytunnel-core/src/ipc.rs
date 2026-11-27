@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::Secret;
 use crate::profile::{
-    ClientOs, LocalIdType, ModeConfigStyle, normalize_server, parse_ipv4_network, valid_host,
+    ClientOs, EapMethodName, IpsecTransport, LocalIdType, ModeConfigStyle, ServerAuthStyle,
+    normalize_server, parse_ipv4_network, valid_host,
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -105,7 +106,7 @@ pub struct IpsecConnect {
     /// Host name or IPv4 address of the FortiGate.
     pub server: String,
     pub psk: Secret,
-    /// Username and password for XAuth; `None` when the tunnel does not use XAuth.
+    /// Username and password for XAuth (IKEv1) or EAP (IKEv2); `None` when not used.
     pub xauth: Option<XauthLogin>,
     pub local_id: Option<String>,
     pub local_id_type: LocalIdType,
@@ -126,7 +127,21 @@ pub struct IpsecConnect {
     pub nat_keepalive: u32,
     /// Sent to the gateway as the application version.
     pub client_version: String,
+    /// 1 or 2.
+    pub ike_version: u8,
+    /// IKEv2: EAP sign-in with the username and password.
+    pub eap: Option<EapMethodName>,
+    pub server_auth: ServerAuthStyle,
+    /// IKEv2 with a certificate: CA certificates (PEM) to trust besides the system's.
+    pub ca_pem: Option<String>,
+    /// The name the gateway's certificate must carry; `None`: the server.
+    pub remote_id: Option<String>,
+    pub transport: IpsecTransport,
+    pub tcp_port: u16,
 }
+
+/// Largest CA bundle a connect request may carry.
+pub const MAX_CA_PEM: usize = 32 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -340,10 +355,37 @@ impl IpsecConnect {
     fn validate(&self) -> Result<(), String> {
         check(printable(&self.profile, 128), "profile name")?;
         check(valid_host(&self.server), "server")?;
+        check(matches!(self.ike_version, 1 | 2), "IKE version")?;
+        if self.ike_version == 1 {
+            check(
+                self.eap.is_none()
+                    && self.server_auth == ServerAuthStyle::Psk
+                    && self.transport == IpsecTransport::Udp,
+                "IKEv1 settings (EAP, certificates and TCP need IKEv2)",
+            )?;
+        }
+        // Only EAP sign-in with a certificate gateway needs no pre-shared key.
+        let psk_used = !(self.eap.is_some() && self.server_auth == ServerAuthStyle::Certificate);
         check(
-            !self.psk.is_empty() && no_controls(self.psk.expose(), 256),
+            (!psk_used || !self.psk.is_empty()) && no_controls(self.psk.expose(), 256),
             "pre-shared key",
         )?;
+        if self.eap.is_some() {
+            check(self.xauth.is_some(), "EAP username and password")?;
+        }
+        if let Some(pem) = &self.ca_pem {
+            check(
+                pem.len() <= MAX_CA_PEM
+                    && pem
+                        .bytes()
+                        .all(|b| (0x20..0x7f).contains(&b) || b"\r\n\t".contains(&b)),
+                "CA certificate",
+            )?;
+        }
+        if let Some(id) = &self.remote_id {
+            check(valid_host(id), "remote ID")?;
+        }
+        check(self.tcp_port != 0, "TCP port")?;
         if let Some(x) = &self.xauth {
             check(printable(&x.username, 256), "username")?;
             check(no_controls(x.password.expose(), 256), "password")?;
@@ -493,6 +535,13 @@ mod tests {
             dpd: 20,
             nat_keepalive: 5,
             client_version: "Polytunnel 0.1.0".into(),
+            ike_version: 1,
+            eap: None,
+            server_auth: ServerAuthStyle::Psk,
+            ca_pem: None,
+            remote_id: None,
+            transport: IpsecTransport::Udp,
+            tcp_port: 443,
         }
     }
 
@@ -516,6 +565,34 @@ mod tests {
         assert!(bad(|c| c.remote_network = Some("10.0.0.0".into())));
         assert!(bad(|c| c.dpd = 2));
         assert!(bad(|c| c.local_id_type = LocalIdType::Ipv4));
+        assert!(bad(|c| c.ike_version = 3));
+        assert!(
+            bad(|c| c.transport = IpsecTransport::Tcp),
+            "TCP needs IKEv2"
+        );
+        assert!(
+            bad(|c| c.eap = Some(EapMethodName::Mschapv2)),
+            "EAP needs IKEv2"
+        );
+        // IKEv2: EAP with a certificate gateway needs no pre-shared key.
+        let mut v2 = ipsec();
+        v2.ike_version = 2;
+        v2.eap = Some(EapMethodName::Mschapv2);
+        v2.server_auth = ServerAuthStyle::Certificate;
+        v2.psk = Secret::new("");
+        v2.transport = IpsecTransport::Tcp;
+        v2.ca_pem = Some("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n".into());
+        v2.remote_id = Some("vpn.example.net".into());
+        assert_eq!(ok(v2.clone()), Ok(()));
+        let mut no_login = v2.clone();
+        no_login.xauth = None;
+        assert!(ok(no_login).is_err());
+        let mut psk_gateway = v2.clone();
+        psk_gateway.server_auth = ServerAuthStyle::Psk;
+        assert!(ok(psk_gateway).is_err(), "a PSK gateway needs the key");
+        let mut big = v2;
+        big.ca_pem = Some("A".repeat(MAX_CA_PEM + 1));
+        assert!(ok(big).is_err());
         assert_eq!(validate_answer(&[Secret::new("123456")]), Ok(()));
         assert!(validate_answer(&[Secret::new("12\r\n")]).is_err());
     }

@@ -11,5 +11,11 @@
 //! [RFC 3706]: https://www.rfc-editor.org/rfc/rfc3706
 
 pub mod dh;
+pub mod eap;
 pub mod prf;
+pub mod session;
+pub mod tcp;
 pub mod v1;
+pub mod v2;
+
+pub use session::{ChildSa, Output, Session};

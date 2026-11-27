@@ -152,8 +152,12 @@ fn connect_request(args: &AuthArgs) -> Result<Connect, String> {
             let io = |e: std::io::Error| e.to_string();
             let server = ipsec::server_host(&p)?;
             eprintln!("IPsec tunnel to {server}");
-            let psk = prompter::ask_secret("Pre-shared key: ").map_err(io)?;
-            let xauth = if ipsec::uses_xauth(&p) {
+            let psk = if ipsec::needs_psk(&p) {
+                prompter::ask_secret("Pre-shared key: ").map_err(io)?
+            } else {
+                Secret::new("")
+            };
+            let xauth = if ipsec::needs_login(&p) {
                 let username = match &p.username {
                     Some(u) => u.clone(),
                     None => prompter::ask("Username: ").map_err(io)?,

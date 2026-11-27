@@ -102,10 +102,11 @@ pub fn dh_group_from_mask(mask: u32) -> Option<u16> {
 
 /// Turns one tunnel's values into a profile, or says why it cannot be used.
 pub fn ipsec_profile(v: &IpsecValues) -> Result<FortinetIpsecProfile, String> {
-    if v.ike_version.unwrap_or(1) != 1 {
-        return Err("uses IKEv2, which Polytunnel does not support yet".into());
+    let version = v.ike_version.unwrap_or(1);
+    if !matches!(version, 1 | 2) {
+        return Err(format!("uses IKE version {version}"));
     }
-    if v.aggressive.unwrap_or(1) == 0 {
+    if version == 1 && v.aggressive.unwrap_or(1) == 0 {
         return Err("uses main mode; Polytunnel supports aggressive mode".into());
     }
     if v.auth_method.unwrap_or(1) != 1 {
@@ -150,7 +151,8 @@ pub fn ipsec_profile(v: &IpsecValues) -> Result<FortinetIpsecProfile, String> {
         ike_lifetime: differs(v.p1_key_life, DEFAULT_IKE_LIFETIME),
         esp_lifetime: differs(v.p2_key_life_sec, DEFAULT_ESP_LIFETIME),
         esp_lifetime_kb: v.p2_key_life_type.filter(|t| *t != 0).and(v.p2_key_life_kb),
-        xauth: (v.xauth == Some(0)).then_some(false),
+        xauth: (version == 1 && v.xauth == Some(0)).then_some(false),
+        ike_version: (version == 2).then_some(2),
         dpd: (v.dpd == Some(0)).then_some(0),
         nat_keepalive: differs(v.nat_alive_freq, DEFAULT_NAT_KEEPALIVE),
         remote_network: remote_network(v.remote_ip.as_deref(), v.remote_mask.as_deref()),
@@ -331,10 +333,10 @@ mod tests {
         for (v, why) in [
             (
                 IpsecValues {
-                    ike_version: Some(2),
+                    ike_version: Some(3),
                     ..typical()
                 },
-                "IKEv2",
+                "IKE version",
             ),
             (
                 IpsecValues {
@@ -375,6 +377,17 @@ mod tests {
             let err = ipsec_profile(&v).unwrap_err();
             assert!(err.contains(why), "{err}");
         }
+    }
+
+    #[test]
+    fn ikev2_tunnels_import_as_ikev2() {
+        let p = ipsec_profile(&IpsecValues {
+            ike_version: Some(2),
+            aggressive: Some(0),
+            ..typical()
+        })
+        .unwrap();
+        assert_eq!(p.ike_version, Some(2));
     }
 
     #[test]

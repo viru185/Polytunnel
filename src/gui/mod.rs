@@ -14,8 +14,8 @@ use eframe::egui;
 use polytunnel_core::Secret;
 use polytunnel_core::ipc::Status;
 use polytunnel_core::profile::{
-    FortinetIpsecProfile, FortinetSslProfile, GatewayPolicy, GlobalProtectProfile, ProbeMethod,
-    Profile, Profiles, normalize_server, valid_host,
+    EapMethodName, FortinetIpsecProfile, FortinetSslProfile, GatewayPolicy, GlobalProtectProfile,
+    IpsecTransport, ProbeMethod, Profile, Profiles, normalize_server, valid_host,
 };
 use polytunnel_gp::rank::{self, Probe, Ranking};
 
@@ -108,6 +108,9 @@ struct Editor {
     dh_group: String,
     pfs: bool,
     xauth: bool,
+    ike2: bool,
+    eap: bool,
+    tcp: bool,
     /// The IPsec profile being edited: settings the form does not show are kept.
     ipsec_base: FortinetIpsecProfile,
     error: Option<String>,
@@ -130,6 +133,9 @@ impl Editor {
             dh_group: crate::ipsec::DEFAULT_DH_GROUP.to_string(),
             pfs: true,
             xauth: true,
+            ike2: false,
+            eap: false,
+            tcp: false,
             ipsec_base: FortinetIpsecProfile::default(),
             error: None,
         }
@@ -169,6 +175,9 @@ impl Editor {
                     .to_string(),
                 pfs: p.pfs_group != Some(0),
                 xauth: crate::ipsec::uses_xauth(p),
+                ike2: crate::ipsec::ike_version(p) == 2,
+                eap: p.eap.is_some(),
+                tcp: p.transport == Some(IpsecTransport::Tcp),
                 ipsec_base: p.clone(),
                 ..Editor::new(Kind::FortinetIpsec)
             },
@@ -228,7 +237,16 @@ impl Editor {
                         (true, Some(0)) => None,
                         (true, other) => other,
                     },
-                    xauth: (!self.xauth).then_some(false),
+                    xauth: (!self.ike2 && !self.xauth).then_some(false),
+                    ike_version: self.ike2.then_some(2),
+                    eap: if self.ike2 && self.eap {
+                        base.eap.or(Some(EapMethodName::Mschapv2))
+                    } else {
+                        None
+                    },
+                    transport: (self.ike2 && self.tcp).then_some(IpsecTransport::Tcp),
+                    server_auth: base.server_auth.filter(|_| self.ike2),
+                    tcp_port: base.tcp_port.filter(|_| self.ike2 && self.tcp),
                     ..base.clone()
                 })
             }
@@ -681,11 +699,29 @@ impl App {
                         ui.checkbox(&mut editor.pfs, "Perfect forward secrecy");
                         ui.end_row();
                         ui.label("");
-                        ui.checkbox(
-                            &mut editor.xauth,
-                            "Sign in with username and password (XAuth)",
-                        );
+                        ui.checkbox(&mut editor.ike2, "IKEv2");
                         ui.end_row();
+                        if editor.ike2 {
+                            ui.label("");
+                            ui.checkbox(
+                                &mut editor.eap,
+                                "Sign in with username and password (EAP-MSCHAPv2)",
+                            );
+                            ui.end_row();
+                            ui.label("");
+                            ui.checkbox(
+                                &mut editor.tcp,
+                                "IPsec over TCP (port 443 unless profiles.toml says otherwise)",
+                            );
+                            ui.end_row();
+                        } else {
+                            ui.label("");
+                            ui.checkbox(
+                                &mut editor.xauth,
+                                "Sign in with username and password (XAuth)",
+                            );
+                            ui.end_row();
+                        }
                     }
                 }
             });
@@ -1077,6 +1113,35 @@ mod tests {
         e.dh_group = "14".into();
         e.server = "https://vpn.example.net".into();
         assert!(e.to_profile().is_err());
+    }
+
+    #[test]
+    fn editor_keeps_ikev2_settings() {
+        let v2 = Profile::FortinetIpsec(FortinetIpsecProfile {
+            server: "vpn.example.net".into(),
+            ike_version: Some(2),
+            eap: Some(EapMethodName::Mschapv2),
+            server_auth: Some(polytunnel_core::profile::ServerAuthStyle::Certificate),
+            transport: Some(IpsecTransport::Tcp),
+            tcp_port: Some(4500),
+            ca_file: Some("ca.pem".into()),
+            remote_id: Some("vpn.example.net".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            Editor::from_profile("v2", &v2).to_profile(),
+            Ok(("v2".to_string(), v2.clone()))
+        );
+        // Back to IKEv1: the IKEv2-only settings go.
+        let mut e = Editor::from_profile("v2", &v2);
+        e.ike2 = false;
+        let Ok((_, Profile::FortinetIpsec(p))) = e.to_profile() else {
+            panic!("not IPsec");
+        };
+        assert_eq!(
+            (p.ike_version, p.eap, p.transport, p.tcp_port),
+            (None, None, None, None)
+        );
     }
 
     #[test]

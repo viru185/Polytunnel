@@ -151,6 +151,23 @@ They also accept `dh-group` (14 by default), `local-id` and `local-id-type`
 gateway asks for during sign-in are prompted for in the terminal or the window
 ([protocol notes](docs/protocols/fortigate-ikev1.md)).
 
+With `ike-version = 2` the same profiles use IKEv2: a pre-shared key, or EAP sign-in
+(`eap = "mschapv2"` or `"ttls-pap"`) to a gateway that proves itself with a pre-shared key or a
+certificate (`server-auth = "certificate"`, checked against the system's roots plus an optional
+`ca-file`, and issued for `remote-id`). `transport = "tcp"` (with `tcp-port`, default 443) runs
+IKE and ESP over TCP as FortiOS's "transport tcp" does (RFC 9329)
+([IKEv2 notes](docs/protocols/ikev2.md)):
+
+```toml
+[profile.office-ikev2]
+type = "fortinet-ipsec"
+server = "vpn.example.net"
+ike-version = 2
+eap = "mschapv2"
+server-auth = "certificate"
+transport = "tcp"
+```
+
 ## Building from source
 
 Requires the stable Rust toolchain (see `rust-toolchain.toml`).

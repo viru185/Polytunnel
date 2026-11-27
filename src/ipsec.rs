@@ -2,14 +2,17 @@
 //! there is no separate login step here, only the secrets).
 
 use polytunnel_core::Secret;
-use polytunnel_core::ipc::{Connect, IpsecConnect, XauthLogin, ike_group_name};
-use polytunnel_core::profile::{FortinetIpsecProfile, parse_ipv4_network, valid_host};
+use polytunnel_core::ipc::{Connect, IpsecConnect, MAX_CA_PEM, XauthLogin, ike_group_name};
+use polytunnel_core::profile::{
+    FortinetIpsecProfile, IpsecTransport, ServerAuthStyle, parse_ipv4_network, valid_host,
+};
 
 pub const DEFAULT_DH_GROUP: u16 = 14;
 pub const DEFAULT_IKE_LIFETIME: u32 = 86_400;
 pub const DEFAULT_ESP_LIFETIME: u32 = 43_200;
 pub const DEFAULT_DPD: u32 = 20;
 pub const DEFAULT_NAT_KEEPALIVE: u32 = 5;
+pub const DEFAULT_TCP_PORT: u16 = 443;
 
 /// FortiGate's dial-up proposals (cipher-hash; the group is added from `dh-group`).
 const DEFAULT_IKE: [&str; 4] = [
@@ -34,9 +37,28 @@ pub struct Secrets {
     pub xauth: Option<(String, Secret)>,
 }
 
-/// Whether the profile signs in with XAuth (username and password).
+/// Whether an IKEv1 profile signs in with XAuth (username and password).
 pub fn uses_xauth(p: &FortinetIpsecProfile) -> bool {
     p.xauth.unwrap_or(true)
+}
+
+pub fn ike_version(p: &FortinetIpsecProfile) -> u8 {
+    p.ike_version.unwrap_or(1)
+}
+
+/// Whether connecting needs a username and password (XAuth with IKEv1, EAP with IKEv2).
+pub fn needs_login(p: &FortinetIpsecProfile) -> bool {
+    if ike_version(p) == 2 {
+        p.eap.is_some()
+    } else {
+        uses_xauth(p)
+    }
+}
+
+/// Whether connecting needs the pre-shared key (everything but IKEv2 EAP sign-in to a
+/// gateway with a certificate).
+pub fn needs_psk(p: &FortinetIpsecProfile) -> bool {
+    !(ike_version(p) == 2 && p.eap.is_some() && p.server_auth == Some(ServerAuthStyle::Certificate))
 }
 
 /// The gateway's host name or address, from what the user typed.
@@ -93,11 +115,36 @@ pub fn connect_request(
     {
         return Err(format!("remote-network '{net}' is not a.b.c.d/len"));
     }
-    let xauth = match (uses_xauth(p), secrets.xauth) {
+    let xauth = match (needs_login(p), secrets.xauth) {
         (true, Some((username, password))) => Some(XauthLogin { username, password }),
         (true, None) => return Err("this profile needs a username and password".into()),
         (false, _) => None,
     };
+    if needs_psk(p) && secrets.psk.is_empty() {
+        return Err("this profile needs the pre-shared key".into());
+    }
+    let ca_pem = match &p.ca_file {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("cannot read the CA file {path}: {e}"))?;
+            if text.len() > MAX_CA_PEM {
+                return Err(format!("the CA file {path} is too large"));
+            }
+            Some(text)
+        }
+        None => None,
+    };
+    let version = ike_version(p);
+    if version == 1
+        && (p.eap.is_some()
+            || p.server_auth == Some(ServerAuthStyle::Certificate)
+            || p.transport == Some(IpsecTransport::Tcp))
+    {
+        return Err(
+            "eap, server-auth = \"certificate\" and transport = \"tcp\" need ike-version = 2"
+                .into(),
+        );
+    }
     let request = IpsecConnect {
         profile: name,
         server,
@@ -116,6 +163,13 @@ pub fn connect_request(
         dpd: p.dpd.unwrap_or(DEFAULT_DPD),
         nat_keepalive: p.nat_keepalive.unwrap_or(DEFAULT_NAT_KEEPALIVE),
         client_version: format!("Polytunnel {}", polytunnel_core::VERSION),
+        ike_version: version,
+        eap: p.eap,
+        server_auth: p.server_auth.unwrap_or_default(),
+        ca_pem,
+        remote_id: p.remote_id.clone().filter(|s| !s.trim().is_empty()),
+        transport: p.transport.unwrap_or_default(),
+        tcp_port: p.tcp_port.unwrap_or(DEFAULT_TCP_PORT),
     };
     let connect = Connect::FortinetIpsec(Box::new(request));
     connect.validate()?;
@@ -205,5 +259,48 @@ mod tests {
             ..Default::default()
         };
         assert!(connect_request("x".into(), &xauth_profile, no_login).is_err());
+    }
+
+    #[test]
+    fn ikev2_profiles() {
+        use polytunnel_core::profile::EapMethodName;
+
+        let eap_cert = FortinetIpsecProfile {
+            server: "vpn.example.net".into(),
+            ike_version: Some(2),
+            eap: Some(EapMethodName::Mschapv2),
+            server_auth: Some(ServerAuthStyle::Certificate),
+            transport: Some(IpsecTransport::Tcp),
+            ..Default::default()
+        };
+        assert!(needs_login(&eap_cert) && !needs_psk(&eap_cert));
+        let no_key = Secrets {
+            psk: Secret::new(""),
+            xauth: Some(("user".into(), Secret::new("pw"))),
+        };
+        let Connect::FortinetIpsec(c) = connect_request("x".into(), &eap_cert, no_key).unwrap()
+        else {
+            panic!("not IPsec");
+        };
+        assert_eq!((c.ike_version, c.tcp_port), (2, 443));
+        assert_eq!(c.transport, IpsecTransport::Tcp);
+
+        let v2_psk = FortinetIpsecProfile {
+            server: "vpn.example.net".into(),
+            ike_version: Some(2),
+            ..Default::default()
+        };
+        assert!(!needs_login(&v2_psk) && needs_psk(&v2_psk));
+        let v1_tcp = FortinetIpsecProfile {
+            server: "vpn.example.net".into(),
+            transport: Some(IpsecTransport::Tcp),
+            ..Default::default()
+        };
+        assert!(connect_request("x".into(), &v1_tcp, secrets()).is_err());
+        let missing_ca = FortinetIpsecProfile {
+            ca_file: Some("does-not-exist.pem".into()),
+            ..v2_psk
+        };
+        assert!(connect_request("x".into(), &missing_ca, secrets()).is_err());
     }
 }
