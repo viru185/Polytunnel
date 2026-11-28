@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use polytunnel_core::Secret;
 use polytunnel_core::ipc;
+use polytunnel_core::pin::CertFingerprint;
 use polytunnel_core::profile::{
     FortinetIpsecProfile, FortinetSslProfile, GlobalProtectProfile, Profile, normalize_server,
 };
@@ -18,7 +19,9 @@ use polytunnel_gp::flow::{self, LoginOptions, PasswordPrompt, PortalSession, Pro
 use polytunnel_gp::portal::Gateway;
 use polytunnel_gp::prelogin::{Interface, SamlRequest};
 use polytunnel_gp::sso::{self, SsoResult};
+use polytunnel_http::CertInfo;
 
+use crate::auth::Trust;
 use crate::gateways::{self, GatewayPrefs};
 use crate::{browser, callback, connect, ipsec, sysinfo, uri};
 
@@ -49,9 +52,17 @@ pub enum Prompt {
         fields: Vec<(String, bool)>,
         reply: Sender<Option<Vec<Secret>>>,
     },
+    /// A gateway's certificate is not trusted: trust it once, always, or not at all.
+    Certificate {
+        /// The gateway, `host:port`.
+        server: String,
+        info: Box<CertInfo>,
+        /// The certificate the profile trusted before, when this one replaces it.
+        previous: Option<CertFingerprint>,
+        reply: Sender<Trust>,
+    },
     /// A browser login is in progress; the window may paste a result into `paste`.
     Browser {
-        server: String,
         url: String,
         /// Why the browser could not be opened, if it could not.
         not_opened: Option<String>,
@@ -69,6 +80,13 @@ pub enum Event {
     /// The service stopped waiting for the answer to its question (it gave up, or the
     /// connection ended): the question's dialog goes.
     PromptClosed,
+    /// The user chose to always trust this certificate on `gateway` (`host:port`): the window
+    /// saves it in profile `profile`.
+    TrustCertificate {
+        profile: String,
+        gateway: String,
+        fingerprint: CertFingerprint,
+    },
     Finished(Result<String, String>),
 }
 
@@ -276,48 +294,93 @@ fn login_fortinet(
     events: &Notifier,
 ) -> Result<ipc::Connect, String> {
     let first = normalize_server(&p.server).map_err(|e| e.to_string())?;
-    let (reply, answer) = mpsc::channel();
-    events.send(Event::Prompt(Prompt::Credentials {
-        title: format!("Sign in to {}", first.trim_start_matches("https://")),
-        message: None,
-        username_label: "Username".into(),
-        password_label: "Password".into(),
-        username: p.username.clone(),
-        reply,
-    }));
-    let (username, password) = answer.recv().ok().flatten().ok_or("cancelled")?;
-    let (base, cookie) = crate::auth::forti_login_any(
-        p,
-        &username,
-        &password,
-        &mut |line| events.progress(line),
-        &mut |challenge| {
-            let (reply, answer) = mpsc::channel();
-            let mut message = challenge
-                .message
-                .clone()
-                .unwrap_or_else(|| "Enter the code from your token.".into());
-            if challenge
-                .token_info
-                .as_deref()
-                .is_some_and(|t| t.contains("push"))
-            {
-                message.push_str("\n(Approve the push notification, then press OK.)");
+    // A rejected sign-in asks again (up to three times) with the reason in the dialog.
+    let host = first.trim_start_matches("https://").to_string();
+    let mut message: Option<String> = Some(host);
+    let mut username_shown = p.username.clone();
+    let mut tries = 0;
+    let session = loop {
+        tries += 1;
+        let (reply, answer) = mpsc::channel();
+        events.send(Event::Prompt(Prompt::Credentials {
+            title: format!("Sign in to {name}"),
+            message: message.clone(),
+            username_label: "Username".into(),
+            password_label: "Password".into(),
+            username: username_shown.clone(),
+            reply,
+        }));
+        let (username, password) = answer.recv().ok().flatten().ok_or("cancelled")?;
+        username_shown = Some(username.clone());
+        let outcome = crate::auth::forti_login_any(
+            p,
+            &username,
+            &password,
+            &mut |line| events.progress(line),
+            &mut |gateway, info, previous| {
+                let (reply, answer) = mpsc::channel();
+                events.send(Event::Prompt(Prompt::Certificate {
+                    server: gateway.to_string(),
+                    info: Box::new(info.clone()),
+                    previous,
+                    reply,
+                }));
+                // The dialog gone without an answer (the window closed): no.
+                answer.recv().unwrap_or(Trust::Cancel)
+            },
+            &mut |challenge| {
+                let (reply, answer) = mpsc::channel();
+                let mut message = challenge
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "Enter the code from your token.".into());
+                if challenge
+                    .token_info
+                    .as_deref()
+                    .is_some_and(|t| t.contains("push"))
+                {
+                    message.push_str("\n(Approve the push notification, then press OK.)");
+                }
+                events.send(Event::Prompt(Prompt::Code {
+                    title: "Verification code".into(),
+                    message,
+                    reply,
+                }));
+                answer.recv().ok().flatten().ok_or(FortiError::Cancelled)
+            },
+        );
+        for (gateway, fingerprint) in outcome.always {
+            events.send(Event::TrustCertificate {
+                profile: name.to_string(),
+                gateway,
+                fingerprint,
+            });
+        }
+        match outcome.result {
+            Ok(session) => break session,
+            Err(e) if tries < 3 && rejected(&e) => {
+                events.progress(format!("The gateway rejected the sign-in: {e}"));
+                message = Some(
+                    "!That username or password wasn't accepted. Check them and try again.".into(),
+                );
             }
-            events.send(Event::Prompt(Prompt::Code {
-                title: "Verification code".into(),
-                message,
-                reply,
-            }));
-            answer.recv().ok().flatten().ok_or(FortiError::Cancelled)
-        },
-    )?;
+            Err(e) => return Err(e),
+        }
+    };
     Ok(connect::forti_connect(
         name.to_string(),
-        base,
-        cookie,
-        p.server_cert,
+        session.base,
+        session.cookie,
+        session.pin,
     ))
+}
+
+/// Is `error` the gateway turning the username or password down (worth asking again)?
+fn rejected(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    e.contains("authentication failed")
+        || e.contains("permission denied")
+        || e.contains("credential")
 }
 
 struct GuiPrompter<'a> {
@@ -375,8 +438,8 @@ impl Prompter for GuiPrompter<'_> {
             self.events.progress(e.clone());
         }
         let (paste, pasted) = mpsc::channel();
+        let _ = host;
         self.events.send(Event::Prompt(Prompt::Browser {
-            server: host,
             url,
             not_opened,
             paste,
@@ -487,5 +550,14 @@ impl GuiPrompter<'_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rejected_sign_ins_are_asked_again() {
+        assert!(super::rejected("authentication failed: wrong password"));
+        assert!(!super::rejected("gw.example.net cannot be reached"));
     }
 }

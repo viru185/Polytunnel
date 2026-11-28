@@ -1,16 +1,14 @@
-//! Profiles: every profile as a row that opens to its actions and, for GlobalProtect, its
-//! gateways.
+//! Managing profiles: the list with each profile's menu, "Add a profile" (integration, then
+//! connection type, then the form) and importing another program's profiles.
 
-use eframe::egui::{self, Align, CursorIcon, Label, Layout, Rect, RichText, Sense, vec2};
-use polytunnel_core::ipc::Status;
-use polytunnel_core::profile::{GlobalProtectProfile, Profile};
-use polytunnel_gp::rank::Probe;
+use eframe::egui::{self, Ui};
+use polytunnel_core::profile::GlobalProtectProfile;
 
+use super::body;
 use crate::gui::icons::Icon;
-use crate::gui::widgets::{self, Tone};
-use crate::gui::{App, Kind, Leave, active_profile, save_profiles};
-
-use super::home::profile_line;
+use crate::gui::integrations::{self, ALL};
+use crate::gui::widgets::{self, Banner, Kind as Button, Lead};
+use crate::gui::{App, Confirm, Editor, Page};
 
 /// How a GlobalProtect profile picks its gateway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,8 +29,8 @@ pub fn gateway_mode(p: &GlobalProtectProfile) -> GatewayMode {
     }
 }
 
-/// The profile's gateway settings for `mode`, choosing `candidate` (the best measured
-/// gateway) when the mode needs one and none is set.
+/// The profile's gateway settings for `mode`, choosing `candidate` when the mode needs one and
+/// none is set.
 pub fn with_mode(
     p: &GlobalProtectProfile,
     mode: GatewayMode,
@@ -47,374 +45,478 @@ pub fn with_mode(
     }
 }
 
+enum Do {
+    Add,
+    Edit(String),
+    Duplicate(String),
+    Delete(String),
+    Scan,
+    Integration(usize),
+}
+
 impl App {
-    pub(in crate::gui) fn profiles_screen(&mut self, ui: &mut egui::Ui) {
-        let p = widgets::pal(ui);
-        ui.horizontal(|ui| {
-            ui.heading("Profiles");
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_enabled_ui(!self.read_only(), |ui| {
-                    let add = widgets::icon_button(ui, Icon::Plus, "Add a profile");
-                    egui::Popup::menu(&add).width(210.0).show(|ui| {
-                        let mut pick = None;
-                        if ui.button("GlobalProtect").clicked() {
-                            pick = Some(Kind::GlobalProtect);
-                        }
-                        if ui.button("Fortinet SSL VPN").clicked() {
-                            pick = Some(Kind::FortinetSsl);
-                        }
-                        if ui.button("Fortinet IPsec").clicked() {
-                            pick = Some(Kind::FortinetIpsec);
-                        }
-                        if cfg!(windows) {
-                            ui.separator();
-                            if ui.button("Import from FortiClient").clicked() {
-                                ui.close();
-                                self.import_forticlient();
-                            }
-                        }
-                        if let Some(kind) = pick {
-                            ui.close();
-                            self.leave_editor(Leave::New(kind));
-                        }
-                    });
-                });
+    pub(in crate::gui) fn profiles_page(&mut self, ui: &mut Ui) {
+        let count = self.profiles.profiles.len();
+        let sub = match count {
+            1 => "1 profile".to_string(),
+            n => format!("{n} profiles"),
+        };
+        let mut todo = Vec::new();
+        let read_only = self.read_only();
+        if widgets::page_header(ui, "Profiles", &sub, |ui| {
+            ui.add_enabled_ui(!read_only, |ui| {
+                if widgets::icon_button(ui, Icon::Plus, "Add a profile", 36.0, None).clicked() {
+                    todo.push(Do::Add);
+                }
             });
-        });
-        ui.add_space(4.0);
-        if let Some(e) = self.load_error.clone() {
-            widgets::banner(
-                ui,
-                Tone::Error,
-                "Your profiles file could not be read",
-                &format!(
-                    "{e}\nFix or remove it, then reopen Polytunnel. Nothing is changed until then."
-                ),
+        }) {
+            self.back();
+            return;
+        }
+        if cfg!(windows) && self.import_count.is_none() && !self.fake {
+            self.import_count = Some(
+                crate::forticlient::ssl_tunnels().len()
+                    + crate::forticlient::ipsec_tunnels().tunnels.len(),
             );
-            ui.add_space(6.0);
         }
-        if self.profiles.profiles.is_empty() && self.load_error.is_none() {
-            widgets::card(ui, |ui| {
-                ui.label(RichText::new("No profiles yet").strong());
-                ui.label(
-                    RichText::new("Press + to add a GlobalProtect or Fortinet profile.")
-                        .size(12.0)
-                        .color(p.muted),
-                );
-            });
-            return;
-        }
+        let found = if self.fake {
+            2
+        } else {
+            self.import_count.unwrap_or(0)
+        };
         let names: Vec<String> = self.profiles.profiles.keys().cloned().collect();
-        egui::ScrollArea::vertical()
-            .auto_shrink(false)
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 6.0;
-                for name in names {
-                    self.profile_card(ui, &name);
-                }
-            });
-    }
-
-    fn profile_card(&mut self, ui: &mut egui::Ui, name: &str) {
-        let p = widgets::pal(ui);
-        let Some(profile) = self.profiles.get(name).cloned() else {
-            return;
-        };
-        let active = active_profile(&self.status).map(str::to_string);
-        let this_active = active.as_deref() == Some(name);
-        let open = self.expanded.as_deref() == Some(name);
-        let (dot, ink, _) = crate::gui::theme::status_colors(p, self.status.as_ref());
-        let kind = match &profile {
-            Profile::GlobalProtect(_) => "GP",
-            Profile::FortinetSsl(_) => "SSL",
-            Profile::FortinetIpsec(_) => "IPsec",
-        };
-        let mut toggle = false;
-        widgets::card(ui, |ui| {
-            let header = ui.horizontal(|ui| {
-                widgets::dot(ui, if this_active { dot } else { p.dot_idle });
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.label(RichText::new(name).strong());
-                    let mut line = profile_line(&profile);
-                    if this_active {
-                        line = match &self.status {
-                            Some(Ok(Status::Connected { .. })) => "Connected".into(),
-                            Some(Ok(Status::Reconnecting { .. })) => "Reconnecting".into(),
-                            _ => "Connecting".into(),
+        body(ui, "profiles", |ui| {
+            ui.add_space(4.0);
+            if let Some(e) = &self.load_error {
+                widgets::banner(
+                    ui,
+                    Banner::Bad,
+                    Icon::Error,
+                    "Your profiles file could not be read",
+                    &format!("{e}\nFix or remove it, then reopen Polytunnel."),
+                    |_| {},
+                );
+            } else if names.is_empty() {
+                widgets::card(ui, true, |ui| {
+                    ui.label(egui::RichText::new("No profiles yet").strong());
+                    widgets::help(ui, "Add your organization's VPN below.");
+                });
+            } else {
+                widgets::card(ui, false, |ui| {
+                    for (i, name) in names.iter().enumerate() {
+                        let Some(profile) = self.profiles.get(name) else {
+                            continue;
                         };
-                    }
-                    ui.add(
-                        Label::new(RichText::new(line).size(11.0).color(if this_active {
-                            ink
-                        } else {
-                            p.muted
-                        }))
-                        .truncate(),
-                    );
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    widgets::pill(ui, kind, p.muted, p.sunken);
-                });
-            });
-            let click = ui
-                .interact(
-                    header.response.rect,
-                    egui::Id::unique(("profile-row", name)),
-                    Sense::click(),
-                )
-                .on_hover_cursor(CursorIcon::PointingHand);
-            if click.clicked() {
-                toggle = true;
-            }
-            if open {
-                ui.add_space(4.0);
-                widgets::divider(ui);
-                ui.add_space(4.0);
-                self.profile_actions(ui, name, &profile, active.as_deref());
-                if let Profile::GlobalProtect(gp) = &profile {
-                    ui.add_space(6.0);
-                    self.gateway_section(ui, name, gp);
-                } else {
-                    let servers = match &profile {
-                        Profile::FortinetSsl(f) => f.servers(),
-                        Profile::FortinetIpsec(f) => f.servers(),
-                        Profile::GlobalProtect(_) => Vec::new(),
-                    };
-                    if servers.len() > 1 {
-                        ui.add_space(4.0);
-                        widgets::section(ui, "Gateways, in order");
-                        for (i, server) in servers.iter().enumerate() {
-                            ui.label(RichText::new(format!("{}. {server}", i + 1)).size(12.0));
+                        let (integration, _) = integrations::of(profile);
+                        let line = integrations::profile_line(profile);
+                        let row = widgets::list_row(
+                            ui,
+                            Lead::Badge(integration.badge),
+                            name,
+                            &line,
+                            false,
+                            i == 0,
+                            i + 1 == names.len(),
+                            |ui| {
+                                let more = widgets::icon_button(ui, Icon::More, "More", 32.0, None);
+                                egui::Popup::menu(&more).width(176.0).show(|ui| {
+                                    menu_items(ui, name, read_only, &mut todo);
+                                });
+                            },
+                        );
+                        if row.clicked() && !read_only {
+                            todo.push(Do::Edit(name.clone()));
                         }
                     }
-                }
+                });
             }
-        });
-        if toggle {
-            self.expanded = if open { None } else { Some(name.to_string()) };
-        }
-    }
-
-    fn profile_actions(
-        &mut self,
-        ui: &mut egui::Ui,
-        name: &str,
-        profile: &Profile,
-        active: Option<&str>,
-    ) {
-        let this_active = active == Some(name);
-        let setting_up = matches!(
-            &self.status,
-            Some(Ok(Status::Connecting { .. } | Status::NeedsInput { .. }))
-        );
-        ui.horizontal(|ui| {
-            if this_active {
-                let label = if setting_up || self.busy() {
-                    "Cancel"
-                } else {
-                    "Disconnect"
-                };
-                if ui
-                    .add_enabled(!self.running.disconnect, widgets::primary(ui, label))
-                    .clicked()
-                {
-                    self.disconnect(ui.ctx());
-                }
-            } else {
-                let label = match active {
-                    Some(_) => format!("Switch to {name}"),
-                    None => "Connect".into(),
-                };
-                if ui
-                    .add_enabled(!self.busy(), widgets::primary(ui, &label))
-                    .on_disabled_hover_text("Wait until the current attempt finishes.")
-                    .clicked()
-                {
-                    self.selected = Some(name.to_string());
-                    self.connect(ui.ctx(), name.to_string());
-                }
-            }
-            if ui
-                .add_enabled(
-                    !this_active && !self.busy() && !self.read_only(),
-                    widgets::secondary(ui, "Edit"),
+            widgets::section(ui, "Add", None);
+            widgets::card(ui, false, |ui| {
+                let types: Vec<&str> = ALL.iter().map(|i| i.name).collect();
+                if widgets::list_row(
+                    ui,
+                    Lead::IconBadge(Icon::Plus),
+                    "Add a profile",
+                    &types.join(" or "),
+                    false,
+                    true,
+                    !cfg!(windows),
+                    chevron,
                 )
-                .on_disabled_hover_text("Disconnect first to change this profile.")
                 .clicked()
-            {
-                self.open_editor(crate::gui::Editor::from_profile(name, profile));
-            }
+                    && !read_only
+                {
+                    todo.push(Do::Add);
+                }
+                if cfg!(windows) {
+                    let sub = match found {
+                        0 => "None found on this PC".to_string(),
+                        1 => "1 connection found on this PC".into(),
+                        n => format!("{n} connections found on this PC"),
+                    };
+                    if widgets::list_row(
+                        ui,
+                        Lead::IconBadge(Icon::Download),
+                        "Import from FortiClient",
+                        &sub,
+                        false,
+                        false,
+                        true,
+                        chevron,
+                    )
+                    .clicked()
+                        && !read_only
+                    {
+                        todo.push(Do::Scan);
+                    }
+                }
+            });
         });
+        for action in todo {
+            self.profiles_do(action);
+        }
     }
 
-    /// A GlobalProtect profile's gateway choice and the measured gateways.
-    fn gateway_section(&mut self, ui: &mut egui::Ui, name: &str, gp: &GlobalProtectProfile) {
-        let p = widgets::pal(ui);
-        widgets::section(ui, "Gateway");
-        let mut mode = gateway_mode(gp);
-        let before = mode;
-        widgets::segmented(
-            ui,
-            &mut mode,
-            &[
-                (GatewayMode::Fastest, "Fastest"),
-                (GatewayMode::Prefer, "Prefer one"),
-                (GatewayMode::Always, "Always one"),
-            ],
-        );
-        let shown = self.gateways.as_ref().is_some_and(|g| g.profile == name);
-        let best = self
-            .gateways
-            .as_ref()
-            .filter(|g| g.profile == name)
-            .and_then(|g| g.ranking.as_ref())
-            .and_then(|r| r.chosen.and_then(|i| r.gateways.get(i)))
-            .map(|r| r.gateway.label().to_string());
-        if mode != before {
-            let (gateway, preferred) = with_mode(gp, mode, best.as_deref());
-            self.set_gateway_choice(name, gateway, preferred);
-        }
-        let help = match mode {
-            GatewayMode::Fastest => "Every connect measures the gateways and uses the quickest.",
-            GatewayMode::Prefer => "Your choice while it answers, else the fastest other.",
-            GatewayMode::Always => "Only your choice. If it does not answer, connecting fails.",
-        };
-        ui.label(RichText::new(help).size(11.0).color(p.muted));
-
-        let measuring = self.gateways.as_ref().is_some_and(|g| g.pending.is_some());
-        let mut action = None;
-        if let Some(view) = self.gateways.as_ref().filter(|g| g.profile == name) {
-            if let Some(ranking) = &view.ranking {
-                let slowest = ranking
-                    .gateways
-                    .iter()
-                    .filter_map(|r| match r.probe {
-                        Probe::Answered(t) => Some(t.as_millis() as f32),
-                        _ => None,
-                    })
-                    .fold(1.0f32, f32::max);
-                for (i, r) in ranking.gateways.iter().enumerate() {
-                    let label = r.gateway.label().to_string();
-                    let chosen_here = match mode {
-                        GatewayMode::Always => gp.gateway.as_deref() == Some(label.as_str()),
-                        _ => gp.preferred_gateway.as_deref() == Some(label.as_str()),
-                    };
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("{}", i + 1))
-                                .size(12.0)
-                                .color(p.muted),
-                        );
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            ui.set_width((ui.available_width() - 120.0).max(80.0));
-                            ui.add(Label::new(RichText::new(&label).size(12.0)).truncate());
-                            let (rect, _) = ui.allocate_exact_size(
-                                vec2(ui.available_width(), 4.0),
-                                Sense::hover(),
-                            );
-                            ui.painter().rect_filled(rect, 2, p.sunken);
-                            if let Probe::Answered(t) = r.probe {
-                                let share = 1.0 - (t.as_millis() as f32 / (slowest * 1.25));
-                                let fill = Rect::from_min_size(
-                                    rect.min,
-                                    vec2(rect.width() * share.clamp(0.08, 1.0), rect.height()),
-                                );
-                                let color = if ranking.chosen == Some(i) {
-                                    p.dot_green
-                                } else {
-                                    p.accent
-                                };
-                                ui.painter().rect_filled(fill, 2, color);
-                            }
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if chosen_here {
-                                let tag = if mode == GatewayMode::Always {
-                                    "In use"
-                                } else {
-                                    "Preferred"
-                                };
-                                widgets::pill(ui, tag, p.accent, p.accent_soft);
-                            } else if mode != GatewayMode::Fastest
-                                && !matches!(r.probe, Probe::Failed)
-                            {
-                                let verb = if mode == GatewayMode::Always {
-                                    "Use"
-                                } else {
-                                    "Prefer"
-                                };
-                                if ui.add(widgets::mini(ui, verb)).clicked() {
-                                    action = Some(label.clone());
-                                }
-                            } else if ranking.chosen == Some(i) {
-                                widgets::pill(ui, "Fastest", p.green, p.green_soft);
-                            }
-                            let ms = match r.probe {
-                                Probe::Answered(t) => format!("{} ms", t.as_millis()),
-                                Probe::Failed => "none".into(),
-                                Probe::Unknown => "-".into(),
-                            };
-                            ui.label(RichText::new(ms).size(12.0).color(p.muted));
-                        });
-                    });
+    fn profiles_do(&mut self, action: Do) {
+        match action {
+            Do::Add => self.go(Page::AddIntegration),
+            Do::Edit(name) => {
+                if let Some(profile) = self.profiles.get(&name).cloned() {
+                    self.open_editor(Editor::from_profile(&name, &profile));
                 }
             }
-            if let Some(note) = &view.note {
-                ui.label(RichText::new(note).size(11.0).color(p.muted));
+            Do::Duplicate(name) => {
+                if let Some(profile) = self.profiles.get(&name).cloned() {
+                    let mut editor = Editor::from_profile(&name, &profile);
+                    editor.original = None;
+                    let mut copy = format!("{name}-copy");
+                    while self.profiles.profiles.contains_key(&copy) {
+                        copy.push('-');
+                    }
+                    editor.name = copy;
+                    self.open_editor(editor);
+                }
             }
-        }
-        ui.horizontal(|ui| {
-            let label = if shown {
-                "Measure again"
-            } else {
-                "Measure the gateways"
-            };
-            if ui
-                .add_enabled(!measuring, widgets::mini(ui, label))
-                .clicked()
-            {
-                self.find_best_gateway(ui.ctx(), name, gp);
-            }
-            if measuring {
-                ui.add(egui::Spinner::new());
-            }
-        });
-        if let Some(label) = action {
-            let (gateway, preferred) = match mode {
-                GatewayMode::Always => (Some(label), None),
-                _ => (None, Some(label)),
-            };
-            self.set_gateway_choice(name, gateway, preferred);
+            Do::Delete(name) => self.confirm = Some(Confirm::Delete(name)),
+            Do::Scan => self.scan_import(),
+            Do::Integration(i) => self.choose_integration(i),
         }
     }
 
-    /// Saves a GlobalProtect profile's gateway choice.
-    fn set_gateway_choice(
-        &mut self,
-        name: &str,
-        gateway: Option<String>,
-        preferred: Option<String>,
-    ) {
-        let before = self.profiles.clone();
-        if let Some(Profile::GlobalProtect(p)) = self.profiles.profiles.get_mut(name) {
-            p.gateway = gateway;
-            p.preferred_gateway = preferred;
-            if let Err(e) = save_profiles(&self.profiles) {
-                self.profiles = before;
-                self.log_at(
-                    crate::gui::Level::Problem,
-                    format!("Could not save the profiles: {e}"),
+    /// Step 1 of "Add a profile": the integration.
+    pub(in crate::gui) fn add_integration_page(&mut self, ui: &mut Ui) {
+        let mut todo = Vec::new();
+        if widgets::page_header(
+            ui,
+            "Add a profile",
+            "Which VPN does your organization use?",
+            |_| {},
+        ) {
+            self.back();
+            return;
+        }
+        if cfg!(windows) && self.import_count.is_none() && !self.fake {
+            self.import_count = Some(
+                crate::forticlient::ssl_tunnels().len()
+                    + crate::forticlient::ipsec_tunnels().tunnels.len(),
+            );
+        }
+        let found = if self.fake {
+            2
+        } else {
+            self.import_count.unwrap_or(0)
+        };
+        body(ui, "add-integration", |ui| {
+            ui.add_space(4.0);
+            widgets::card(ui, false, |ui| {
+                for (i, integration) in ALL.iter().enumerate() {
+                    if widgets::list_row(
+                        ui,
+                        Lead::BigBadge(integration.badge),
+                        integration.name,
+                        integration.summary,
+                        false,
+                        i == 0,
+                        i + 1 == ALL.len(),
+                        chevron,
+                    )
+                    .clicked()
+                    {
+                        todo.push(Do::Integration(i));
+                    }
+                }
+            });
+            let sources: Vec<&str> = ALL
+                .iter()
+                .filter_map(|i| i.import.as_ref().map(|s| s.name))
+                .collect();
+            if cfg!(windows) && !sources.is_empty() {
+                widgets::section(ui, "Already set up elsewhere?", None);
+                widgets::card(ui, false, |ui| {
+                    for (k, source) in sources.iter().enumerate() {
+                        let sub = match found {
+                            0 => "None found on this PC".to_string(),
+                            1 => "1 connection found on this PC".into(),
+                            n => format!("{n} connections found on this PC"),
+                        };
+                        if widgets::list_row(
+                            ui,
+                            Lead::BigIconBadge(Icon::Download),
+                            &format!("Import from {source}"),
+                            &sub,
+                            false,
+                            k == 0,
+                            k + 1 == sources.len(),
+                            chevron,
+                        )
+                        .clicked()
+                        {
+                            todo.push(Do::Scan);
+                        }
+                    }
+                });
+            }
+            ui.add_space(16.0);
+            widgets::help(
+                ui,
+                "Product names belong to their owners. Polytunnel is an independent client.",
+            );
+        });
+        for action in todo {
+            self.profiles_do(action);
+        }
+    }
+
+    /// An integration was chosen: its type picker, or the form when it has one type.
+    fn choose_integration(&mut self, i: usize) {
+        let Some(integration) = ALL.get(i) else {
+            return;
+        };
+        if integration.types.len() == 1 {
+            self.new_profile(i, 0);
+        } else {
+            self.go(Page::AddType(i));
+        }
+    }
+
+    /// Opens the form for a new profile of integration `i`, type `t`.
+    fn new_profile(&mut self, i: usize, t: usize) {
+        let Some(conn) = ALL.get(i).and_then(|integration| integration.types.get(t)) else {
+            return;
+        };
+        let mut editor = Editor::new(conn.kind);
+        editor.ike2 = conn.ike2;
+        editor.eap = conn.ike2;
+        editor.xauth = !conn.ike2;
+        self.open_editor(editor);
+    }
+
+    /// Step 2 of "Add a profile": the connection type.
+    pub(in crate::gui) fn add_type_page(&mut self, ui: &mut Ui, i: usize) {
+        let Some(integration) = ALL.get(i) else {
+            self.back();
+            return;
+        };
+        if widgets::page_header(ui, integration.name, "How does it connect?", |_| {}) {
+            self.back();
+            return;
+        }
+        let key = egui::Id::unique(("add-type-choice", i));
+        let mut choice = ui.data(|d| d.get_temp::<usize>(key).unwrap_or(0));
+        body(ui, "add-type", |ui| {
+            ui.add_space(4.0);
+            widgets::card(ui, false, |ui| {
+                for (t, conn) in integration.types.iter().enumerate() {
+                    if widgets::radio_row(
+                        ui,
+                        choice == t,
+                        conn.name,
+                        conn.tag,
+                        Some(conn.summary),
+                        true,
+                        t > 0,
+                        true,
+                    )
+                    .clicked()
+                    {
+                        choice = t;
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            if integration.id == "fortinet" {
+                widgets::help(
+                    ui,
+                    "Not sure? FortiClient shows it in the connection's settings, or ask IT.",
                 );
             }
+        });
+        ui.data_mut(|d| d.insert_temp(key, choice));
+    }
+
+    pub(in crate::gui) fn add_type_footer(&mut self, ui: &mut Ui, i: usize) {
+        let key = egui::Id::unique(("add-type-choice", i));
+        let choice = ui.data(|d| d.get_temp::<usize>(key).unwrap_or(0));
+        let mut go = false;
+        let mut back = false;
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            back = widgets::button(ui, Button::Secondary, "Back", None, false).clicked();
+            go = widgets::button(ui, Button::Primary, "Continue", None, false).clicked();
+        });
+        if go {
+            self.new_profile(i, choice);
+        } else if back {
+            self.back();
         }
     }
+
+    /// Import: the profiles found in another program, to tick and import.
+    pub(in crate::gui) fn import_page(&mut self, ui: &mut Ui) {
+        let p = widgets::pal(ui);
+        let sub = match self.import.len() {
+            0 => "None found".to_string(),
+            1 => "1 connection found".into(),
+            n => format!("{n} connections found"),
+        };
+        if widgets::page_header(ui, "Import from FortiClient", &sub, |_| {}) {
+            self.back();
+            return;
+        }
+        body(ui, "import", |ui| {
+            ui.add_space(4.0);
+            if self.import.is_empty() {
+                widgets::card(ui, true, |ui| {
+                    widgets::help(ui, "FortiClient has no VPN connections on this PC.");
+                });
+                return;
+            }
+            widgets::card(ui, false, |ui| {
+                for (k, item) in self.import.iter_mut().enumerate() {
+                    let (_, conn) = integrations::of(&item.profile);
+                    let mut desc = format!(
+                        "{} · {}",
+                        conn.full_name,
+                        integrations::hosts_line(&integrations::servers(&item.profile))
+                    );
+                    if let Some(note) = &item.note {
+                        desc.push('\n');
+                        desc.push_str(note);
+                    }
+                    let skip = item
+                        .note
+                        .as_deref()
+                        .is_some_and(|n| n.starts_with("Already"));
+                    if widgets::check_row(ui, item.checked, &item.name, Some(&desc), k > 0)
+                        .clicked()
+                        && !skip
+                    {
+                        item.checked = !item.checked;
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(
+                    "Passwords and pre-shared keys aren't copied. Polytunnel asks for them when \
+                     you connect.",
+                )
+                .size(12.0)
+                .color(p.text3),
+            );
+        });
+    }
+
+    pub(in crate::gui) fn import_footer(&mut self, ui: &mut Ui) {
+        let checked = self.import.iter().filter(|i| i.checked).count();
+        let mut go = false;
+        let mut cancel = false;
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            cancel = widgets::button(ui, Button::Secondary, "Cancel", None, false).clicked();
+            ui.add_enabled_ui(checked > 0, |ui| {
+                go = widgets::button(
+                    ui,
+                    Button::Primary,
+                    &format!("Import {checked}"),
+                    None,
+                    false,
+                )
+                .clicked();
+            });
+        });
+        if go {
+            self.do_import();
+        } else if cancel {
+            self.import.clear();
+            self.back();
+        }
+    }
+}
+
+/// The ⋮ menu of a profile.
+fn menu_items(ui: &mut Ui, name: &str, read_only: bool, todo: &mut Vec<Do>) {
+    let p = widgets::pal(ui);
+    ui.add_enabled_ui(!read_only, |ui| {
+        if menu_item(ui, Icon::Edit, "Edit", p.text) {
+            todo.push(Do::Edit(name.to_string()));
+            ui.close();
+        }
+        if menu_item(ui, Icon::Copy, "Duplicate", p.text) {
+            todo.push(Do::Duplicate(name.to_string()));
+            ui.close();
+        }
+        ui.separator();
+        if menu_item(ui, Icon::Trash, "Delete…", p.red_text) {
+            todo.push(Do::Delete(name.to_string()));
+            ui.close();
+        }
+    });
+}
+
+/// A 36 point menu item with an icon. True when chosen.
+pub(in crate::gui) fn menu_item(ui: &mut Ui, icon: Icon, text: &str, ink: egui::Color32) -> bool {
+    let p = widgets::pal(ui);
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().max(168.0), 36.0),
+        egui::Sense::click(),
+    );
+    if response.hovered() || response.has_focus() {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(4), p.surface3);
+    }
+    crate::gui::icons::paint(
+        ui.painter(),
+        egui::Rect::from_min_size(
+            rect.left_center() + egui::vec2(12.0, -8.0),
+            egui::vec2(16.0, 16.0),
+        ),
+        icon,
+        ink,
+    );
+    ui.painter().text(
+        rect.left_center() + egui::vec2(40.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        text,
+        crate::gui::theme::regular(14.0),
+        ink,
+    );
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+}
+
+/// A row's trailing chevron.
+fn chevron(ui: &mut Ui) {
+    let p = widgets::pal(ui);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    crate::gui::icons::paint(ui.painter(), rect, Icon::ChevronRight, p.text3);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polytunnel_core::profile::Profile;
 
     #[test]
     fn gateway_modes_map_to_the_profile_fields() {
@@ -440,6 +542,18 @@ mod tests {
         assert_eq!(
             with_mode(&gp, GatewayMode::Fastest, Some("east")),
             (None, None)
+        );
+    }
+
+    #[test]
+    fn profiles_are_counted() {
+        let profile = Profile::GlobalProtect(GlobalProtectProfile {
+            portal: "vpn.example.com".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            integrations::profile_line(&profile),
+            "GlobalProtect · vpn.example.com"
         );
     }
 }

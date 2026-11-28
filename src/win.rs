@@ -280,3 +280,53 @@ pub fn computer_name() -> Option<String> {
     let ok = unsafe { GetComputerNameExW(ComputerNameDnsHostname, buf.as_mut_ptr(), &mut len) };
     (ok != 0).then(|| String::from_utf16_lossy(&buf[..len as usize]))
 }
+
+/// Whether the taskbar is light (Windows' "default app mode" can differ from it).
+pub fn taskbar_is_light() -> bool {
+    reg_get_dword(
+        Hive::CurrentUser,
+        r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+        "SystemUsesLightTheme",
+    ) == Some(1)
+}
+
+/// The size of small icons (the notification area's), in pixels, at the taskbar's DPI: 16 at
+/// 100% scaling, 20 at 125%, 24 at 150%... Without a taskbar: at the system's DPI.
+pub fn small_icon_size() -> u32 {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, GetSystemMetrics, SM_CXSMICON};
+    // Windows 10 1607 and later; looked up so that older systems use the system metric.
+    type DpiForWindow = unsafe extern "system" fn(HWND) -> u32;
+    type MetricsForDpi = unsafe extern "system" fn(i32, u32) -> i32;
+    // SAFETY: user32 is loaded in every GUI process; the two exports are only called when
+    // present, with their documented signatures, and every handle passed is checked.
+    unsafe {
+        let user32 = GetModuleHandleW(wide("user32.dll").as_ptr());
+        if !user32.is_null()
+            && let (Some(dpi_for_window), Some(metrics_for_dpi)) = (
+                GetProcAddress(user32, c"GetDpiForWindow".as_ptr().cast()),
+                GetProcAddress(user32, c"GetSystemMetricsForDpi".as_ptr().cast()),
+            )
+        {
+            let dpi_for_window: DpiForWindow = std::mem::transmute(dpi_for_window);
+            let metrics_for_dpi: MetricsForDpi = std::mem::transmute(metrics_for_dpi);
+            let taskbar = FindWindowW(wide("Shell_TrayWnd").as_ptr(), null());
+            let dpi = if taskbar.is_null() {
+                0
+            } else {
+                dpi_for_window(taskbar)
+            };
+            if dpi != 0 {
+                let size = metrics_for_dpi(SM_CXSMICON, dpi);
+                if size > 0 {
+                    return size as u32;
+                }
+            }
+        }
+        u32::try_from(GetSystemMetrics(SM_CXSMICON))
+            .ok()
+            .filter(|&s| s > 0)
+            .unwrap_or(16)
+    }
+}

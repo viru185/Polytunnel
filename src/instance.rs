@@ -40,6 +40,12 @@ pub enum Message {
     Quit,
     /// Bring the window to the front and connect with this profile.
     Connect(String),
+    /// To the window: open Settings and ask to confirm turning the kill switch's lockdown
+    /// ("Always") on. The tray never turns lockdown on by itself.
+    Lockdown,
+    /// To the tray: the user closed the window while the tray runs (the tray says once that
+    /// Polytunnel keeps running).
+    Closed,
 }
 
 /// A profile name as the window accepts it: letters, digits, `-` and `_`, at most 64.
@@ -57,6 +63,8 @@ impl Message {
             Message::Show => "show".into(),
             Message::Quit => "quit".into(),
             Message::Connect(name) => format!("connect {name}"),
+            Message::Lockdown => "lockdown".into(),
+            Message::Closed => "closed".into(),
         }
     }
 
@@ -64,6 +72,8 @@ impl Message {
         match s.trim() {
             "show" => Some(Message::Show),
             "quit" => Some(Message::Quit),
+            "lockdown" => Some(Message::Lockdown),
+            "closed" => Some(Message::Closed),
             other => other
                 .strip_prefix("connect ")
                 .filter(|name| valid_profile_name(name))
@@ -194,6 +204,8 @@ mod tests {
             Message::Show,
             Message::Quit,
             Message::Connect("office-2".into()),
+            Message::Lockdown,
+            Message::Closed,
         ] {
             assert_eq!(Message::parse(&format!("{}\n", m.line())), Some(m));
         }
@@ -202,5 +214,7 @@ mod tests {
         assert_eq!(Message::parse("connect ../x"), None);
         assert_eq!(Message::parse("connect "), None);
         assert_eq!(Message::parse("connect a b"), None);
+        assert_eq!(Message::parse("lockdown now"), None);
+        assert_eq!(Message::parse("Closed"), None);
     }
 }

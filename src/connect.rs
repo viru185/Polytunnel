@@ -217,8 +217,10 @@ fn connect_request(args: &AuthArgs) -> Result<Connect, String> {
             gp_connect(profile, client, result.session, version)
         }
         Profile::FortinetSsl(p) => {
-            let FortiLogin { base, cookie, .. } = auth::forti_login(&p)?;
-            forti_connect(profile, base, cookie, p.server_cert)
+            let FortiLogin {
+                base, cookie, pin, ..
+            } = auth::forti_login(&p, auth::profile_name(args))?;
+            forti_connect(profile, base, cookie, pin)
         }
         Profile::FortinetIpsec(p) => {
             let io = |e: std::io::Error| e.to_string();

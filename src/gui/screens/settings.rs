@@ -1,252 +1,391 @@
-//! Settings: kill switch, start-up, notifications, appearance, updates and the advanced bits.
+//! Settings: one scrolling page of cards that apply at once — Protection, Startup,
+//! Notifications, Appearance, Updates, Troubleshooting, About, and Quit.
 
-use eframe::egui::{self, RichText};
+use eframe::egui::{self, Ui};
 use polytunnel_core::ipc::{KillSwitchMode, KillSwitchSettings};
 
+use super::body;
+use crate::gui::icons::Icon;
 use crate::gui::prefs::Appearance;
-use crate::gui::widgets;
-use crate::gui::{App, Confirm, Job, Level, link_status_text};
+use crate::gui::widgets::{self, Kind as Button, Tone};
+use crate::gui::{App, Confirm, Job, Level, Page};
 use crate::{autostart, connect, uri};
 
-/// The kill switch's state in a word, with its colours.
+/// The kill switch's state in a word, with its tone.
 fn killswitch_word(
-    p: &crate::gui::theme::Palette,
     settings: &KillSwitchSettings,
     active: bool,
     problem: Option<&str>,
-) -> (&'static str, egui::Color32, egui::Color32) {
+) -> (&'static str, Tone) {
     match (settings.mode, active, problem) {
-        (_, _, Some(_)) => ("Problem", p.red, p.red_soft),
-        (KillSwitchMode::Off, _, _) => ("Off", p.muted, p.sunken),
-        (KillSwitchMode::Always, true, _) => ("Lockdown", p.amber, p.amber_soft),
-        (_, true, _) => ("Protecting", p.green, p.green_soft),
-        (_, false, _) => ("Ready", p.muted, p.sunken),
+        (_, _, Some(_)) => ("Problem", Tone::Bad),
+        (KillSwitchMode::Off, _, _) => ("Off", Tone::Mute),
+        (KillSwitchMode::Always, _, _) => ("Lockdown", Tone::Warn),
+        (KillSwitchMode::Connected, true, _) => ("Protecting", Tone::Good),
+        (KillSwitchMode::Connected, false, _) => ("Ready", Tone::Mute),
     }
 }
 
-impl App {
-    pub(in crate::gui) fn settings_screen(&mut self, ui: &mut egui::Ui) {
-        let p = widgets::pal(ui);
-        ui.heading("Settings");
-        ui.add_space(4.0);
-        egui::ScrollArea::vertical()
-            .auto_shrink(false)
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 6.0;
+enum Do {
+    KillSwitch(KillSwitchSettings),
+    Autostart(bool),
+    Notifications(bool),
+    Appearance(Appearance),
+    Check,
+    Install(String),
+    Links(bool),
+    Activity,
+    Source,
+    Quit,
+}
 
-                widgets::section(ui, "Security");
-                widgets::card(ui, |ui| match self.killswitch.clone() {
-                    None => {
-                        ui.label(RichText::new("Kill switch").strong());
-                        ui.label(
-                            RichText::new("Unavailable while the Polytunnel service isn't running.")
-                                .size(12.0)
-                                .color(p.muted),
+impl App {
+    pub(in crate::gui) fn settings_page(&mut self, ui: &mut Ui) {
+        if widgets::page_header(ui, "Settings", "", |_| {}) {
+            self.back();
+            return;
+        }
+        let mut todo = Vec::new();
+        let killswitch = self.killswitch.clone();
+        let running_ks = self.running.killswitch;
+        let mut autostart_on = self.autostart;
+        let mut notify = self.prefs.notifications;
+        let mut appearance = self.prefs.appearance;
+        let update = self.update.clone();
+        let running_update = self.running.update;
+        let service = self.status.clone();
+        let links = matches!(uri::status(), uri::Status::Polytunnel(_));
+        let links_supported = !self.link_status.is_empty();
+        body(ui, "settings", |ui| {
+            let p = widgets::pal(ui);
+            // Protection
+            match &killswitch {
+                None => {
+                    widgets::section(ui, "Protection", None);
+                    widgets::card(ui, true, |ui| {
+                        ui.label(egui::RichText::new("Kill switch").strong());
+                        widgets::help(
+                            ui,
+                            "Unavailable while the Polytunnel service isn't running.",
                         );
-                    }
-                    Some((settings, active, problem)) => {
-                        let (word, fg, bg) = killswitch_word(p, &settings, active, problem.as_deref());
-                        widgets::row(ui, "Kill switch", None, |ui| widgets::pill(ui, word, fg, bg));
-                        let mut ks = settings;
-                        ui.add_enabled_ui(!self.running.killswitch, |ui| {
-                            widgets::segmented(
+                    });
+                }
+                Some((settings, active, problem)) => {
+                    let (word, tone) = killswitch_word(settings, *active, problem.as_deref());
+                    let mut right = |ui: &mut Ui| {
+                        widgets::pill(ui, word, tone);
+                    };
+                    widgets::section(ui, "Protection", Some(&mut right));
+                    widgets::card(ui, false, |ui| {
+                        egui::Frame::NONE
+                            .inner_margin(egui::Margin {
+                                left: 16,
+                                right: 16,
+                                top: 12,
+                                bottom: 4,
+                            })
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.label(
+                                    egui::RichText::new("Kill switch")
+                                        .font(crate::gui::theme::semibold(14.0))
+                                        .color(p.text),
+                                );
+                                ui.label(
+                                    egui::RichText::new("Keeps traffic inside the VPN.")
+                                        .size(12.0)
+                                        .color(p.text2),
+                                );
+                            });
+                        let mut ks = *settings;
+                        ui.add_enabled_ui(!running_ks, |ui| {
+                            for (mode, title, desc) in [
+                                (KillSwitchMode::Off, "Off", "Traffic can leave outside the VPN."),
+                                (
+                                    KillSwitchMode::Connected,
+                                    "While connected",
+                                    "If the VPN drops, nothing leaves until it's back or you disconnect.",
+                                ),
+                                (
+                                    KillSwitchMode::Always,
+                                    "Always (lockdown)",
+                                    "No VPN, no internet, even when Polytunnel isn't running.",
+                                ),
+                            ] {
+                                if widgets::radio_row(ui, ks.mode == mode, title, None, Some(desc), !running_ks, false, false)
+                                    .clicked()
+                                {
+                                    ks.mode = mode;
+                                }
+                            }
+                            let lan_enabled = ks.mode != KillSwitchMode::Off && !running_ks;
+                            widgets::toggle_row(
                                 ui,
-                                &mut ks.mode,
-                                &[
-                                    (KillSwitchMode::Off, "Off"),
-                                    (KillSwitchMode::Connected, "While on"),
-                                    (KillSwitchMode::Always, "Always"),
-                                ],
+                                "Allow the local network",
+                                Some(if ks.mode == KillSwitchMode::Off {
+                                    "Turn on the kill switch to use this"
+                                } else {
+                                    "Printers and file shares keep working"
+                                }),
+                                lan_enabled,
+                                &mut ks.allow_lan,
+                                false,
+                                true,
                             );
                         });
-                        let help = match settings.mode {
-                            KillSwitchMode::Off => "Traffic may leave outside the VPN.",
-                            KillSwitchMode::Connected => {
-                                "While a connection is wanted, nothing leaves outside the tunnel, \
-                                 even if it drops."
-                            }
-                            KillSwitchMode::Always => {
-                                "Nothing ever leaves outside the tunnel. No VPN, no internet."
-                            }
-                        };
-                        ui.label(RichText::new(help).size(11.0).color(p.muted));
-                        if let Some(problem) = &problem {
-                            ui.label(RichText::new(problem).size(11.0).color(p.red));
-                        }
-                        widgets::divider(ui);
-                        let enabled = ks.mode != KillSwitchMode::Off && !self.running.killswitch;
-                        widgets::row(
-                            ui,
-                            "Allow the local network",
-                            Some("Printers and file shares keep working"),
-                            |ui| {
-                                widgets::toggle(ui, enabled, &mut ks.allow_lan);
-                            },
-                        );
-                        if ks != settings {
-                            if ks.mode == KillSwitchMode::Always
-                                && settings.mode != KillSwitchMode::Always
-                            {
-                                self.confirm = Some(Confirm::Lockdown(ks));
-                            } else {
-                                self.set_killswitch(ui.ctx(), ks);
-                            }
-                        }
-                    }
-                });
-
-                widgets::section(ui, "General");
-                widgets::card(ui, |ui| {
-                    if autostart::SUPPORTED {
-                        let mut on = self.autostart;
-                        widgets::row(ui, "Start in the tray at sign-in", None, |ui| {
-                            if widgets::toggle(ui, true, &mut on).changed() {
-                                if let Err(e) = autostart::set(on) {
-                                    self.log_at(
-                                        Level::Problem,
-                                        format!("Could not change the start-up setting: {e}"),
+                        if let Some(problem) = problem {
+                            egui::Frame::NONE
+                                .inner_margin(egui::Margin::symmetric(16, 8))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(problem).size(12.0).color(p.red_text),
                                     );
-                                }
-                                self.autostart = autostart::enabled();
-                            }
-                        });
-                        widgets::divider(ui);
-                    }
-                    let mut notify = self.prefs.notifications;
-                    widgets::row(
+                                });
+                        }
+                        if ks != *settings {
+                            todo.push(Do::KillSwitch(ks));
+                        }
+                    });
+                }
+            }
+            // Startup
+            if autostart::SUPPORTED {
+                widgets::section(ui, "Startup", None);
+                widgets::card(ui, false, |ui| {
+                    if widgets::toggle_row(
                         ui,
-                        "Notifications",
-                        Some("When the VPN connects, drops, or needs you"),
-                        |ui| {
-                            if widgets::toggle(ui, true, &mut notify).changed() {
-                                self.prefs.notifications = notify;
-                                self.save_prefs();
-                            }
-                        },
-                    );
-                    widgets::divider(ui);
-                    ui.label(RichText::new("Appearance").color(p.text));
-                    let mut appearance = self.prefs.appearance;
-                    if widgets::segmented(
-                        ui,
-                        &mut appearance,
-                        &[
-                            (Appearance::System, "System"),
-                            (Appearance::Light, "Light"),
-                            (Appearance::Dark, "Dark"),
-                        ],
+                        "Start in the tray when I sign in",
+                        Some("Waits quietly until you connect"),
+                        true,
+                        &mut autostart_on,
+                        true,
+                        true,
                     ) {
-                        self.set_appearance(ui.ctx(), appearance);
+                        todo.push(Do::Autostart(autostart_on));
                     }
                 });
-
-                widgets::section(ui, "Updates");
-                widgets::card(ui, |ui| {
-                    let detail = match &self.update {
-                        Some(version) => format!("Polytunnel {version} is available"),
-                        None => "Updates install only when you choose".into(),
-                    };
-                    let title = format!("Polytunnel {}", polytunnel_core::VERSION);
-                    widgets::row(ui, &title, Some(&detail), |ui| {
-                        if let Some(version) = self.update.clone() {
-                            if ui
-                                .add_enabled(!self.running.update, widgets::mini(ui, "Install"))
+            }
+            // Notifications
+            widgets::section(ui, "Notifications", None);
+            widgets::card(ui, false, |ui| {
+                if widgets::toggle_row(
+                    ui,
+                    "Connected and disconnected",
+                    Some("Problems are always shown"),
+                    true,
+                    &mut notify,
+                    true,
+                    true,
+                ) {
+                    todo.push(Do::Notifications(notify));
+                }
+            });
+            // Appearance
+            widgets::section(ui, "Appearance", None);
+            widgets::card(ui, true, |ui| {
+                if widgets::segmented(
+                    ui,
+                    &mut appearance,
+                    &[
+                        (Appearance::System, "System"),
+                        (Appearance::Light, "Light"),
+                        (Appearance::Dark, "Dark"),
+                    ],
+                ) {
+                    todo.push(Do::Appearance(appearance));
+                }
+            });
+            // Updates
+            widgets::section(ui, "Updates", None);
+            widgets::card(ui, false, |ui| {
+                let detail = match &update {
+                    Some(version) => format!("Polytunnel {version} is available"),
+                    None => "Updates install only when you choose".into(),
+                };
+                widgets::setting_row(
+                    ui,
+                    &format!("Polytunnel {}", polytunnel_core::VERSION),
+                    Some(&detail),
+                    true,
+                    |ui| {
+                        if running_update {
+                            ui.add(egui::Spinner::new());
+                        } else if let Some(version) = update.clone() {
+                            if widgets::button(ui, Button::Secondary, "Install", None, true)
                                 .clicked()
                             {
-                                self.confirm = Some(Confirm::Install(version));
+                                todo.push(Do::Install(version));
                             }
-                        } else if ui
-                            .add_enabled(!self.running.update, widgets::mini(ui, "Check"))
+                        } else if widgets::button(ui, Button::Secondary, "Check", None, true)
                             .clicked()
                         {
-                            self.running.update = true;
-                            self.spawn_job(ui.ctx(), || Job::UpdateChecked(connect::update(false)));
+                            todo.push(Do::Check);
                         }
-                        if self.running.update {
-                            ui.add(egui::Spinner::new());
-                        }
-                    });
+                    },
+                );
+            });
+            // Troubleshooting
+            widgets::section(ui, "Troubleshooting", None);
+            widgets::card(ui, false, |ui| {
+                let (word, tone, detail) = match &service {
+                    Some(Ok(_)) => ("Running", Tone::Good, "Restarts by itself if it stops"),
+                    Some(Err(_)) => (
+                        "Not running",
+                        Tone::Bad,
+                        "Restart the PC or reinstall Polytunnel",
+                    ),
+                    None => ("Checking", Tone::Mute, ""),
+                };
+                widgets::setting_row(ui, "Polytunnel service", Some(detail), true, |ui| {
+                    widgets::pill(ui, word, tone);
                 });
-
-                widgets::section(ui, "Advanced");
-                widgets::card(ui, |ui| {
-                    if !self.link_status.is_empty() {
-                        let handled = matches!(uri::status(), uri::Status::Polytunnel(_));
-                        let detail = self.link_status.clone();
-                        widgets::row(ui, "GlobalProtect browser sign-in", Some(&detail), |ui| {
-                            let label = if handled { "Stop" } else { "Handle" };
-                            if ui.add(widgets::mini(ui, label)).clicked() {
-                                let result = if handled {
-                                    uri::unregister()
-                                } else {
-                                    uri::register()
-                                };
-                                match result {
-                                    Ok(()) if handled => self.log(
-                                        "Polytunnel no longer handles GlobalProtect sign-ins (it \
-                                         registers again the next time a browser sign-in needs it).",
-                                    ),
-                                    Ok(()) => self.log("Polytunnel now handles GlobalProtect sign-ins."),
-                                    Err(e) => self.log_at(Level::Problem, format!("Could not change it: {e}")),
-                                }
-                                self.link_status = link_status_text();
-                            }
-                        });
-                        widgets::divider(ui);
-                    }
-                    let mut trace = self.trace;
-                    let file = crate::trace::file().display().to_string();
-                    widgets::row(
+                if links_supported {
+                    let mut on = links;
+                    if widgets::toggle_row(
                         ui,
-                        "Troubleshooting trace",
-                        Some("Passwords, codes and cookies are removed"),
-                        |ui| {
-                            if widgets::toggle(ui, true, &mut trace).changed() {
-                                match crate::trace::set(trace) {
-                                    Ok(()) => {
-                                        self.trace = crate::trace::enabled();
-                                        self.log(if self.trace {
-                                            format!("Recording connection traces in {file}.")
-                                        } else {
-                                            "Connection traces are off.".to_string()
-                                        });
-                                    }
-                                    Err(e) => self.log_at(
-                                        Level::Problem,
-                                        format!("Could not change the trace setting: {e}"),
-                                    ),
-                                }
-                            }
-                        },
-                    );
-                    if self.trace {
-                        ui.label(RichText::new(format!("App: {file}")).size(11.0).color(p.muted));
-                        if cfg!(windows) {
-                            ui.label(
-                                RichText::new(r"Service: %ProgramData%\Polytunnel\trace.log")
-                                    .size(11.0)
-                                    .color(p.muted),
+                        "Sign-in links from your browser",
+                        Some(
+                            "Browser sign-in hands its result to Polytunnel. Turning this off stops browser sign-in.",
+                        ),
+                        true,
+                        &mut on,
+                        false,
+                        false,
+                    ) {
+                        todo.push(Do::Links(on));
+                    }
+                }
+                if widgets::link_row(
+                    ui,
+                    "Activity, report and trace",
+                    None,
+                    Icon::ChevronRight,
+                    false,
+                    true,
+                )
+                .clicked()
+                {
+                    todo.push(Do::Activity);
+                }
+            });
+            // About
+            widgets::section(ui, "About", None);
+            widgets::card(ui, false, |ui| {
+                if widgets::link_row(
+                    ui,
+                    "Source code and license",
+                    Some("MIT License · github.com/viru185/Polytunnel"),
+                    Icon::External,
+                    true,
+                    true,
+                )
+                .clicked()
+                {
+                    todo.push(Do::Source);
+                }
+            });
+            ui.add_space(24.0);
+            widgets::card(ui, false, |ui| {
+                let (rect, response) =
+                    widgets::row_frame(ui, 56.0, true, true, egui::Sense::click());
+                crate::gui::icons::paint(
+                    ui.painter(),
+                    egui::Rect::from_min_size(
+                        rect.left_center() + egui::vec2(16.0, -10.0),
+                        egui::vec2(20.0, 20.0),
+                    ),
+                    Icon::Power,
+                    p.red_text,
+                );
+                ui.painter().text(
+                    rect.left_center() + egui::vec2(48.0, -9.0),
+                    egui::Align2::LEFT_CENTER,
+                    "Quit Polytunnel",
+                    crate::gui::theme::semibold(14.0),
+                    p.red_text,
+                );
+                ui.painter().text(
+                    rect.left_center() + egui::vec2(48.0, 10.0),
+                    egui::Align2::LEFT_CENTER,
+                    "Disconnects and closes the tray icon",
+                    crate::gui::theme::regular(12.0),
+                    p.text3,
+                );
+                if response.clicked() {
+                    todo.push(Do::Quit);
+                }
+            });
+        });
+        let ctx = ui.ctx().clone();
+        for action in todo {
+            match action {
+                Do::KillSwitch(ks) => {
+                    let was_always = self
+                        .killswitch
+                        .as_ref()
+                        .is_some_and(|(s, _, _)| s.mode == KillSwitchMode::Always);
+                    if ks.mode == KillSwitchMode::Always && !was_always {
+                        self.confirm = Some(Confirm::Lockdown(ks));
+                    } else if self.fake {
+                        if let Some(state) = &mut self.killswitch {
+                            state.0 = ks;
+                        }
+                    } else {
+                        self.set_killswitch(&ctx, ks);
+                    }
+                }
+                Do::Autostart(on) => {
+                    if !self.fake {
+                        if let Err(e) = autostart::set(on) {
+                            self.log_at(
+                                Level::Problem,
+                                format!("Could not change the start-up setting: {e}"),
                             );
                         }
+                        self.autostart = autostart::enabled();
+                    } else {
+                        self.autostart = on;
                     }
-                    if std::env::var_os("POLYTUNNEL_TRACE").is_some() {
-                        ui.label(
-                            RichText::new("POLYTUNNEL_TRACE is set, so traces stay on.")
-                                .size(11.0)
-                                .color(p.amber),
-                        );
-                    }
-                    widgets::divider(ui);
-                    let (word, fg, bg, detail) = match &self.status {
-                        Some(Ok(_)) => ("Running", p.green, p.green_soft, "Restarts by itself if it stops"),
-                        Some(Err(_)) => ("Not running", p.red, p.red_soft, "Restart the computer or reinstall"),
-                        None => ("Checking", p.muted, p.sunken, ""),
+                }
+                Do::Notifications(on) => {
+                    self.prefs.notifications = on;
+                    self.save_prefs();
+                }
+                Do::Appearance(a) => self.set_appearance(&ctx, a),
+                Do::Check => {
+                    self.running.update = true;
+                    self.spawn_job(&ctx, || Job::UpdateChecked(connect::update(false)));
+                }
+                Do::Install(version) => self.confirm = Some(Confirm::Install(version)),
+                Do::Links(on) => {
+                    let result = if on {
+                        uri::register()
+                    } else {
+                        uri::unregister()
                     };
-                    widgets::row(ui, "Polytunnel service", Some(detail), |ui| {
-                        widgets::pill(ui, word, fg, bg);
-                    });
-                });
-                ui.add_space(8.0);
-            });
+                    match result {
+                        Ok(()) if on => self.log("Polytunnel now receives browser sign-in links."),
+                        Ok(()) => self.log("Polytunnel no longer receives browser sign-in links."),
+                        Err(e) => self.log_at(Level::Problem, format!("Could not change it: {e}")),
+                    }
+                    self.link_status = crate::gui::link_status_text();
+                }
+                Do::Activity => self.go(Page::Activity),
+                Do::Source => {
+                    let _ = crate::browser::open("https://github.com/viru185/Polytunnel");
+                }
+                Do::Quit => {
+                    let lockdown = self
+                        .killswitch
+                        .as_ref()
+                        .is_some_and(|(s, _, _)| s.mode == KillSwitchMode::Always);
+                    if lockdown {
+                        self.confirm = Some(Confirm::QuitLockdown);
+                    } else {
+                        self.quit_all(&ctx);
+                    }
+                }
+            }
+        }
     }
 }

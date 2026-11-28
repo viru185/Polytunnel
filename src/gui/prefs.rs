@@ -38,6 +38,12 @@ pub struct Prefs {
     pub notifications: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<WindowPlace>,
+    /// The tray has said once that Polytunnel keeps running after the window closes.
+    #[serde(default)]
+    pub close_hint_shown: bool,
+    /// The profile connected with last (Home opens on it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_profile: Option<String>,
 }
 
 impl Default for Prefs {
@@ -46,6 +52,8 @@ impl Default for Prefs {
             appearance: Appearance::System,
             notifications: true,
             window: None,
+            close_hint_shown: false,
+            last_profile: None,
         }
     }
 }
@@ -68,7 +76,7 @@ pub fn save(prefs: &Prefs) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let text = toml::to_string(prefs).map_err(|e| e.to_string())?;
-    super::write_with_backup(&path, &text)
+    crate::profiles_file::write_with_backup(&path, &text)
 }
 
 /// When the preferences file last changed (to notice changes made by the other process).
@@ -148,6 +156,8 @@ mod tests {
                 height: 680.0,
                 scale: 1.5,
             }),
+            close_hint_shown: true,
+            last_profile: Some("Work".into()),
         };
         let text = toml::to_string(&prefs).unwrap();
         assert!(text.contains("appearance = \"dark\""));
@@ -156,6 +166,7 @@ mod tests {
         let partial: Prefs = toml::from_str("notifications = false").unwrap();
         assert_eq!(partial.appearance, Appearance::System);
         assert!(!partial.notifications);
+        assert!(!partial.close_hint_shown);
         assert_eq!(toml::from_str::<Prefs>("").unwrap(), Prefs::default());
     }
 

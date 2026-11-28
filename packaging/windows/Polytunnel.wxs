@@ -1,16 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Polytunnel MSI (WiX Toolset 5). Build:
+  Polytunnel MSI (WiX Toolset 5). Build (packaging/build.sh does this):
 
     dotnet tool restore
-    dotnet wix build packaging/windows/Polytunnel.wxs -arch x64 ^
+    dotnet wix build packaging/windows/Polytunnel.wxs packaging/windows/ui.wxs -arch x64 ^
       -d Version=0.1.0 -d BinDir=target/release -d WintunDll=path/to/wintun.dll ^
       -d WintunLicense=path/to/wintun/LICENSE.txt ^
-      -d NoticesFile=THIRD-PARTY-NOTICES.txt -o dist/polytunnel-x64.msi
+      -d NoticesFile=THIRD-PARTY-NOTICES.txt -o dist/polytunnel-0.1.0-windows-x64.msi
 
   Per-machine install into Program Files, the Polytunnel service (LocalSystem, started at
   boot), a Start menu shortcut, and clean major upgrades (the old service is removed before
-  the new one is installed).
+  the new one is installed). ui.wxs is the setup wizard.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="Polytunnel"
@@ -18,8 +18,12 @@
            Version="$(var.Version)"
            UpgradeCode="67804223-D7CD-4334-BA9F-E497E61DC06C"
            Scope="perMachine"
+           Language="1033"
+           Codepage="1252"
            Compressed="yes">
-    <MajorUpgrade Schedule="afterInstallInitialize"
+    <!-- IgnoreLanguage: versions up to 0.0.12 were language-neutral (0); without it the
+         Upgrade table would look only for language 1033 and miss them. -->
+    <MajorUpgrade Schedule="afterInstallInitialize" IgnoreLanguage="yes"
                   DowngradeErrorMessage="A newer version of Polytunnel is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
@@ -27,6 +31,21 @@
     <Property Id="ARPPRODUCTICON" Value="PolytunnelIcon" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/viru185/Polytunnel" />
     <Property Id="ARPHELPLINK" Value="https://github.com/viru185/Polytunnel/issues" />
+    <!-- No Modify button in Apps (there are no features to change); opening the MSI again
+         offers Repair or Remove. -->
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <UIRef Id="PolytunnelUI" />
+
+    <!-- Uninstalling (not upgrading) also stops the tray starting at sign-in: deletes the
+         uninstalling user's HKCU Run value, which the app or the Finish page wrote. -->
+    <CustomAction Id="AutostartOff" Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[INSTALLFOLDER]polytunnelw.exe&quot; autostart off"
+                  Execute="deferred" Impersonate="yes" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="AutostartOff" Before="RemoveFiles"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
 
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="Polytunnel" />

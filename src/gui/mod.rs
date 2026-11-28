@@ -4,6 +4,7 @@
 pub mod agent;
 mod dialogs;
 mod icons;
+mod integrations;
 mod notify;
 mod prefs;
 mod screens;
@@ -13,7 +14,6 @@ mod worker;
 
 use std::collections::VecDeque;
 use std::fs;
-use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -21,13 +21,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use eframe::egui;
 use polytunnel_core::Secret;
 use polytunnel_core::ipc::{KillSwitchSettings, Status};
+use polytunnel_core::pin::CertFingerprint;
 use polytunnel_core::profile::{
     EapMethodName, FortinetIpsecProfile, FortinetSslProfile, GatewayPolicy, GlobalProtectProfile,
     IpsecTransport, ProbeMethod, Profile, Profiles, normalize_server, valid_host,
 };
 use polytunnel_gp::rank::Ranking;
+use polytunnel_http::CertInfo;
 
+use crate::auth::Trust;
 use crate::instance::{self, Instance, Message, Role};
+use crate::profiles_file::{save_profiles, trust_certificate};
 use crate::{autostart, connect, forticlient, gateways, paths, uri};
 
 const TITLE: &str = "Polytunnel";
@@ -76,9 +80,13 @@ pub fn run_window_with(connect: Option<String>) -> i32 {
     agent::ensure_running();
 
     let prefs = prefs::load();
-    let place = prefs.window.and_then(|place| {
-        prefs::placement(place, prefs::screens()?, (WINDOW_MIN[0], WINDOW_MIN[1]))
-    });
+    // Debug screenshots open at the design size, not where the window was last.
+    let place = prefs
+        .window
+        .filter(|_| debug_pages().is_none())
+        .and_then(|place| {
+            prefs::placement(place, prefs::screens()?, (WINDOW_MIN[0], WINDOW_MIN[1]))
+        });
     let icon = egui::IconData {
         rgba: include_bytes!(concat!(env!("OUT_DIR"), "/icon48.rgba")).to_vec(),
         width: 48,
@@ -167,6 +175,7 @@ struct Editor {
     tcp: bool,
     /// The profile being edited: settings the form does not show are kept.
     gp_base: GlobalProtectProfile,
+    forti_base: FortinetSslProfile,
     ipsec_base: FortinetIpsecProfile,
     error: Option<String>,
 }
@@ -195,6 +204,7 @@ impl Editor {
             eap: false,
             tcp: false,
             gp_base: GlobalProtectProfile::default(),
+            forti_base: FortinetSslProfile::default(),
             ipsec_base: FortinetIpsecProfile::default(),
             error: None,
         }
@@ -224,6 +234,7 @@ impl Editor {
                 realm: text(&p.realm),
                 backups: p.backup_servers.clone(),
                 server_cert: p.server_cert.map(|c| c.to_string()).unwrap_or_default(),
+                forti_base: p.clone(),
                 ..Editor::new(Kind::FortinetSsl)
             },
             Profile::FortinetIpsec(p) => Editor {
@@ -316,6 +327,7 @@ impl Editor {
                             .map_err(|e| format!("Server certificate: {e}."))?,
                     ),
                 },
+                ..self.forti_base.clone()
             }),
             Kind::FortinetIpsec => {
                 let group: u16 = self
@@ -382,10 +394,19 @@ enum PromptUi {
         reply: Sender<Option<Vec<Secret>>>,
         focused: bool,
     },
+    /// A gateway certificate to trust or not.
+    Certificate {
+        /// `host:port`
+        server: String,
+        info: Box<CertInfo>,
+        /// The certificate the profile trusted before, when this one replaces it.
+        previous: Option<CertFingerprint>,
+        reply: Sender<Trust>,
+        focused: bool,
+    },
 }
 
 struct BrowserUi {
-    server: String,
     url: String,
     not_opened: Option<String>,
     pasted: String,
@@ -425,22 +446,54 @@ enum Confirm {
     Install(String),
     /// Leave the form with unsaved changes, then do this.
     Discard(Leave),
+    /// Quit while lockdown keeps the internet off.
+    QuitLockdown,
 }
 
 enum Leave {
-    New(Kind),
-    /// Back to the profiles.
+    /// Back to the page before the form.
     Close,
 }
 
-/// The window's screens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Screen {
+/// The window's pages: Home, and the pages opened from it (with a back arrow).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Page {
     Home,
+    /// Manage profiles.
     Profiles,
+    /// Add a profile, step 1: the integration.
+    AddIntegration,
+    /// Add a profile, step 2: the connection type (index into `integrations::ALL`).
+    AddType(usize),
+    /// The profile form (`App::editor`).
     Edit,
+    /// A GlobalProtect profile's gateway picker.
+    Gateways(String),
+    /// A Fortinet profile's gateways, in order.
+    GatewayOrder(String),
+    /// Import another program's profiles.
+    Import,
     Settings,
     Activity,
+}
+
+/// The last connection attempt this window made: the profile, when, and how it ended.
+#[derive(Debug, Clone)]
+struct Attempt {
+    profile: String,
+    time: String,
+    result: Result<(), String>,
+    /// Home no longer shows its failure (Dismiss, or a newer attempt).
+    dismissed: bool,
+}
+
+/// A profile found in another program, offered for import.
+struct ImportItem {
+    name: String,
+    profile: Profile,
+    checked: bool,
+    /// Why it is renamed or skipped, if it is.
+    note: Option<String>,
 }
 
 /// How an activity log line is marked.
@@ -483,12 +536,36 @@ struct App {
     prompt: Option<PromptUi>,
     browser: Option<BrowserUi>,
     log: VecDeque<LogLine>,
-    screen: Screen,
+    /// The page stack: Home at the bottom, the open page on top.
+    pages: Vec<Page>,
     prefs: prefs::Prefs,
     /// Where the window is now (saved when it closes).
     place: Option<prefs::WindowPlace>,
-    /// The profile opened in the Profiles list.
-    expanded: Option<String>,
+    /// Home's connection details are open.
+    details_open: bool,
+    /// The profile this window is connecting with (until the attempt ends).
+    attempt: Option<String>,
+    /// That attempt signs in through Polytunnel's window because the kill switch holds
+    /// traffic (the browser is offline).
+    signin_held: bool,
+    /// How the last attempt ended (for Activity's summary).
+    last_attempt: Option<Attempt>,
+    /// The log as it was before Clear, for Undo (for a few seconds).
+    cleared: Option<(VecDeque<LogLine>, Instant)>,
+    /// Profiles found to import.
+    import: Vec<ImportItem>,
+    /// How many FortiClient profiles there are to import (counted when first needed).
+    import_count: Option<usize>,
+    /// The update banner was put off for now.
+    update_later: bool,
+    /// The user closed the window (not Quit or an update).
+    user_closed: bool,
+    /// The theme the title bar was last coloured for (dark?).
+    caption: Option<bool>,
+    /// When the service started reconnecting (it tries for five minutes).
+    reconnect_started: Option<Instant>,
+    /// Debug builds: a made-up status for screenshots (`POLYTUNNEL_STATE`); nothing is saved.
+    fake: bool,
     /// The activity log shows only warnings and problems.
     problems_only: bool,
     /// A connection the tray asked for, started on the first frame.
@@ -532,32 +609,6 @@ fn load_profiles() -> (Profiles, Option<String>) {
             Some(format!("{}: {e}", path.display())),
         ),
     }
-}
-
-/// Writes `text` to `path` through a temporary file, so a failed write never leaves half a
-/// file, and keeps the previous version next to it as `<name>.bak`.
-fn write_with_backup(path: &Path, text: &str) -> Result<(), String> {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = path.with_file_name(format!("{name}.tmp"));
-    fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    if path.exists() {
-        let _ = fs::copy(path, path.with_file_name(format!("{name}.bak")));
-    }
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("{}: {e}", path.display())
-    })
-}
-
-fn save_profiles(profiles: &Profiles) -> Result<(), String> {
-    let path = paths::profiles_file().ok_or("no configuration directory")?;
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    write_with_backup(&path, &profiles.to_toml())
 }
 
 fn link_status_text() -> String {
@@ -615,21 +666,32 @@ fn bytes(n: u64) -> String {
     if f < K {
         format!("{n} B")
     } else if f < K * K {
-        format!("{:.1} KB", f / K)
+        tidy(f / K, "KB")
     } else if f < K * K * K {
-        format!("{:.1} MB", f / (K * K))
+        tidy(f / (K * K), "MB")
     } else {
         format!("{:.2} GB", f / (K * K * K))
     }
 }
 
-/// ` (+2 backup gateways)` for a list of `count` gateways.
-fn backup_note(count: usize) -> String {
-    match count {
-        0 | 1 => String::new(),
-        2 => " (+1 backup gateway)".into(),
-        n => format!(" (+{} backup gateways)", n - 1),
+/// `12.3 KB` below 100, `182 MB` from 100 up.
+fn tidy(value: f64, unit: &str) -> String {
+    if value >= 100.0 {
+        format!("{value:.0} {unit}")
+    } else {
+        format!("{value:.1} {unit}")
     }
+}
+
+/// The local time of day `secs` from now, `HH:MM`.
+fn clock_in(secs: u64) -> String {
+    let now = clock();
+    let parts: Vec<u64> = now.split(':').filter_map(|p| p.parse().ok()).collect();
+    let [h, m, s] = parts[..] else {
+        return now;
+    };
+    let t = (h * 3600 + m * 60 + s + secs) % 86_400;
+    format!("{:02}:{:02}", t / 3600, t / 60 % 60)
 }
 
 /// The profile of the connection that is on, on its way, or stopping.
@@ -675,10 +737,19 @@ impl App {
                 }
             })
             .ok();
-        let (profiles, load_error) = load_profiles();
-        let selected = profiles.profiles.keys().next().cloned();
+        let fake = debug_state();
+        let (profiles, load_error) = match &fake {
+            Some(state) if state.as_str() == "first" => (Profiles::default(), None),
+            Some(_) => (sample_profiles(), None),
+            None => load_profiles(),
+        };
+        let selected = prefs
+            .last_profile
+            .clone()
+            .filter(|name| profiles.get(name).is_some())
+            .or_else(|| profiles.profiles.keys().next().cloned());
         let (job_tx, job_rx) = mpsc::channel();
-        App {
+        let mut app = App {
             profiles,
             load_error,
             selected,
@@ -691,10 +762,21 @@ impl App {
             prompt: None,
             browser: None,
             log: VecDeque::new(),
-            screen: debug_screen().unwrap_or(Screen::Home),
+            pages: vec![Page::Home],
             prefs,
             place: None,
-            expanded: None,
+            details_open: false,
+            attempt: None,
+            signin_held: false,
+            last_attempt: None,
+            cleared: None,
+            import: Vec::new(),
+            import_count: None,
+            update_later: false,
+            user_closed: false,
+            caption: None,
+            reconnect_started: None,
+            fake: fake.is_some(),
             problems_only: false,
             pending_connect,
             gateways: None,
@@ -710,7 +792,77 @@ impl App {
             update: None,
             was_focused: true,
             _instance: instance,
+        };
+        if let Some(state) = fake {
+            app.fake_state(&state);
         }
+        if let Some(pages) = debug_pages() {
+            if pages.last() == Some(&Page::Edit) {
+                let which = std::env::var("POLYTUNNEL_SCREEN").unwrap_or_default();
+                let name = match which.as_str() {
+                    "edit-gp" => "Work",
+                    "edit-ipsec" => "Lab",
+                    _ => "Office",
+                };
+                if let Some(profile) = app.profiles.get(name).cloned() {
+                    app.open_editor(Editor::from_profile(name, &profile));
+                }
+            } else {
+                app.pages = pages;
+            }
+        }
+        app
+    }
+
+    /// The open page.
+    fn page(&self) -> &Page {
+        self.pages.last().unwrap_or(&Page::Home)
+    }
+
+    /// Opens `page` over the current one.
+    fn go(&mut self, page: Page) {
+        if self.page() != &page {
+            self.pages.push(page);
+        }
+    }
+
+    /// Back to the page before (the form asks first when it has unsaved changes).
+    fn back(&mut self) {
+        if self.page() == &Page::Edit {
+            self.leave_editor(Leave::Close);
+        } else if self.pages.len() > 1 {
+            self.pages.pop();
+        }
+    }
+
+    /// Back to Home.
+    fn home(&mut self) {
+        self.pages.truncate(1);
+    }
+
+    /// Saves the profiles (not in a debug build showing made-up profiles).
+    fn store(&self) -> Result<(), String> {
+        if self.fake {
+            return Ok(());
+        }
+        save_profiles(&self.profiles)
+    }
+
+    /// The profile Home shows: the one connected or connecting, else the one chosen last.
+    fn current_profile(&self) -> Option<String> {
+        active_profile(&self.status)
+            .map(str::to_string)
+            .or_else(|| self.attempt.clone())
+            .or_else(|| self.selected.clone())
+            .filter(|name| self.profiles.get(name).is_some())
+    }
+
+    /// Is the kill switch holding traffic now (lockdown, or a dropped connection)?
+    fn traffic_held(&self) -> bool {
+        let connected = matches!(&self.status, Some(Ok(Status::Connected { .. })));
+        matches!(&self.killswitch, Some((settings, active, _))
+            if *active && settings.mode != polytunnel_core::ipc::KillSwitchMode::Off)
+            && !connected
     }
 
     fn log(&mut self, line: impl Into<String>) {
@@ -728,12 +880,20 @@ impl App {
         });
     }
 
-    /// Leaves the profile form (back to the profiles).
+    /// Leaves the profile form, back to the page before it.
     fn close_editor(&mut self) {
         self.editor = None;
         self.editor_initial = None;
-        if self.screen == Screen::Edit {
-            self.screen = Screen::Profiles;
+        if self.page() == &Page::Edit {
+            self.pages.pop();
+        }
+    }
+
+    /// Leaves the form after saving: a new profile's "Add" steps go too.
+    fn finish_editor(&mut self) {
+        self.close_editor();
+        while matches!(self.page(), Page::AddIntegration | Page::AddType(_)) {
+            self.pages.pop();
         }
     }
 
@@ -746,9 +906,13 @@ impl App {
 
     /// Saves the window's preferences (keeping the remembered place as it is on disk).
     fn save_prefs(&mut self) {
+        if self.fake {
+            return;
+        }
         let mut stored = prefs::load();
         stored.appearance = self.prefs.appearance;
         stored.notifications = self.prefs.notifications;
+        stored.last_profile = self.prefs.last_profile.clone();
         if let Err(e) = prefs::save(&stored) {
             self.log_at(Level::Problem, format!("Could not save the settings: {e}"));
         }
@@ -787,11 +951,41 @@ impl App {
         });
     }
 
+    /// Connects with profile `name`; an attempt already under way is cancelled first (Switch).
     fn connect(&mut self, ctx: &egui::Context, name: String) {
-        let Some(profile) = self.profiles.get(&name).cloned() else {
+        let Some(mut profile) = self.profiles.get(&name).cloned() else {
             return;
         };
+        self.selected = Some(name.clone());
+        if self.fake {
+            self.log(format!("Not connecting to '{name}' (screenshot mode)."));
+            return;
+        }
+        if let Some(worker) = self.worker.take() {
+            worker.cancel();
+        }
+        self.prompt = None;
+        self.browser = None;
+        // While the kill switch holds traffic the browser is offline too: sign in through
+        // Polytunnel's own window, which the kill switch lets through.
+        self.signin_held = false;
+        if let Profile::GlobalProtect(gp) = &mut profile
+            && gp.embedded_login != Some(true)
+            && self.traffic_held()
+            && crate::embedded::helper().is_some()
+        {
+            gp.embedded_login = Some(true);
+            self.signin_held = true;
+            self.log(
+                "The kill switch is holding traffic, so sign-in opens in Polytunnel's window.",
+            );
+        }
         self.log(format!("Connecting with '{name}'..."));
+        self.attempt = Some(name.clone());
+        if self.prefs.last_profile.as_deref() != Some(name.as_str()) {
+            self.prefs.last_profile = Some(name.clone());
+            self.save_prefs();
+        }
         let repaint = ctx.clone();
         self.worker = Some(worker::start(name, profile, move || {
             repaint.request_repaint()
@@ -814,7 +1008,6 @@ impl App {
 
     fn do_leave(&mut self, leave: Leave) {
         match leave {
-            Leave::New(kind) => self.open_editor(Editor::new(kind)),
             Leave::Close => self.close_editor(),
         }
     }
@@ -822,11 +1015,14 @@ impl App {
     fn open_editor(&mut self, editor: Editor) {
         self.editor_initial = Some(editor.clone());
         self.editor = Some(editor);
-        self.screen = Screen::Edit;
+        self.go(Page::Edit);
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(poll) = self.poll_rx.try_recv() {
+            if self.fake {
+                continue;
+            }
             match poll {
                 Poll::Status(status) => {
                     if let Err(e) = &status
@@ -842,6 +1038,12 @@ impl App {
                         change_line(self.status.as_ref(), &status, self.worker.is_some())
                     {
                         self.log_at(level, line);
+                    }
+                    let reconnecting = matches!(&status, Ok(Status::Reconnecting { .. }));
+                    if !reconnecting {
+                        self.reconnect_started = None;
+                    } else if self.reconnect_started.is_none() {
+                        self.reconnect_started = Some(Instant::now());
                     }
                     // Home shows the connection that is on.
                     if let Some(active) = active_profile(&Some(status.clone()))
@@ -869,13 +1071,17 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     self.pending_connect = Some(name);
                 }
+                #[allow(unreachable_patterns)]
+                other => self.other_message(ctx, other),
             }
         }
         while let Ok(job) = self.job_rx.try_recv() {
             self.finish_job(ctx, job);
         }
         let mut finished = false;
+        let mut outcome: Option<Result<(), String>> = None;
         let mut lines = Vec::new();
+        let mut trusted = Vec::new();
         if let Some(worker) = &self.worker {
             while let Ok(event) = worker.events.try_recv() {
                 match event {
@@ -930,15 +1136,32 @@ impl App {
                             focused: false,
                         });
                     }
+                    worker::Event::Prompt(worker::Prompt::Certificate {
+                        server,
+                        info,
+                        previous,
+                        reply,
+                    }) => {
+                        self.prompt = Some(PromptUi::Certificate {
+                            server,
+                            info,
+                            previous,
+                            reply,
+                            focused: false,
+                        });
+                    }
+                    worker::Event::TrustCertificate {
+                        profile,
+                        gateway,
+                        fingerprint,
+                    } => trusted.push((profile, gateway, fingerprint)),
                     worker::Event::PromptClosed => self.prompt = None,
                     worker::Event::Prompt(worker::Prompt::Browser {
-                        server,
                         url,
                         not_opened,
                         paste,
                     }) => {
                         self.browser = Some(BrowserUi {
-                            server,
                             url,
                             not_opened,
                             pasted: String::new(),
@@ -953,11 +1176,16 @@ impl App {
                     }
                     worker::Event::BrowserDone => self.browser = None,
                     worker::Event::Finished(result) => {
-                        lines.push(match result {
-                            Ok(message) => (Level::Good, message),
+                        lines.push(match &result {
+                            Ok(message) => (Level::Good, message.clone()),
                             Err(e) if e == connect::CANCELLED => (Level::Info, "Cancelled.".into()),
                             Err(e) => (Level::Problem, format!("Could not connect: {e}")),
                         });
+                        outcome = match result {
+                            Ok(_) => Some(Ok(())),
+                            Err(e) if e == connect::CANCELLED => None,
+                            Err(e) => Some(Err(e)),
+                        };
                         finished = true;
                     }
                 }
@@ -966,7 +1194,20 @@ impl App {
         for (level, line) in lines {
             self.log_at(level, line);
         }
+        for (profile, gateway, fingerprint) in trusted {
+            self.save_trusted_certificate(&profile, &gateway, fingerprint);
+        }
         if finished {
+            if let (Some(result), Some(profile)) = (outcome, self.attempt.clone()) {
+                self.last_attempt = Some(Attempt {
+                    profile,
+                    time: clock()[..5].to_string(),
+                    result,
+                    dismissed: false,
+                });
+            }
+            self.attempt = None;
+            self.signin_held = false;
             self.worker = None;
             self.prompt = None;
             self.browser = None;
@@ -1111,7 +1352,8 @@ impl App {
             .map(|(name, _)| name.clone())
     }
 
-    fn import_forticlient(&mut self) {
+    /// Looks for FortiClient's profiles and opens the import page with them.
+    fn scan_import(&mut self) {
         let mut found: Vec<(String, Profile)> = forticlient::ssl_tunnels()
             .into_iter()
             .map(|t| (t.name, Profile::FortinetSsl(t.profile)))
@@ -1126,46 +1368,72 @@ impl App {
                 .into_iter()
                 .map(|t| (t.name, Profile::FortinetIpsec(t.profile))),
         );
-        if found.is_empty() {
-            self.log("No FortiClient VPN profiles found.");
-            return;
-        }
+        self.import_count = Some(found.len());
+        self.import = found
+            .into_iter()
+            .map(|(base, profile)| {
+                if let Some(existing) = self.same_profile(&profile) {
+                    return ImportItem {
+                        name: base,
+                        profile,
+                        checked: false,
+                        note: Some(format!("Already here as \"{existing}\".")),
+                    };
+                }
+                let mut name = base.clone();
+                while self.profiles.profiles.contains_key(&name) {
+                    name.push('-');
+                }
+                let note = (name != base)
+                    .then(|| format!("You already have \"{base}\". This one becomes \"{name}\"."));
+                ImportItem {
+                    name,
+                    profile,
+                    checked: true,
+                    note,
+                }
+            })
+            .collect();
+        self.go(Page::Import);
+    }
+
+    /// Adds the checked import items as profiles.
+    fn do_import(&mut self) {
+        let items = std::mem::take(&mut self.import);
         let before = self.profiles.clone();
         let mut first_new = None;
-        for (base, profile) in found {
-            if let Some(existing) = self.same_profile(&profile) {
-                self.log(format!(
-                    "The FortiClient profile '{base}' is already here as '{existing}'."
-                ));
-                continue;
-            }
-            let mut name = base;
-            while self.profiles.profiles.contains_key(&name) {
-                name.push('-');
-            }
+        let mut count = 0;
+        for item in items.into_iter().filter(|i| i.checked) {
             self.log(format!(
-                "Imported the FortiClient {} profile as '{name}'.",
-                profile.kind()
+                "Imported the FortiClient {} profile as '{}'.",
+                item.profile.kind(),
+                item.name
             ));
-            self.profiles.profiles.insert(name.clone(), profile);
-            first_new.get_or_insert(name);
+            self.profiles
+                .profiles
+                .insert(item.name.clone(), item.profile);
+            first_new.get_or_insert(item.name);
+            count += 1;
         }
-        let Some(first) = first_new else {
+        if count == 0 {
+            self.back();
             return;
-        };
-        match save_profiles(&self.profiles) {
+        }
+        match self.store() {
             Ok(()) => {
-                self.selected = Some(first);
-                self.close_editor();
+                self.selected = first_new;
+                self.import_count = Some(0);
+                self.home();
             }
             Err(e) => {
                 self.profiles = before;
-                self.log(format!("Could not save the profiles: {e}"));
+                self.log_at(Level::Problem, format!("Could not save the profiles: {e}"));
             }
         }
     }
 
-    fn save_editor(&mut self) {
+    /// Saves the form; `connect_after`: a new profile connects right away (from Home).
+    fn save_editor(&mut self, ctx: &egui::Context, connect_after: bool) {
         let Some(editor) = &mut self.editor else {
             return;
         };
@@ -1191,10 +1459,15 @@ impl App {
             self.profiles.profiles.remove(original);
         }
         self.profiles.profiles.insert(name.clone(), profile);
-        match save_profiles(&self.profiles) {
+        let new = editor.original.is_none();
+        match self.store() {
             Ok(()) => {
-                self.selected = Some(name);
-                self.close_editor();
+                self.selected = Some(name.clone());
+                self.finish_editor();
+                if new && connect_after {
+                    self.home();
+                    self.connect(ctx, name);
+                }
             }
             Err(e) => {
                 self.profiles = before;
@@ -1205,14 +1478,53 @@ impl App {
         }
     }
 
+    /// Saves a certificate the user chose to always trust on one of a Fortinet profile's
+    /// gateways.
+    fn save_trusted_certificate(
+        &mut self,
+        name: &str,
+        gateway: &str,
+        fingerprint: CertFingerprint,
+    ) {
+        if self.read_only() {
+            self.log_at(
+                Level::Warning,
+                format!(
+                    "The certificate of {gateway} was trusted for this connection only: the \
+                     profiles file could not be read, so nothing was saved."
+                ),
+            );
+            return;
+        }
+        let before = self.profiles.clone();
+        let saved = trust_certificate(&mut self.profiles, name, gateway, fingerprint)
+            .and_then(|()| self.store());
+        match saved {
+            Ok(()) => self.log(format!(
+                "'{name}' now always trusts this certificate on {gateway}."
+            )),
+            Err(e) => {
+                self.profiles = before;
+                self.log_at(
+                    Level::Problem,
+                    format!("Could not save the trusted certificate: {e}"),
+                );
+            }
+        }
+    }
+
     fn delete_profile(&mut self, name: &str) {
         let before = self.profiles.clone();
         self.profiles.profiles.remove(name);
-        match save_profiles(&self.profiles) {
+        match self.store() {
             Ok(()) => {
                 self.log(format!("Deleted the profile '{name}'."));
-                self.selected = self.profiles.profiles.keys().next().cloned();
-                self.close_editor();
+                if self.selected.as_deref() == Some(name) {
+                    self.selected = self.profiles.profiles.keys().next().cloned();
+                }
+                if self.editor.as_ref().and_then(|e| e.original.as_deref()) == Some(name) {
+                    self.close_editor();
+                }
             }
             Err(e) => {
                 self.profiles = before;
@@ -1222,26 +1534,34 @@ impl App {
     }
 }
 
-/// The bottom bar's tabs.
-const NAV: [(Screen, icons::Icon, &str); 4] = [
-    (Screen::Home, icons::Icon::Power, "Connect"),
-    (Screen::Profiles, icons::Icon::List, "Profiles"),
-    (Screen::Activity, icons::Icon::Activity, "Activity"),
-    (Screen::Settings, icons::Icon::Gear, "Settings"),
-];
-
-/// A debug build can open on a given screen and theme (`POLYTUNNEL_SCREEN`,
-/// `POLYTUNNEL_THEME`), for screenshots.
-fn debug_screen() -> Option<Screen> {
+/// Debug builds: the page to open on (`POLYTUNNEL_SCREEN`), for screenshots.
+fn debug_pages() -> Option<Vec<Page>> {
     if !cfg!(debug_assertions) {
         return None;
     }
-    match std::env::var("POLYTUNNEL_SCREEN").ok()?.as_str() {
-        "profiles" => Some(Screen::Profiles),
-        "settings" => Some(Screen::Settings),
-        "activity" => Some(Screen::Activity),
-        _ => Some(Screen::Home),
+    let top = match std::env::var("POLYTUNNEL_SCREEN").ok()?.as_str() {
+        "profiles" => Page::Profiles,
+        "add" => Page::AddIntegration,
+        "add-type" => Page::AddType(1),
+        "edit" | "edit-ssl" | "edit-gp" | "edit-ipsec" => Page::Edit,
+        "gateways" => Page::Gateways("Work".into()),
+        "gateway-order" => Page::GatewayOrder("Office".into()),
+        "import" => Page::Import,
+        "settings" => Page::Settings,
+        "activity" => Page::Activity,
+        _ => return Some(vec![Page::Home]),
+    };
+    Some(vec![Page::Home, top])
+}
+
+/// Debug builds: a made-up state to show (`POLYTUNNEL_STATE`), with made-up profiles.
+fn debug_state() -> Option<String> {
+    if !cfg!(debug_assertions) {
+        return None;
     }
+    std::env::var("POLYTUNNEL_STATE")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 fn debug_appearance() -> Option<prefs::Appearance> {
@@ -1253,6 +1573,374 @@ fn debug_appearance() -> Option<prefs::Appearance> {
         "dark" => Some(prefs::Appearance::Dark),
         _ => None,
     }
+}
+
+/// Made-up profiles for screenshots (example addresses only).
+fn sample_profiles() -> Profiles {
+    let text = r#"
+[profile.Work]
+type = "global-protect"
+portal = "vpn.example.com"
+
+[profile.Office]
+type = "fortinet-ssl"
+server = "gw.example.net:10443"
+backup-servers = ["gw2.example.net:10443"]
+trusted-certs = { "gw.example.net:10443" = "sha256:3f9a5c2e71d04b8e6a1c9f37b2e05d48c6a91f0e3b7d25a8e4c1f69b0d73a25e" }
+
+[profile.Lab]
+type = "fortinet-ipsec"
+server = "198.51.100.7"
+username = "a.user"
+
+[profile.Branch]
+type = "global-protect"
+portal = "branch.example.org"
+"#;
+    Profiles::parse(text).unwrap_or_default()
+}
+
+impl App {
+    /// Debug builds: shows a made-up connection state.
+    fn fake_state(&mut self, state: &str) {
+        use polytunnel_core::ipc::KillSwitchMode;
+        let ks = |mode, active| {
+            Some((
+                KillSwitchSettings {
+                    mode,
+                    allow_lan: true,
+                },
+                active,
+                None,
+            ))
+        };
+        let connected = |notice: Option<&str>| Status::Connected {
+            profile: "Work".into(),
+            server: "gw-use.example.com".into(),
+            addresses: vec!["10.20.30.40".into()],
+            transport: "esp".into(),
+            since_unix: now_unix().saturating_sub(6130),
+            notice: notice.map(str::to_string),
+            gateway: Some("203.0.113.10".into()),
+            bytes_in: 190_840_832,
+            bytes_out: 25_794_560,
+        };
+        self.selected = Some("Work".into());
+        self.killswitch = ks(KillSwitchMode::Connected, false);
+        self.status = Some(Ok(Status::Idle {}));
+        match state {
+            "connecting" => {
+                self.selected = Some("Office".into());
+                self.status = Some(Ok(Status::Connecting {
+                    profile: "Office".into(),
+                }));
+            }
+            "waiting" => {
+                self.selected = Some("Office".into());
+                self.status = Some(Ok(Status::Connecting {
+                    profile: "Office".into(),
+                }));
+                let (reply, _) = mpsc::channel();
+                self.prompt = Some(PromptUi::Credentials {
+                    title: "Sign in to Office".into(),
+                    message: Some("gw.example.net:10443".into()),
+                    username_label: "Username".into(),
+                    password_label: "Password".into(),
+                    username: "a.user".into(),
+                    password: String::new(),
+                    reply,
+                    focused: false,
+                });
+            }
+            "browser" => {
+                self.status = Some(Ok(Status::Connecting {
+                    profile: "Work".into(),
+                }));
+                let (paste, _) = mpsc::channel();
+                self.browser = Some(BrowserUi {
+                    url: "https://vpn.example.com/".into(),
+                    not_opened: None,
+                    pasted: String::new(),
+                    paste_error: None,
+                    paste,
+                });
+            }
+            "held" => {
+                self.killswitch = ks(KillSwitchMode::Always, true);
+                self.status = Some(Ok(Status::Connecting {
+                    profile: "Work".into(),
+                }));
+                self.signin_held = true;
+            }
+            "connected" | "details" => {
+                self.killswitch = ks(KillSwitchMode::Connected, true);
+                self.status = Some(Ok(connected(None)));
+                self.details_open = state == "details";
+            }
+            "limited" => {
+                self.killswitch = ks(KillSwitchMode::Connected, true);
+                self.status = Some(Ok(connected(Some(
+                    "VPN access is limited: the device check did not pass.",
+                ))));
+            }
+            "reconnecting" => {
+                self.reconnect_started = Some(Instant::now());
+                self.killswitch = ks(KillSwitchMode::Connected, true);
+                self.status = Some(Ok(Status::Reconnecting {
+                    profile: "Work".into(),
+                    server: "gw-use.example.com".into(),
+                    attempt: 3,
+                    since_unix: now_unix().saturating_sub(6130),
+                }));
+            }
+            "failed" => {
+                self.selected = Some("Office".into());
+                self.status = Some(Ok(Status::Failed {
+                    profile: "Office".into(),
+                    message: "gw.example.net cannot be reached (network error: connection timed \
+                              out)"
+                        .into(),
+                    since_unix: now_unix(),
+                }));
+                self.last_attempt = Some(Attempt {
+                    profile: "Office".into(),
+                    time: "13:12".into(),
+                    result: Err("gw.example.net cannot be reached".into()),
+                    dismissed: false,
+                });
+                self.log_at(Level::Info, "Connecting with 'Office'...");
+                self.log_at(
+                    Level::Problem,
+                    "Could not connect: gw.example.net and its backup didn't answer.",
+                );
+            }
+            "blocked" => self.killswitch = ks(KillSwitchMode::Connected, true),
+            "lockdown" => self.killswitch = ks(KillSwitchMode::Always, true),
+            "service" => {
+                self.status = Some(Err("cannot reach the Polytunnel service".into()));
+                self.killswitch = None;
+            }
+            "update" => self.update = Some("0.0.14".into()),
+            _ => {}
+        }
+        if self.log.is_empty() {
+            self.log_at(Level::Warning, "Reconnecting: the network changed.");
+            self.log_at(Level::Good, "Connected to Work (US East).");
+        }
+    }
+
+    /// The tray's other requests.
+    fn other_message(&mut self, ctx: &egui::Context, message: Message) {
+        match message {
+            Message::Lockdown => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.home();
+                self.go(Page::Settings);
+                let allow_lan = self
+                    .killswitch
+                    .as_ref()
+                    .is_some_and(|(s, _, _)| s.allow_lan);
+                self.confirm = Some(Confirm::Lockdown(KillSwitchSettings {
+                    mode: polytunnel_core::ipc::KillSwitchMode::Always,
+                    allow_lan,
+                }));
+            }
+            Message::Show | Message::Quit | Message::Connect(_) | Message::Closed => {}
+        }
+    }
+
+    /// Quits Polytunnel: the tray disconnects and closes everything (or this window does it
+    /// when there is no tray).
+    fn quit_all(&mut self, ctx: &egui::Context) {
+        if self.fake || instance::send(Role::Agent, Message::Quit).is_err() {
+            if active_profile(&self.status).is_some() && !self.fake {
+                let _ = connect::disconnect();
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Starts the Polytunnel service (Windows asks for an administrator's approval).
+    fn start_service(&mut self) {
+        #[cfg(windows)]
+        {
+            match run_elevated("sc.exe", "start Polytunnel") {
+                Ok(()) => self.log("Starting the Polytunnel service..."),
+                Err(e) => self.log_at(Level::Problem, format!("Could not start the service: {e}")),
+            }
+        }
+        #[cfg(not(windows))]
+        self.log("Start the polytunnel service with your system's service manager.");
+    }
+
+    /// Writes a report for IT (status, kill switch, the profiles' servers, this log and the
+    /// recent app and trace logs) to Downloads and shows it.
+    fn save_report(&mut self) {
+        let mut text = String::new();
+        let mut line = |l: String| {
+            text.push_str(&l);
+            text.push('\n');
+        };
+        line(format!(
+            "Polytunnel {} report, {}",
+            polytunnel_core::VERSION,
+            clock()
+        ));
+        line(String::new());
+        line(format!(
+            "Status: {}",
+            match &self.status {
+                Some(Ok(s)) => connect::describe(s),
+                Some(Err(e)) => connect::service_problem(e),
+                None => "checking".into(),
+            }
+        ));
+        if let Some((settings, active, problem)) = &self.killswitch {
+            line(format!(
+                "Kill switch: {}",
+                connect::describe_killswitch(settings, *active, problem.as_deref())
+            ));
+        }
+        if let Some(a) = &self.last_attempt {
+            line(format!(
+                "Last attempt: {} at {}: {}",
+                a.profile,
+                a.time,
+                match &a.result {
+                    Ok(()) => "connected".to_string(),
+                    Err(e) => e.clone(),
+                }
+            ));
+        }
+        line(String::new());
+        line("Profiles:".into());
+        for (name, profile) in &self.profiles.profiles {
+            line(format!("  {name}: {}", integrations::profile_line(profile)));
+        }
+        line(String::new());
+        line("Activity:".into());
+        for l in &self.log {
+            line(format!("  {}  {}", l.time, l.text));
+        }
+        for (title, file) in [
+            ("App log", paths::log_dir().join("app.log")),
+            (
+                "Trace (passwords, codes and cookies removed)",
+                crate::trace::file(),
+            ),
+        ] {
+            if let Ok(content) = fs::read_to_string(&file) {
+                let tail: Vec<&str> = content.lines().rev().take(300).collect();
+                line(String::new());
+                line(format!("{title}, last {} lines:", tail.len()));
+                for l in tail.into_iter().rev() {
+                    line(format!("  {l}"));
+                }
+            }
+        }
+        let dir = std::env::var_os("USERPROFILE")
+            .map(|home| std::path::PathBuf::from(home).join("Downloads"))
+            .filter(|d| d.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let path = dir.join(format!("Polytunnel report {}.txt", now_unix()));
+        match fs::write(&path, text) {
+            Ok(()) => {
+                self.log(format!("Saved a report for IT: {}", path.display()));
+                #[cfg(windows)]
+                let _ = std::process::Command::new("explorer.exe")
+                    .arg(format!("/select,{}", path.display()))
+                    .spawn();
+            }
+            Err(e) => self.log_at(Level::Problem, format!("Could not save the report: {e}")),
+        }
+    }
+}
+
+/// Runs `program` with `args` as an administrator (Windows asks first).
+#[cfg(windows)]
+fn run_elevated(program: &str, args: &str) -> Result<(), String> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let (verb, file, params) = (wide("runas"), wide(program), wide(args));
+    // SAFETY: NUL-terminated wide strings that outlive the call.
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            std::ptr::null(),
+            SW_HIDE,
+        )
+    };
+    // ShellExecute returns a value greater than 32 on success.
+    if result as usize > 32 {
+        Ok(())
+    } else {
+        Err(format!("Windows refused (code {})", result as usize))
+    }
+}
+
+/// Colours the window's title bar like the page under it (Windows 11; older Windows keeps its
+/// own).
+#[cfg(windows)]
+fn color_title_bar(p: &theme::Palette) -> bool {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumThreadWindows, GetWindowTextW, IsWindowVisible,
+    };
+
+    /// The window titled like ours (winit's event window on this thread is "visible" too).
+    unsafe extern "system" fn found(hwnd: HWND, out: LPARAM) -> i32 {
+        let mut title = [0u16; 64];
+        // SAFETY: `title` is a writable buffer of the given length; `out` points at the HWND
+        // slot below, alive for the enumeration.
+        unsafe {
+            let n = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+            let ours = String::from_utf16_lossy(&title[..n.max(0) as usize]) == TITLE;
+            if ours && IsWindowVisible(hwnd) != 0 {
+                *(out as *mut HWND) = hwnd;
+                return 0;
+            }
+        }
+        1
+    }
+    let mut hwnd: HWND = std::ptr::null_mut();
+    // SAFETY: enumerates this thread's windows into a local; the callback only writes it.
+    unsafe {
+        EnumThreadWindows(
+            GetCurrentThreadId(),
+            Some(found),
+            &mut hwnd as *mut HWND as LPARAM,
+        );
+    }
+    if hwnd.is_null() {
+        return false;
+    }
+    let colorref =
+        |c: egui::Color32| u32::from(c.r()) | (u32::from(c.g()) << 8) | (u32::from(c.b()) << 16);
+    // DWMWA_BORDER_COLOR = 34, DWMWA_CAPTION_COLOR = 35, DWMWA_TEXT_COLOR = 36.
+    for (attribute, value) in [
+        (35u32, colorref(p.title_bar)),
+        (36, colorref(p.title_ink)),
+        (34, colorref(p.line)),
+    ] {
+        // SAFETY: a valid window handle and a 4-byte COLORREF value.
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                attribute,
+                &value as *const u32 as *const core::ffi::c_void,
+                4,
+            );
+        }
+    }
+    true
 }
 
 /// A log line for a change of the connection the window did not start itself (or that
@@ -1288,8 +1976,7 @@ impl eframe::App for App {
                     format!("Not connecting to '{name}': another connection is being set up."),
                 );
             } else if self.profiles.get(&name).is_some() {
-                self.selected = Some(name.clone());
-                self.screen = Screen::Home;
+                self.home();
                 self.connect(ctx, name);
             } else {
                 self.log_at(
@@ -1305,6 +1992,41 @@ impl eframe::App for App {
             theme::apply(ctx, appearance);
         }
         self.poll(ctx);
+        // The user closed the window (the tray says once that Polytunnel keeps running).
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.user_closed = true;
+        }
+        // Esc, Alt+Left and the mouse's back button go back a page (dialogs take Esc first).
+        let nothing_open =
+            self.prompt.is_none() && self.confirm.is_none() && self.browser.is_none();
+        let back = ctx.input(|i| {
+            i.key_pressed(egui::Key::Escape)
+                || (i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft))
+                || i.pointer.button_pressed(egui::PointerButton::Extra1)
+        });
+        if back && nothing_open && ctx.memory(|m| m.focused().is_none()) {
+            self.back();
+        }
+        // Undo for Clear lasts ten seconds.
+        if self
+            .cleared
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(10))
+        {
+            self.cleared = None;
+        }
+        // The title bar follows the theme.
+        let dark = theme::palette(ctx).dark;
+        if self.caption != Some(dark) {
+            #[cfg(windows)]
+            if color_title_bar(theme::palette(ctx)) {
+                self.caption = Some(dark);
+            }
+            #[cfg(not(windows))]
+            {
+                self.caption = Some(dark);
+            }
+        }
         // Back in the window: settings changed elsewhere (Task Manager, another program)
         // show as they are now.
         let focused = ctx.input(|i| i.focused);
@@ -1336,39 +2058,52 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let p = theme::palette(ui.ctx());
-        let bar = egui::Frame::NONE
-            .fill(p.surface)
-            .inner_margin(egui::Margin::symmetric(6, 4));
-        if self.screen == Screen::Edit && self.editor.is_none() {
-            self.screen = Screen::Profiles;
+        if self.page() == &Page::Edit && self.editor.is_none() {
+            self.pages.pop();
         }
-        if self.screen == Screen::Edit {
-            egui::Panel::bottom("editor-actions")
-                .exact_size(56.0)
-                .frame(bar.inner_margin(egui::Margin::symmetric(14, 10)))
-                .show(ui, |ui| self.editor_footer(ui));
-        } else {
-            egui::Panel::bottom("nav")
-                .exact_size(56.0)
-                .frame(bar)
+        let page = self.page().clone();
+        let footer = match &page {
+            Page::Edit | Page::AddType(_) | Page::Import => true,
+            Page::Gateways(name) => self.gateway_switch_target(name).is_some(),
+            _ => false,
+        };
+        if footer {
+            egui::Panel::bottom("footer")
+                .exact_size(60.0)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(p.bg)
+                        .inner_margin(egui::Margin::symmetric(16, 12)),
+                )
                 .show(ui, |ui| {
-                    let mut screen = self.screen;
-                    widgets::nav_bar(ui, &mut screen, &NAV);
-                    self.screen = screen;
+                    let r = ui.max_rect();
+                    ui.painter().hline(
+                        (r.left() - 16.0)..=(r.right() + 16.0),
+                        r.top() - 12.0 + 0.5,
+                        egui::Stroke::new(1.0, p.line),
+                    );
+                    match &page {
+                        Page::Edit => self.editor_footer(ui),
+                        Page::AddType(i) => self.add_type_footer(ui, *i),
+                        Page::Import => self.import_footer(ui),
+                        Page::Gateways(name) => self.gateways_footer(ui, name),
+                        _ => {}
+                    }
                 });
         }
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::NONE
-                    .fill(p.bg)
-                    .inner_margin(egui::Margin::symmetric(14, 10)),
-            )
-            .show(ui, |ui| match self.screen {
-                Screen::Home => self.home_screen(ui),
-                Screen::Profiles => self.profiles_screen(ui),
-                Screen::Edit => self.editor_screen(ui),
-                Screen::Settings => self.settings_screen(ui),
-                Screen::Activity => self.activity_screen(ui),
+            .frame(egui::Frame::NONE.fill(p.bg))
+            .show(ui, |ui| match &page {
+                Page::Home => self.home_page(ui),
+                Page::Profiles => self.profiles_page(ui),
+                Page::AddIntegration => self.add_integration_page(ui),
+                Page::AddType(i) => self.add_type_page(ui, *i),
+                Page::Edit => self.editor_page(ui),
+                Page::Gateways(name) => self.gateways_page(ui, name),
+                Page::GatewayOrder(name) => self.gateway_order_page(ui, name),
+                Page::Import => self.import_page(ui),
+                Page::Settings => self.settings_page(ui),
+                Page::Activity => self.activity_page(ui),
             });
         let ctx = ui.ctx().clone();
         self.prompts(&ctx);
@@ -1381,6 +2116,12 @@ impl eframe::App for App {
             let mut stored = prefs::load();
             stored.window = Some(place);
             let _ = prefs::save(&stored);
+        }
+        // Closed by the user (not Quit or an update): the tray says once that it keeps
+        // running. Sent after saving the place, so the two saves of the preferences don't
+        // overlap.
+        if self.user_closed && !self.fake {
+            let _ = instance::send(Role::Agent, Message::Closed);
         }
         // A connection still being set up is stopped (nobody could answer its questions any
         // more); one that is up keeps running in the service.
@@ -1413,6 +2154,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn screenshot_profiles_parse() {
+        let profiles = sample_profiles();
+        assert_eq!(profiles.profiles.len(), 4);
+        for name in ["Work", "Office", "Lab", "Branch"] {
+            assert!(profiles.get(name).is_some(), "{name}");
+        }
+    }
+
+    #[test]
     fn editor_round_trips_profiles() {
         let gp = Profile::GlobalProtect(GlobalProtectProfile {
             portal: "vpn.example.com".into(),
@@ -1424,11 +2174,17 @@ mod tests {
         let editor = Editor::from_profile("work", &gp);
         assert_eq!(editor.to_profile(), Ok(("work".to_string(), gp)));
 
+        // Certificates trusted with "Always trust" have no field in the form, and are kept.
         let forti = Profile::FortinetSsl(FortinetSslProfile {
             server: "vpn.example.net:10443".into(),
             username: Some("me".into()),
             realm: None,
             server_cert: Some("0123456789abcdef".repeat(4).parse().unwrap()),
+            trusted_certs: [(
+                "vpn.example.net:10443".to_string(),
+                "ab".repeat(32).parse().unwrap(),
+            )]
+            .into(),
             ..Default::default()
         });
         assert_eq!(
@@ -1516,8 +2272,6 @@ mod tests {
         assert_eq!(p.backup_servers, ["198.51.100.8"]);
         ipsec.backups = vec!["198.51.100.8:500".into()];
         assert!(ipsec.to_profile().is_err());
-        assert_eq!(backup_note(1), "");
-        assert_eq!(backup_note(3), " (+2 backup gateways)");
     }
 
     #[test]
@@ -1573,22 +2327,6 @@ mod tests {
     }
 
     #[test]
-    fn saving_keeps_the_previous_file() {
-        let dir = std::env::temp_dir().join(format!("polytunnel-save-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("profiles.toml");
-        write_with_backup(&path, "first").unwrap();
-        write_with_backup(&path, "second").unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "second");
-        assert_eq!(
-            fs::read_to_string(dir.join("profiles.toml.bak")).unwrap(),
-            "first"
-        );
-        assert!(!dir.join("profiles.toml.tmp").exists());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn connection_changes_are_logged_once() {
         let connected = Ok(Status::Connected {
             profile: "work".into(),
@@ -1634,6 +2372,8 @@ mod tests {
     fn sizes_and_durations() {
         assert_eq!(bytes(512), "512 B");
         assert_eq!(bytes(1536), "1.5 KB");
+        assert_eq!(bytes(190_840_832), "182 MB");
+        assert_eq!(bytes(25_794_560), "24.6 MB");
         assert_eq!(bytes(3 * 1024 * 1024 * 1024), "3.00 GB");
         assert_eq!(elapsed(now_unix() - 65), "1:05");
         assert_eq!(elapsed(now_unix() - 3725), "1:02:05");

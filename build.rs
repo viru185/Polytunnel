@@ -1,6 +1,7 @@
 //! Build script (adapted from AutoTyper).
 //!
-//! * Decodes the app icon into raw RGBA (32 px for the tray, 48 px for the window) so the
+//! * Decodes the app icon into raw RGBA (48 px for the window, 256 px for the window's welcome
+//!   page; the tray draws its own glyph) so the
 //!   binary needs no image decoder at run time.
 //! * On Windows targets, embeds the icon, version info and the application manifest
 //!   (`assets/polytunnel.manifest`) as resources. This needs `rc.exe` from the Windows SDK.
@@ -17,7 +18,7 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
     let file = fs::File::open(ICON).expect("open the app icon");
     let dir = ico::IconDir::read(file).expect("parse the app icon");
-    for size in [32u32, 48] {
+    for size in [48u32, 256] {
         let entry = dir
             .entries()
             .iter()
