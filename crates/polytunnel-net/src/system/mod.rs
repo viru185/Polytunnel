@@ -163,6 +163,7 @@ mod tests {
             if_index: missing,
             servers: Vec::new(),
             domains: Vec::new(),
+            search: Vec::new(),
         };
         assert!(
             !route_already_gone(&dns),

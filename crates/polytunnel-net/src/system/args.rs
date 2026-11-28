@@ -32,18 +32,34 @@ pub fn linux_route(
     args
 }
 
-/// The `resolvectl` invocations that route `domains` to `servers` over `if_name`.
-pub fn linux_dns(if_name: &str, servers: &[IpAddr], domains: &[String]) -> Vec<Vec<String>> {
+/// The `resolvectl` invocations that route `domains` to `servers` over `if_name` and complete
+/// short names with `search` (a plain domain is both; `~domain` only routes).
+pub fn linux_dns(
+    if_name: &str,
+    servers: &[IpAddr],
+    domains: &[String],
+    search: &[String],
+) -> Vec<Vec<String>> {
     let mut dns = vec!["dns".to_string(), if_name.to_string()];
     dns.extend(servers.iter().map(IpAddr::to_string));
     let mut domain = vec!["domain".to_string(), if_name.to_string()];
-    domain.extend(domains.iter().filter(|d| valid_domain(d)).map(|d| {
-        if d == "." {
-            "~.".to_string()
-        } else {
-            format!("~{d}")
-        }
-    }));
+    let search: Vec<&String> = search
+        .iter()
+        .filter(|d| valid_domain(d) && *d != ".")
+        .collect();
+    domain.extend(search.iter().map(|d| d.to_string()));
+    domain.extend(
+        domains
+            .iter()
+            .filter(|d| valid_domain(d) && !search.contains(d))
+            .map(|d| {
+                if d == "." {
+                    "~.".to_string()
+                } else {
+                    format!("~{d}")
+                }
+            }),
+    );
     let all = domains.iter().any(|d| d == ".");
     vec![
         dns,
@@ -140,13 +156,28 @@ mod tests {
             "tun0",
             &["10.0.0.53".parse().unwrap()],
             &["corp.example.com".into(), "bad;x".into()],
+            &[],
         );
         assert_eq!(dns[0], ["dns", "tun0", "10.0.0.53"]);
         assert_eq!(dns[1], ["domain", "tun0", "~corp.example.com"]);
         assert_eq!(dns[2], ["default-route", "tun0", "false"]);
-        let all = linux_dns("tun0", &[], &[".".into()]);
+        let all = linux_dns("tun0", &[], &[".".into()], &[]);
         assert_eq!(all[1], ["domain", "tun0", "~."]);
         assert_eq!(all[2][2], "true");
+
+        // Search domains are listed plainly, so short names are completed with them.
+        let split = linux_dns(
+            "tun0",
+            &[],
+            &["corp.example.com".into(), "lab.example.com".into()],
+            &["corp.example.com".into(), "bad;x".into()],
+        );
+        assert_eq!(
+            split[1],
+            ["domain", "tun0", "corp.example.com", "~lab.example.com"]
+        );
+        let full = linux_dns("tun0", &[], &[".".into()], &["corp.example.com".into()]);
+        assert_eq!(full[1], ["domain", "tun0", "corp.example.com", "~."]);
     }
 
     #[test]
