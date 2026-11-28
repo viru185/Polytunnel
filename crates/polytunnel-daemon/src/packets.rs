@@ -28,11 +28,9 @@ impl Pump {
             let (device, interrupt) = (device.clone(), interrupt.clone());
             thread::spawn(move || {
                 let mut buf = vec![0u8; usize::from(mtu) + 64];
-                while let Ok(n) = device.recv_intr(&mut buf, &interrupt) {
-                    if n > 0 && out_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
+                read_packets(&device, &interrupt, &mut buf, |packet| {
+                    out_tx.blocking_send(packet.to_vec()).is_ok()
+                });
             })
         };
         let writer = {
@@ -62,6 +60,54 @@ impl Pump {
         let _ = self.interrupt.trigger();
         for t in self.threads {
             let _ = t.join();
+        }
+    }
+}
+
+/// Reads packets from the device and hands each to `deliver` (which returns false to stop),
+/// until the device fails or `interrupt` is triggered.
+///
+/// On Windows the Wintun ring has to be emptied, until it reports no more packets, before
+/// waiting on its read event. The event is signalled once for a whole batch, so waiting first
+/// (as `recv_intr` does) leaves the rest of a batch in the ring until more packets arrive:
+/// every packet then waits for later ones, and a new connection's first packet waits for its
+/// own retransmission.
+#[cfg(windows)]
+fn read_packets(
+    device: &SyncDevice,
+    interrupt: &InterruptEvent,
+    buf: &mut [u8],
+    mut deliver: impl FnMut(&[u8]) -> bool,
+) {
+    while !interrupt.is_trigger() {
+        match device.try_recv(buf) {
+            Ok(0) => {}
+            Ok(n) => {
+                if !deliver(&buf[..n]) {
+                    return;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if device.wait_readable_intr(interrupt).is_err() {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// Other systems: the descriptor is polled level-triggered, so waiting first loses nothing.
+#[cfg(not(windows))]
+fn read_packets(
+    device: &SyncDevice,
+    interrupt: &InterruptEvent,
+    buf: &mut [u8],
+    mut deliver: impl FnMut(&[u8]) -> bool,
+) {
+    while let Ok(n) = device.recv_intr(buf, interrupt) {
+        if n > 0 && !deliver(&buf[..n]) {
+            return;
         }
     }
 }
