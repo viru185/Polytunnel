@@ -5,8 +5,9 @@ banner.bmp) with the app icon, assets/polytunnel.png.
 
 dialog.bmp fills the Welcome and Finish style pages above the buttons (370 x 234 installer
 units, 493 x 312 pixels at 100% display scaling): an indigo glow on near-black, the logo at
-the top left, and a bottom band that fades to the window colour (#F0F0F0) for the Finish
-page's check boxes, which are opaque and fill behind their labels with that colour.
+the top left, and from y = 240 a hard edge, a 1-pixel indigo rule (#3A2BC0) and then a flat
+band in the window colour (#F0F0F0) for the Finish page's check boxes, which are opaque and
+fill behind their labels with that colour.
 banner.bmp is the strip at the top of the other pages (370 x 44 units, 493 x 58 pixels): a
 plain indigo gradient with the logo on the right. The wizard draws all the words. Windows
 Installer stretches a bitmap to its control, so --scale 2 (the default) draws them at twice
@@ -25,6 +26,7 @@ ICON = HERE.parent.parent / "assets" / "polytunnel.png"
 GLOW = [(0.0, (0x2B, 0x2F, 0x8F)), (0.55, (0x0B, 0x0C, 0x22)), (1.0, (0x05, 0x06, 0x08))]
 EDGE = GLOW[-1][1]
 FACE = (0xF0, 0xF0, 0xF0)  # Windows' dialog (button face) colour, behind check box labels
+RULE = (0x3A, 0x2B, 0xC0)  # the icon's deep indigo, between the art and the band
 BANNER = ((0x0B, 0x0C, 0x22), (0x1B, 0x1F, 0x5E))  # left, right
 
 
@@ -61,16 +63,13 @@ def logo(img, scale, left_top, size):
 
 
 def dialog(scale):
-    """493 x 312 (x scale). Logo at x, y = 27, 24 (48 x 48), text from y = 83, and from
-    y = 192 a fade to FACE that is solid from y = 240 down."""
+    """493 x 312 (x scale). Logo at x, y = 27, 24 (48 x 48), text from y = 83; the art ends
+    with a hard edge at y = 240, then a 1-unit RULE and FACE from y = 241 down."""
     w, h = 493 * scale, 312 * scale
     img = glow((w, h), (150 * scale, 70 * scale), (380 * scale, 260 * scale))
-    top, solid = 192 * scale, 240 * scale
-    mask = Image.new("L", (1, h), 0)
-    for y in range(top, h):
-        t = min(1.0, (y - top) / (solid - top))
-        mask.putpixel((0, y), round(255 * t * t * (3 - 2 * t)))  # smoothstep
-    img.paste(Image.new("RGB", (w, h), FACE), (0, 0), mask.resize((w, h)))
+    edge = 240 * scale
+    img.paste(RULE, (0, edge, w, edge + scale))
+    img.paste(FACE, (0, edge + scale, w, h))
     return logo(img, scale, (27, 24), 48)
 
 

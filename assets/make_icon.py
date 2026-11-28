@@ -4,7 +4,9 @@ Original artwork drawn with plain shapes (no fonts, no third-party art): "Arch a
 tunnel arch with flat feet and a white light inside, on an indigo rounded square.
 
 Sizes 16, 20, 24 and 32 are drawn on whole pixels (their own geometry) so they stay crisp; 40 px
-and up are scaled from the 1024 px master. Below 48 px there is no halo and no sheen.
+and up are scaled from the 1024 px master. Below 48 px there is no halo and no sheen. 16, 20 and
+24 px get a 1 px inner stroke of white at 12% along the tile's edge, so the tile stays visible on
+black title bars.
 
     uv run --no-project --with pillow python assets/make_icon.py
 """
@@ -18,6 +20,7 @@ TOP, BOTTOM = (0x7C, 0x8B, 0xFF), (0x3A, 0x2B, 0xC0)
 HALO = (0xC7, 0xCE, 0xFF)
 WHITE = (255, 255, 255, 255)
 SS = 16  # supersampling for the hand-fitted small sizes
+EDGE_ALPHA = round(0.12 * 255)  # the small sizes' inner stroke: white at 12%
 
 
 def diagonal_gradient(size: int) -> Image.Image:
@@ -100,7 +103,19 @@ def small(size: int) -> Image.Image:
     big = size * k
     img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
     scaled = [v * k for v in box]
-    img.paste(diagonal_gradient(big), (0, 0), rounded_mask(big, scaled, radius * k))
+    tile = rounded_mask(big, scaled, radius * k)
+    img.paste(diagonal_gradient(big), (0, 0), tile)
+    if size <= 24:
+        # A 1 px stroke just inside the tile's edge (the box's far edges are exclusive).
+        ring = Image.new("L", (big, big), 0)
+        x0, y0, x1, y1 = scaled
+        ImageDraw.Draw(ring).rounded_rectangle(
+            [x0, y0, x1 - 1, y1 - 1], radius=radius * k, outline=255, width=k
+        )
+        alpha = ImageChops.multiply(ring, tile).point(lambda v: v * EDGE_ALPHA // 255)
+        edge = Image.new("RGBA", (big, big), (255, 255, 255, 0))
+        edge.putalpha(alpha)
+        img = Image.alpha_composite(img, edge)
     d = ImageDraw.Draw(img)
     arch(d, cx * k, cy * k, r * k, stroke * k, foot * k)
     if light[0] == "rect":
