@@ -181,6 +181,7 @@ ureq = { version = "3.5.2", default-features = false, features = ["native-tls-no
 widestring = "1.2.1"
 windows-service = "0.8.1"
 windows-sys = "0.61.2"
+wmi = { version = "0.18.4", default-features = false }
 winit = { version = "0.30.13", default-features = false }
 zeroize = "1.9.2"
 

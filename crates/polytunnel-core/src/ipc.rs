@@ -270,6 +270,10 @@ pub enum Status {
         /// `tls`, `esp` or `ppp`.
         transport: String,
         since_unix: u64,
+        /// What the server says about this connection, when it restricts it (e.g. a
+        /// GlobalProtect gateway's HIP verdict: "VPN Access Denied ...").
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notice: Option<String>,
     },
     Disconnecting {
         profile: String,

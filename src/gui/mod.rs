@@ -563,6 +563,12 @@ impl App {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let (text, color) = match &self.status {
+                // Connected, but the server restricts it (e.g. a HIP verdict): amber.
+                Ok(
+                    s @ Status::Connected {
+                        notice: Some(_), ..
+                    },
+                ) => (connect::describe(s), egui::Color32::from_rgb(217, 119, 6)),
                 Ok(s @ Status::Connected { .. }) => {
                     (connect::describe(s), egui::Color32::from_rgb(22, 163, 74))
                 }

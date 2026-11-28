@@ -180,6 +180,7 @@ async fn connect_and_run(
             addresses: vec![ip.address.to_string()],
             transport: "ppp".into(),
             since_unix: now_unix(),
+            notice: None,
         },
     );
     let ended = ppp_loop(&mut ppp, reader, &mut writer, decoder, &mut channels, stop).await;

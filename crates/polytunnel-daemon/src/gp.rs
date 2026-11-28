@@ -35,6 +35,10 @@ const TLS_KEEPALIVE: Duration = Duration::from_secs(10);
 const ESP_KEEPALIVE: Duration = Duration::from_secs(10);
 const ESP_DEAD_AFTER: Duration = Duration::from_secs(45);
 const TLS_RECONNECTS: usize = 3;
+/// The HIP report is sent again this often while connected, as openconnect does.
+const HIP_RECHECK: Duration = Duration::from_secs(3600);
+/// Reading the device's security state from Windows must not hold up the connection.
+const POSTURE_TIMEOUT: Duration = Duration::from_secs(20);
 /// The ESP probe is an ICMP echo to the gateway's `gw-address` that the gateway only answers
 /// with this payload ("monitor", two zero bytes, "pan ha "), sent with this identifier, as
 /// openconnect documents.
@@ -177,17 +181,10 @@ async fn connect_and_run(
 
     // HIP comes before any network change, as in openconnect: many gateways pass no traffic
     // until they have it.
-    if let Some((ip, _)) = settings.address_v4 {
-        let (client, session, pinned) = (client.clone(), session.clone(), pinned.clone());
-        let hip = blocking(move || {
-            let http = crate::trace::transport_to(None, pinned);
-            hip_exchange(&http, &client, &session, &ip.to_string())
-        })
-        .await;
-        if let Err(e) = hip {
-            warn!("HIP report: {e}");
-        }
-    }
+    let notice = match settings.address_v4 {
+        Some((ip, _)) => hip_round(&client, &session, pinned.clone(), ip.to_string(), true).await,
+        None => None,
+    };
 
     let mut servers = gateway_ips.clone();
     servers.extend(settings.gateway_address);
@@ -196,6 +193,28 @@ async fn connect_and_run(
 
     let (pump, mut channels) =
         Pump::start(device.clone(), config.mtu).map_err(|e| e.to_string())?;
+    // The report is sent again every hour; the gateway's verdict updates the status.
+    let recheck = settings.address_v4.map(|(ip, _)| {
+        let (client, session, pinned, status) = (
+            client.clone(),
+            session.clone(),
+            pinned.clone(),
+            status.clone(),
+        );
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(HIP_RECHECK);
+            every.tick().await;
+            loop {
+                every.tick().await;
+                let notice =
+                    hip_round(&client, &session, pinned.clone(), ip.to_string(), false).await;
+                let mut current = status.lock().unwrap_or_else(|e| e.into_inner());
+                if let Status::Connected { notice: shown, .. } = &mut *current {
+                    *shown = notice;
+                }
+            }
+        })
+    });
     let addresses: Vec<String> = config
         .addresses
         .iter()
@@ -211,8 +230,12 @@ async fn connect_and_run(
         stop,
         status,
         &addresses,
+        notice,
     )
     .await;
+    if let Some(task) = recheck {
+        task.abort();
+    }
     drop(channels);
     pump.stop();
 
@@ -227,29 +250,70 @@ async fn connect_and_run(
     result
 }
 
+/// Reads the device's security state, sends the HIP report if the gateway wants it, and
+/// returns what the gateway says about the connection (its notice), if anything.
+async fn hip_round(
+    client: &ClientInfo,
+    session: &GatewaySession,
+    pinned: Option<(String, Vec<IpAddr>)>,
+    ip: String,
+    first: bool,
+) -> Option<String> {
+    let posture = timeout(POSTURE_TIMEOUT, blocking(|| Ok(crate::posture::read())))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    if first {
+        info!(
+            "device security for the HIP report: {}",
+            crate::posture::describe(&posture)
+        );
+    }
+    let (client, session) = (client.clone(), session.clone());
+    let result = blocking(move || {
+        let http = crate::trace::transport_to(None, pinned);
+        hip_exchange(&http, &client, &session, &ip, &posture)
+    })
+    .await;
+    match result {
+        Ok(messages) => {
+            for message in &messages {
+                warn!("the gateway's HIP verdict: {message}");
+            }
+            (!messages.is_empty()).then(|| messages.join(" "))
+        }
+        Err(e) => {
+            warn!("HIP report: {e}");
+            Some(format!("the HIP report could not be sent ({e})"))
+        }
+    }
+}
+
 fn hip_exchange(
     http: &dyn Transport,
     client: &ClientInfo,
     session: &GatewaySession,
     ip: &str,
-) -> Result<(), String> {
-    let (report, md5) = hip::report(client, session, ip, &hip_time());
+    posture: &hip::Posture,
+) -> Result<Vec<String>, String> {
+    let (report, md5) = hip::report(client, session, ip, &hip_time(), posture);
     let needed = hip::parse_check(
         &http
             .send(&hip::check_request(session, ip, &md5))
             .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    if needed {
-        info!("submitting the HIP report (host information only)");
-        hip::parse_submit(
-            &http
-                .send(&hip::submit_request(session, ip, &report))
-                .map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
+    if !needed {
+        return Ok(Vec::new());
     }
-    Ok(())
+    info!("submitting the HIP report");
+    hip::parse_submit(
+        &http
+            .send(&hip::submit_request(session, ip, &report))
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -263,6 +327,7 @@ async fn transports(
     stop: &mut watch::Receiver<bool>,
     status: &StatusCell,
     addresses: &[String],
+    notice: Option<String>,
 ) -> Result<(), String> {
     let connected = |transport: &str| Status::Connected {
         profile: c.profile.clone(),
@@ -270,6 +335,7 @@ async fn transports(
         addresses: addresses.to_vec(),
         transport: transport.to_string(),
         since_unix: now_unix(),
+        notice: notice.clone(),
     };
 
     // Without an IPv6 address on the tunnel, the system's own IPv6 traffic stays out of it.

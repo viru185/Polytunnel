@@ -87,12 +87,21 @@ pub fn describe(status: &Status) -> String {
             server,
             addresses,
             transport,
+            notice,
             ..
-        } => format!(
-            "Connected to {server} ({profile}) over {}, address {}.",
-            transport.to_uppercase(),
-            addresses.join(", ")
-        ),
+        } => {
+            let connected = format!(
+                "Connected to {server} ({profile}) over {}, address {}.",
+                transport.to_uppercase(),
+                addresses.join(", ")
+            );
+            match notice {
+                Some(notice) => {
+                    format!("{connected} The server restricted the connection: {notice}")
+                }
+                None => connected,
+            }
+        }
         Status::Disconnecting { profile } => format!("Disconnecting ({profile})..."),
         Status::Failed { profile, message } => format!("Connection failed ({profile}): {message}"),
     }
@@ -456,8 +465,21 @@ mod tests {
                 addresses: vec!["10.20.30.40".into()],
                 transport: "esp".into(),
                 since_unix: 0,
+                notice: None,
             }),
             "Connected to gw.example.com (work) over ESP, address 10.20.30.40."
+        );
+        assert_eq!(
+            describe(&Status::Connected {
+                profile: "work".into(),
+                server: "gw.example.com".into(),
+                addresses: vec!["10.20.30.40".into()],
+                transport: "tls".into(),
+                since_unix: 0,
+                notice: Some("VPN Access Denied".into()),
+            }),
+            "Connected to gw.example.com (work) over TLS, address 10.20.30.40. The server \
+             restricted the connection: VPN Access Denied"
         );
     }
 }
