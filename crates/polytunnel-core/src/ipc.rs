@@ -16,7 +16,7 @@ use crate::profile::{
     normalize_server, parse_ipv4_network, valid_host,
 };
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Largest frame accepted in either direction.
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -274,6 +274,23 @@ pub enum Status {
         /// GlobalProtect gateway's HIP verdict: "VPN Access Denied ...").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notice: Option<String>,
+        /// The address the tunnel runs to (the server resolved), when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gateway: Option<String>,
+        /// Bytes received from and sent into the tunnel (IP packets) since it came up.
+        #[serde(default)]
+        bytes_in: u64,
+        #[serde(default)]
+        bytes_out: u64,
+    },
+    /// The tunnel dropped and is being brought back; the network stays set up meanwhile.
+    Reconnecting {
+        profile: String,
+        server: String,
+        /// 1 for the first try.
+        attempt: u32,
+        /// When the connection first came up (kept across reconnects).
+        since_unix: u64,
     },
     Disconnecting {
         profile: String,
@@ -281,6 +298,9 @@ pub enum Status {
     Failed {
         profile: String,
         message: String,
+        /// When it failed.
+        #[serde(default)]
+        since_unix: u64,
     },
 }
 

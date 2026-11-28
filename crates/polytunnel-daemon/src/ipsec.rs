@@ -40,7 +40,10 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 use zeroize::Zeroizing;
 
-use crate::common::{STEP_TIMEOUT, StatusCell, blocking, bring_up, now_unix, set};
+use crate::common::{
+    STEP_TIMEOUT, StatusCell, blocking, bring_up, conclude, connected_status, failed, set,
+    tunnel_ended, until_stopped,
+};
 use crate::packets::{self, Pump};
 use crate::{info, paths, warn};
 
@@ -66,12 +69,14 @@ pub async fn run(
     let mut journal = match Journal::open(paths::journal_file()) {
         Ok(j) => j,
         Err(e) => {
+            warn!("cannot open the network journal: {e}");
             set(
                 &status,
-                Status::Failed {
+                failed(
                     profile,
-                    message: format!("network journal: {e}"),
-                },
+                    "Polytunnel could not prepare the network settings. Restart the computer                      and try again."
+                        .into(),
+                ),
             );
             return;
         }
@@ -85,20 +90,11 @@ pub async fn run(
         system.as_mut(),
     )
     .await;
-    crate::killswitch::tunnel_down();
+    let held = tunnel_ended(&status, &result);
     if let Err(e) = journal.rollback(system.as_mut()) {
         warn!("could not undo every network change: {e}");
     }
-    match result {
-        Ok(()) => {
-            info!("disconnected from {}", c.server);
-            set(&status, Status::Idle {});
-        }
-        Err(message) => {
-            warn!("connection to {} failed: {message}", c.server);
-            set(&status, Status::Failed { profile, message });
-        }
-    }
+    conclude(&status, profile, &c.server, result, held);
 }
 
 fn proposals<T>(
@@ -538,8 +534,9 @@ impl Tunnel<'_> {
             .as_ref()
             .ok_or("the IPsec SA came up before the address was assigned")?;
         let config = tunnel_config(mc, IpAddr::V4(self.gateway), self.remote_network)?;
-        let device = bring_up(&self.c.profile, &config, journal, system)?;
+        let device = bring_up(&self.c.profile, &config, journal, system, self.status)?;
         let (pump, channels) = Pump::start(device, config.mtu).map_err(|e| e.to_string())?;
+        self.status.set_counters(pump.counters());
         self.from_system = Some(channels.from_system);
         self.to_system = Some(channels.to_system);
         self.pump = Some(pump);
@@ -549,18 +546,19 @@ impl Tunnel<'_> {
         };
         set(
             self.status,
-            Status::Connected {
-                profile: self.c.profile.clone(),
-                server: self.c.server.clone(),
-                addresses: config
+            connected_status(
+                self.status,
+                &self.c.profile,
+                &self.c.server,
+                Some(self.gateway.to_string()),
+                config
                     .addresses
                     .iter()
                     .map(|a| a.addr().to_string())
                     .collect(),
-                transport: transport.into(),
-                since_unix: now_unix(),
-                notice: None,
-            },
+                transport,
+                None,
+            ),
         );
         info!("connected to {} over IPsec", self.c.server);
         Ok(())
@@ -622,11 +620,20 @@ async fn connect_and_run(
         c.ike_version,
         if over_tcp { "TCP" } else { "UDP" }
     );
-    let gateway = resolve(&c.server).await?;
-    let (link, local) = if over_tcp {
-        Link::tcp(gateway, c.tcp_port).await?
-    } else {
-        Link::udp(gateway).await?
+    let gateway = match until_stopped(stop, resolve(&c.server)).await {
+        Some(gateway) => gateway?,
+        None => return Ok(()),
+    };
+    let link = async {
+        if over_tcp {
+            Link::tcp(gateway, c.tcp_port).await
+        } else {
+            Link::udp(gateway).await
+        }
+    };
+    let (link, local) = match until_stopped(stop, link).await {
+        Some(link) => link?,
+        None => return Ok(()),
     };
     let remote = SocketAddr::new(
         IpAddr::V4(gateway),

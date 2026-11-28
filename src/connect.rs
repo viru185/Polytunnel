@@ -75,6 +75,17 @@ pub fn status() -> Result<Status, String> {
     }
 }
 
+/// How a transport is named to people: `esp` → "ESP", `esp-tcp` → "ESP over TCP", and the
+/// Fortinet SSL tunnel (PPP inside TLS) → "TLS".
+pub fn transport_name(transport: &str) -> String {
+    match transport {
+        "esp" => "ESP".into(),
+        "esp-tcp" => "ESP over TCP".into(),
+        "tls" | "ppp" => "TLS".into(),
+        other => other.to_uppercase(),
+    }
+}
+
 pub fn describe(status: &Status) -> String {
     match status {
         Status::Idle {} => "Not connected.".into(),
@@ -92,7 +103,7 @@ pub fn describe(status: &Status) -> String {
         } => {
             let connected = format!(
                 "Connected to {server} ({profile}) over {}, address {}.",
-                transport.to_uppercase(),
+                transport_name(transport),
                 addresses.join(", ")
             );
             match notice {
@@ -102,8 +113,18 @@ pub fn describe(status: &Status) -> String {
                 None => connected,
             }
         }
+        Status::Reconnecting {
+            profile,
+            server,
+            attempt,
+            ..
+        } => format!(
+            "The connection to {server} ({profile}) dropped; reconnecting (try {attempt})..."
+        ),
         Status::Disconnecting { profile } => format!("Disconnecting ({profile})..."),
-        Status::Failed { profile, message } => format!("Connection failed ({profile}): {message}"),
+        Status::Failed {
+            profile, message, ..
+        } => format!("Connection failed ({profile}): {message}"),
     }
 }
 
@@ -466,6 +487,9 @@ mod tests {
                 transport: "esp".into(),
                 since_unix: 0,
                 notice: None,
+                gateway: None,
+                bytes_in: 0,
+                bytes_out: 0,
             }),
             "Connected to gw.example.com (work) over ESP, address 10.20.30.40."
         );
@@ -474,12 +498,25 @@ mod tests {
                 profile: "work".into(),
                 server: "gw.example.com".into(),
                 addresses: vec!["10.20.30.40".into()],
-                transport: "tls".into(),
+                transport: "ppp".into(),
                 since_unix: 0,
                 notice: Some("VPN Access Denied".into()),
+                gateway: None,
+                bytes_in: 0,
+                bytes_out: 0,
             }),
             "Connected to gw.example.com (work) over TLS, address 10.20.30.40. The server \
              restricted the connection: VPN Access Denied"
+        );
+        assert_eq!(transport_name("esp-tcp"), "ESP over TCP");
+        assert!(
+            describe(&Status::Reconnecting {
+                profile: "work".into(),
+                server: "gw.example.com".into(),
+                attempt: 2,
+                since_unix: 0,
+            })
+            .contains("reconnecting (try 2)")
         );
     }
 }

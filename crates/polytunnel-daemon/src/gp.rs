@@ -25,7 +25,8 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 
 use crate::common::{
-    Ended, STEP_TIMEOUT, StatusCell, blocking, bring_up, host_port, now_unix, set,
+    Ended, STEP_TIMEOUT, StatusCell, blocking, bring_up, conclude, connected_status, failed,
+    host_port, now_unix, set, tunnel_ended, until_stopped,
 };
 use crate::packets::{self, Channels, Pump};
 use crate::{info, paths, warn};
@@ -39,6 +40,8 @@ const TLS_RECONNECTS: usize = 3;
 const HIP_RECHECK: Duration = Duration::from_secs(3600);
 /// Reading the device's security state from Windows must not hold up the connection.
 const POSTURE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Logging out of a gateway that no longer answers must not hold up the disconnect.
+const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The ESP probe is an ICMP echo to the gateway's `gw-address` that the gateway only answers
 /// with this payload ("monitor", two zero bytes, "pan ha "), sent with this identifier, as
 /// openconnect documents.
@@ -118,31 +121,24 @@ pub async fn run(c: GpConnect, status: StatusCell, mut stop: watch::Receiver<boo
     let mut journal = match Journal::open(paths::journal_file()) {
         Ok(j) => j,
         Err(e) => {
+            warn!("cannot open the network journal: {e}");
             set(
                 &status,
-                Status::Failed {
+                failed(
                     profile,
-                    message: format!("network journal: {e}"),
-                },
+                    "Polytunnel could not prepare the network settings. Restart the computer                      and try again."
+                        .into(),
+                ),
             );
             return;
         }
     };
     let result = connect_and_run(&c, &status, &mut stop, &mut journal, system.as_mut()).await;
-    crate::killswitch::tunnel_down();
+    let held = tunnel_ended(&status, &result);
     if let Err(e) = journal.rollback(system.as_mut()) {
         warn!("could not undo every network change: {e}");
     }
-    match result {
-        Ok(()) => {
-            info!("disconnected from {}", c.gateway);
-            set(&status, Status::Idle {});
-        }
-        Err(message) => {
-            warn!("connection to {} failed: {message}", c.gateway);
-            set(&status, Status::Failed { profile, message });
-        }
-    }
+    conclude(&status, profile, &c.gateway, result, held);
 }
 
 async fn connect_and_run(
@@ -170,29 +166,39 @@ async fn connect_and_run(
 
     let settings = {
         let (client, session, pinned) = (client.clone(), session.clone(), pinned.clone());
-        blocking(move || {
+        let step = blocking(move || {
             let response = crate::trace::transport_to(None, pinned)
                 .send(&tunnel::getconfig_request(&client, &session))
                 .map_err(|e| e.to_string())?;
             tunnel::parse_getconfig(&response).map_err(|e| e.to_string())
-        })
-        .await?
+        });
+        match until_stopped(stop, step).await {
+            Some(settings) => settings?,
+            None => return Ok(()),
+        }
     };
 
     // HIP comes before any network change, as in openconnect: many gateways pass no traffic
     // until they have it.
     let notice = match settings.address_v4 {
-        Some((ip, _)) => hip_round(&client, &session, pinned.clone(), ip.to_string(), true).await,
+        Some((ip, _)) => {
+            let step = hip_round(&client, &session, pinned.clone(), ip.to_string(), true);
+            match until_stopped(stop, step).await {
+                Some(notice) => notice,
+                None => return Ok(()),
+            }
+        }
         None => None,
     };
 
     let mut servers = gateway_ips.clone();
     servers.extend(settings.gateway_address);
     let config = tunnel_config(&settings, servers.clone());
-    let device = bring_up(&c.profile, &config, journal, system)?;
+    let device = bring_up(&c.profile, &config, journal, system, status)?;
 
     let (pump, mut channels) =
         Pump::start(device.clone(), config.mtu).map_err(|e| e.to_string())?;
+    status.set_counters(pump.counters());
     // The report is sent again every hour; the gateway's verdict updates the status.
     let recheck = settings.address_v4.map(|(ip, _)| {
         let (client, session, pinned, status) = (
@@ -208,10 +214,11 @@ async fn connect_and_run(
                 every.tick().await;
                 let notice =
                     hip_round(&client, &session, pinned.clone(), ip.to_string(), false).await;
-                let mut current = status.lock().unwrap_or_else(|e| e.into_inner());
-                if let Status::Connected { notice: shown, .. } = &mut *current {
-                    *shown = notice;
-                }
+                status.update(|current| {
+                    if let Status::Connected { notice: shown, .. } = current {
+                        *shown = notice;
+                    }
+                });
             }
         })
     });
@@ -240,13 +247,15 @@ async fn connect_and_run(
     pump.stop();
 
     let (client, session) = (client.clone(), session.clone());
-    let _ = blocking(move || {
+    let logout = blocking(move || {
         crate::trace::transport_to(None, pinned)
             .send(&tunnel::logout_request(&client, &session))
             .map(|_| ())
             .map_err(|e| e.to_string())
-    })
-    .await;
+    });
+    if timeout(LOGOUT_TIMEOUT, logout).await.is_err() {
+        info!("the gateway did not answer the logout; disconnecting anyway");
+    }
     result
 }
 
@@ -283,9 +292,11 @@ async fn hip_round(
             }
             (!messages.is_empty()).then(|| messages.join(" "))
         }
+        // Not the gateway's verdict: only logged, so the window does not claim the server
+        // restricted anything.
         Err(e) => {
-            warn!("HIP report: {e}");
-            Some(format!("the HIP report could not be sent ({e})"))
+            warn!("the HIP report could not be sent: {e}");
+            None
         }
     }
 }
@@ -329,13 +340,17 @@ async fn transports(
     addresses: &[String],
     notice: Option<String>,
 ) -> Result<(), String> {
-    let connected = |transport: &str| Status::Connected {
-        profile: c.profile.clone(),
-        server: host.to_string(),
-        addresses: addresses.to_vec(),
-        transport: transport.to_string(),
-        since_unix: now_unix(),
-        notice: notice.clone(),
+    // A reconnect keeps when the connection first came up and the gateway's latest verdict.
+    let connected = |transport: &str| {
+        connected_status(
+            status,
+            &c.profile,
+            host,
+            Some(gateway_addr.ip().to_string()),
+            addresses.to_vec(),
+            transport,
+            notice.clone(),
+        )
     };
 
     // Without an IPv6 address on the tunnel, the system's own IPv6 traffic stays out of it.

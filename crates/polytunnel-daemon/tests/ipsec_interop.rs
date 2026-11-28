@@ -10,7 +10,7 @@
 //! name filter for the responder at hand.
 
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+
 use std::time::{Duration, Instant};
 
 use polytunnel_core::Secret;
@@ -18,6 +18,7 @@ use polytunnel_core::ipc::{IpsecConnect, Status, XauthLogin};
 use polytunnel_core::profile::{
     EapMethodName, IpsecTransport, LocalIdType, ModeConfigStyle, ServerAuthStyle,
 };
+use polytunnel_daemon::common::StatusCell;
 use polytunnel_daemon::ipsec;
 use tokio::sync::{mpsc, watch};
 
@@ -95,7 +96,7 @@ fn ikev2_eap(password: String) -> IpsecConnect {
 /// A running connection in the daemon's IPsec engine.
 struct Connection {
     runtime: tokio::runtime::Runtime,
-    status: Arc<Mutex<Status>>,
+    status: StatusCell,
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
     _answers: mpsc::Sender<ipsec::Answer>,
@@ -104,9 +105,10 @@ struct Connection {
 impl Connection {
     fn start(request: IpsecConnect) -> Self {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let status = Arc::new(Mutex::new(Status::Connecting {
+        let status = StatusCell::new().next_run();
+        status.force(Status::Connecting {
             profile: "interop".into(),
-        }));
+        });
         let (stop, stop_rx) = watch::channel(false);
         let (answers, answers_rx) = mpsc::channel(1);
         let task = runtime.spawn(ipsec::run(request, status.clone(), stop_rx, answers_rx));
@@ -120,7 +122,7 @@ impl Connection {
     }
 
     fn status(&self) -> Status {
-        self.status.lock().unwrap().clone()
+        self.status.get()
     }
 
     /// Waits until connected or failed.
@@ -149,7 +151,7 @@ impl Connection {
             .block_on(async { tokio::time::timeout(Duration::from_secs(20), task).await })
             .expect("the engine stops")
             .unwrap();
-        status.lock().unwrap().clone()
+        status.get()
     }
 }
 

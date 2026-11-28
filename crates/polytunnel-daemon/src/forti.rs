@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use polytunnel_core::Secret;
 use polytunnel_core::http::{CookieJar, Transport};
-use polytunnel_core::ipc::{FortiConnect, Status};
+use polytunnel_core::ipc::FortiConnect;
 use polytunnel_core::pin::CertFingerprint;
 use polytunnel_forti::ppp::{Event, IpConfig, Ppp};
 use polytunnel_forti::tunnel::{self, TunnelSettings, frame};
@@ -25,7 +25,8 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 
 use crate::common::{
-    Ended, STEP_TIMEOUT, StatusCell, blocking, bring_up, host_port, now_unix, set,
+    Ended, STEP_TIMEOUT, StatusCell, blocking, bring_up, conclude, connected_status, failed,
+    host_port, now_unix, set, tunnel_ended, until_stopped,
 };
 use crate::packets::{Channels, Pump};
 use crate::{info, paths, warn};
@@ -34,6 +35,8 @@ const ECHO_INTERVAL: Duration = Duration::from_secs(10);
 const DEAD_AFTER: Duration = Duration::from_secs(60);
 const RETRANSMIT: Duration = Duration::from_secs(3);
 const MRU: u16 = 1354;
+/// Logging out of a server that no longer answers must not hold up the disconnect.
+const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Runs one Fortinet connection until it is stopped or fails. Always cleans up.
 pub async fn run(c: FortiConnect, status: StatusCell, mut stop: watch::Receiver<bool>) {
@@ -42,12 +45,14 @@ pub async fn run(c: FortiConnect, status: StatusCell, mut stop: watch::Receiver<
     let mut journal = match Journal::open(paths::journal_file()) {
         Ok(j) => j,
         Err(e) => {
+            warn!("cannot open the network journal: {e}");
             set(
                 &status,
-                Status::Failed {
+                failed(
                     profile,
-                    message: format!("network journal: {e}"),
-                },
+                    "Polytunnel could not prepare the network settings. Restart the computer                      and try again."
+                        .into(),
+                ),
             );
             return;
         }
@@ -63,28 +68,21 @@ pub async fn run(c: FortiConnect, status: StatusCell, mut stop: watch::Receiver<
         system.as_mut(),
     )
     .await;
-    crate::killswitch::tunnel_down();
+    let held = tunnel_ended(&status, &result);
     if let Err(e) = journal.rollback(system.as_mut()) {
         warn!("could not undo every network change: {e}");
     }
     let (server, pin) = (c.server.clone(), c.server_cert);
-    let _ = blocking(move || {
+    let logout = blocking(move || {
         crate::trace::transport(pin)
             .send(&tunnel::logout_request(&server, &cookies))
             .map(|_| ())
             .map_err(|e| e.to_string())
-    })
-    .await;
-    match result {
-        Ok(()) => {
-            info!("disconnected from {}", c.server);
-            set(&status, Status::Idle {});
-        }
-        Err(message) => {
-            warn!("connection to {} failed: {message}", c.server);
-            set(&status, Status::Failed { profile, message });
-        }
+    });
+    if timeout(LOGOUT_TIMEOUT, logout).await.is_err() {
+        info!("the server did not answer the logout; disconnecting anyway");
     }
+    conclude(&status, profile, &c.server, result, held);
 }
 
 /// The network plan input from the XML configuration and the PPP result.
@@ -124,7 +122,7 @@ async fn connect_and_run(
     info!("connecting to {}", c.server);
     let settings = {
         let (server, sent, pin) = (c.server.clone(), cookies.clone(), c.server_cert);
-        let (settings, refreshed) = blocking(move || {
+        let step = blocking(move || {
             let response = crate::trace::transport(pin)
                 .send(&tunnel::config_request(&server, &sent))
                 .map_err(|e| e.to_string())?;
@@ -133,8 +131,11 @@ async fn connect_and_run(
             jar.update(&response);
             let settings = tunnel::parse_config(&response).map_err(|e| e.to_string())?;
             Ok::<_, String>((settings, Secret::new(jar.header())))
-        })
-        .await?;
+        });
+        let (settings, refreshed) = match until_stopped(stop, step).await {
+            Some(result) => result?,
+            None => return Ok(()),
+        };
         *cookies = refreshed;
         settings
     };
@@ -150,7 +151,15 @@ async fn connect_and_run(
         return Err("the server has no address".into());
     }
 
-    let stream = open_tunnel(&host, port, &addrs, cookies, c.server_cert.as_ref()).await?;
+    let stream = match until_stopped(
+        stop,
+        open_tunnel(&host, port, &addrs, cookies, c.server_cert.as_ref()),
+    )
+    .await
+    {
+        Some(stream) => stream?,
+        None => return Ok(()),
+    };
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut decoder = frame::Decoder::default();
     let magic = {
@@ -165,23 +174,33 @@ async fn connect_and_run(
         settings.address,
         settings.dns_servers.is_empty(),
     );
-    let ip = negotiate(&mut ppp, &mut reader, &mut writer, &mut decoder).await?;
+    let ip = match until_stopped(
+        stop,
+        negotiate(&mut ppp, &mut reader, &mut writer, &mut decoder),
+    )
+    .await
+    {
+        Some(ip) => ip?,
+        None => return Ok(()),
+    };
     info!("PPP is up with address {}", ip.address);
 
     let config = tunnel_config(&settings, &ip, addrs.iter().map(SocketAddr::ip).collect());
-    let device = bring_up(&c.profile, &config, journal, system)?;
+    let device = bring_up(&c.profile, &config, journal, system, status)?;
     let (pump, mut channels) =
         Pump::start(device.clone(), config.mtu).map_err(|e| e.to_string())?;
+    status.set_counters(pump.counters());
     set(
         status,
-        Status::Connected {
-            profile: c.profile.clone(),
-            server: host.clone(),
-            addresses: vec![ip.address.to_string()],
-            transport: "ppp".into(),
-            since_unix: now_unix(),
-            notice: None,
-        },
+        connected_status(
+            status,
+            &c.profile,
+            &host,
+            None,
+            vec![ip.address.to_string()],
+            "ppp",
+            None,
+        ),
     );
     let ended = ppp_loop(&mut ppp, reader, &mut writer, decoder, &mut channels, stop).await;
     let _ = writer.write_all(&frame::encode(&ppp.terminate())).await;
