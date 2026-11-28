@@ -67,6 +67,18 @@ pub fn request(request: &Request) -> Result<Response, String> {
     ipc::read_frame(&mut reader).map_err(io)
 }
 
+/// What a failed exchange with the service means for people, in one short sentence.
+pub fn service_problem(error: &str) -> String {
+    if error.contains("protocol version") {
+        "Polytunnel was updated. Quit it from the tray and open it again.".into()
+    } else if error.contains("cannot reach the Polytunnel service") {
+        "The Polytunnel service isn't running. Restart the computer, or reinstall Polytunnel."
+            .into()
+    } else {
+        "Polytunnel can't talk to its service right now.".into()
+    }
+}
+
 pub fn status() -> Result<Status, String> {
     match request(&Request::Status {})? {
         Response::Status { status } => Ok(status),

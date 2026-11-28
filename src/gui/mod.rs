@@ -32,6 +32,8 @@ pub fn run_window() -> i32 {
     let instance = match instance::claim(Role::Gui) {
         Ok(Some(instance)) => Some(instance),
         Ok(None) => {
+            // The window is open already; the tray may have been quit since.
+            agent::ensure_running();
             return match instance::send(Role::Gui, Message::Show) {
                 Ok(()) => 0,
                 Err(e) => {
@@ -431,6 +433,7 @@ impl App {
         while let Ok(message) = self.ipc_rx.try_recv() {
             match message {
                 Message::Show => {
+                    agent::ensure_running();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);

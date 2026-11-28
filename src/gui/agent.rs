@@ -4,7 +4,7 @@
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use polytunnel_core::ipc::Status;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
@@ -19,6 +19,16 @@ use crate::instance::{self, Instance, Message, Role};
 
 const TITLE: &str = "Polytunnel";
 const ICON_SIZE: usize = 32;
+/// Windows cuts tray tooltips at 127 characters.
+const TOOLTIP_MAX: usize = 127;
+/// Clicks closer together than this open the window once (a double-click is two clicks).
+const CLICK_DEBOUNCE: Duration = Duration::from_millis(700);
+/// Status polls: often while the service answers, less often while it does not.
+const POLL: Duration = Duration::from_secs(3);
+const POLL_UNREACHABLE: Duration = Duration::from_secs(10);
+/// An update that started installing but did not close Polytunnel is given up on after this.
+#[cfg_attr(windows, allow(dead_code))]
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug)]
 enum UserEvent {
@@ -30,12 +40,20 @@ enum UserEvent {
     UpdateChecked(Result<Option<String>, String>),
     /// An installation was started (or could not be).
     UpdateStarted(Result<String, String>),
+    /// An installation never closed Polytunnel: offer the check again.
+    #[cfg_attr(windows, allow(dead_code))]
+    UpdateTimedOut,
 }
 
-/// Asks the service whether a newer release exists.
+/// Asks the service whether a newer release exists. The service answers a failed check
+/// without a version (and says why), which is not "up to date".
 fn check_for_update() -> Result<Option<String>, String> {
-    let (current, latest, _, _) = connect::update(false)?;
-    Ok(latest.filter(|l| polytunnel_core::is_newer_version(l, &current)))
+    let (current, latest, _, message) = connect::update(false)?;
+    match latest {
+        Some(latest) => Ok(polytunnel_core::is_newer_version(&latest, &current).then_some(latest)),
+        None if message.is_empty() => Err("no answer".into()),
+        None => Err(message),
+    }
 }
 
 type Proxy = Arc<Mutex<EventLoopProxy<UserEvent>>>;
@@ -46,14 +64,11 @@ fn forward(proxy: &Proxy, event: UserEvent) {
     }
 }
 
-/// Starts the tray agent in the background unless it already runs.
-pub fn ensure_running() {
-    if instance::is_running(Role::Agent) {
-        return;
-    }
-    if let Ok(exe) = std::env::current_exe() {
+/// Starts `polytunnelw` (or this program) with `args`, without a console window.
+fn spawn_gui(args: &[&str]) {
+    if let Some(exe) = crate::paths::gui_program() {
         let mut command = Command::new(exe);
-        command.arg("tray");
+        command.args(args);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -64,13 +79,97 @@ pub fn ensure_running() {
     }
 }
 
-/// The icon with a status dot: green when connected, grey otherwise.
-fn icon(connected: bool) -> Icon {
+/// Starts the tray agent in the background unless it already runs.
+pub fn ensure_running() {
+    if !instance::is_running(Role::Agent) {
+        spawn_gui(&["tray"]);
+    }
+}
+
+/// After an update starts installing: opens the tray again from the new files once the
+/// installer is done. The installer replaces this program, so it waits in `cmd`, not here.
+#[cfg(windows)]
+pub fn reopen_after_update() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let Some(gui) = crate::paths::gui_program() else {
+        return;
+    };
+    let mut command = Command::new("cmd");
+    command.raw_arg(format!(
+        "/c ping -n 91 127.0.0.1 >nul & start \"\" \"{}\" tray",
+        gui.display()
+    ));
+    command.creation_flags(CREATE_NO_WINDOW);
+    let _ = command.spawn();
+}
+
+/// What the icon shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Look {
+    /// Grey: not connected.
+    Idle,
+    /// Amber: connecting, reconnecting, waiting for sign-in, or connected with limits.
+    Busy,
+    /// Green: connected.
+    Connected,
+    /// Red: the connection failed, or the service cannot be reached.
+    Problem,
+}
+
+fn look(status: &Result<Status, String>) -> Look {
+    match status {
+        Ok(Status::Idle {}) => Look::Idle,
+        Ok(Status::Connected { notice: None, .. }) => Look::Connected,
+        Ok(
+            Status::Connected { .. }
+            | Status::Connecting { .. }
+            | Status::NeedsInput { .. }
+            | Status::Reconnecting { .. }
+            | Status::Disconnecting { .. },
+        ) => Look::Busy,
+        Ok(Status::Failed { .. }) | Err(_) => Look::Problem,
+    }
+}
+
+/// Is a connection on or on its way (so Disconnect and Quit have something to stop)?
+fn active(status: &Result<Status, String>) -> bool {
+    matches!(
+        status,
+        Ok(Status::Connected { .. }
+            | Status::Connecting { .. }
+            | Status::NeedsInput { .. }
+            | Status::Reconnecting { .. })
+    )
+}
+
+/// The menu's status line.
+fn status_text(status: &Result<Status, String>) -> String {
+    match status {
+        Ok(s) => connect::describe(s),
+        Err(e) => connect::service_problem(e),
+    }
+}
+
+/// `Polytunnel: <text>`, cut to what Windows shows.
+fn tooltip(text: &str) -> String {
+    let full = format!("{TITLE}: {text}");
+    if full.chars().count() <= TOOLTIP_MAX {
+        return full;
+    }
+    let mut cut: String = full.chars().take(TOOLTIP_MAX - 1).collect();
+    cut.push('…');
+    cut
+}
+
+/// The icon with a status dot in the colour of `look`.
+fn icon(look: Look) -> Icon {
     let mut rgba = include_bytes!(concat!(env!("OUT_DIR"), "/icon32.rgba")).to_vec();
-    let color: [u8; 3] = if connected {
-        [34, 197, 94]
-    } else {
-        [148, 163, 184]
+    let color: [u8; 3] = match look {
+        Look::Idle => [148, 163, 184],
+        Look::Busy => [245, 158, 11],
+        Look::Connected => [34, 197, 94],
+        Look::Problem => [239, 68, 68],
     };
     let (cx, cy, r) = (25.0f32, 25.0f32, 6.5f32);
     for y in 0..ICON_SIZE {
@@ -98,6 +197,8 @@ pub fn run() -> i32 {
             return 1;
         }
     };
+    // A sign-in entry left by an older version starts this one from now on.
+    crate::autostart::refresh();
 
     #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut builder = EventLoop::<UserEvent>::with_user_event();
@@ -145,22 +246,30 @@ pub fn run() -> i32 {
         .name("tray-status".into())
         .spawn(move || {
             loop {
-                forward(&p, UserEvent::Status(connect::status()));
-                thread::sleep(Duration::from_secs(3));
+                let status = connect::status();
+                let wait = if status.is_ok() {
+                    POLL
+                } else {
+                    POLL_UNREACHABLE
+                };
+                forward(&p, UserEvent::Status(status));
+                thread::sleep(wait);
             }
         })
         .ok();
 
     let mut agent = Agent {
         tray: None,
-        status_item: MenuItem::new("Not connected", false, None),
+        status_item: MenuItem::new("Checking…", false, None),
         disconnect_item: MenuItem::with_id(MenuId::new("disconnect"), "Disconnect", false, None),
         update_item: MenuItem::with_id(MenuId::new("update"), "Check for updates", true, None),
         available: None,
         proxy: proxy.clone(),
         open_id: MenuId::new("open"),
         quit_id: MenuId::new("quit"),
-        connected: None,
+        look: None,
+        active: false,
+        last_open: None,
         _instance: instance,
     };
     match event_loop.run_app(&mut agent) {
@@ -182,7 +291,10 @@ struct Agent {
     proxy: Proxy,
     open_id: MenuId,
     quit_id: MenuId,
-    connected: Option<bool>,
+    look: Option<Look>,
+    /// A connection is on or on its way.
+    active: bool,
+    last_open: Option<Instant>,
     _instance: Instance,
 }
 
@@ -190,7 +302,7 @@ impl Agent {
     fn init(&mut self) {
         let menu = Menu::new();
         let open = MenuItem::with_id(self.open_id.clone(), "Open Polytunnel", true, None);
-        let quit = MenuItem::with_id(self.quit_id.clone(), "Quit", true, None);
+        let quit = MenuItem::with_id(self.quit_id.clone(), "Quit Polytunnel", true, None);
         let _ = menu.append_items(&[
             &self.status_item,
             &PredefinedMenuItem::separator(),
@@ -203,7 +315,7 @@ impl Agent {
         match TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip(TITLE)
-            .with_icon(icon(false))
+            .with_icon(icon(Look::Idle))
             .with_menu_on_left_click(false)
             .build()
         {
@@ -213,24 +325,18 @@ impl Agent {
     }
 
     fn update(&mut self, status: Result<Status, String>) {
-        let text = match &status {
-            Ok(s) => connect::describe(s),
-            Err(_) => "The Polytunnel service is not running".to_string(),
-        };
-        let connected = matches!(status, Ok(Status::Connected { .. }));
-        let active = matches!(
-            status,
-            Ok(Status::Connected { .. } | Status::Connecting { .. } | Status::NeedsInput { .. })
-        );
+        let text = status_text(&status);
+        let look = look(&status);
+        self.active = active(&status);
         self.status_item.set_text(&text);
-        self.disconnect_item.set_enabled(active);
+        self.disconnect_item.set_enabled(self.active);
         if let Some(tray) = &self.tray {
-            let _ = tray.set_tooltip(Some(format!("{TITLE}: {text}")));
-            if self.connected != Some(connected) {
-                let _ = tray.set_icon(Some(icon(connected)));
+            let _ = tray.set_tooltip(Some(tooltip(&text)));
+            if self.look != Some(look) {
+                let _ = tray.set_icon(Some(icon(look)));
             }
         }
-        self.connected = Some(connected);
+        self.look = Some(look);
     }
 
     /// Checks for an update, or installs the one found.
@@ -256,12 +362,28 @@ impl Agent {
         });
     }
 
-    fn open_window(&self) {
-        if instance::send(Role::Gui, Message::Show).is_err()
-            && let Ok(exe) = std::env::current_exe()
+    fn open_window(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_open
+            .is_some_and(|last| now.duration_since(last) < CLICK_DEBOUNCE)
         {
-            let _ = Command::new(exe).spawn();
+            return;
         }
+        self.last_open = Some(now);
+        if instance::send(Role::Gui, Message::Show).is_err() {
+            spawn_gui(&[]);
+        }
+    }
+
+    /// Quit: ends the connection, closes the window and removes the icon, so nothing keeps
+    /// running unseen.
+    fn quit(&mut self, event_loop: &ActiveEventLoop) {
+        if self.active {
+            let _ = connect::disconnect();
+        }
+        let _ = instance::send(Role::Gui, Message::Quit);
+        event_loop.exit();
     }
 }
 
@@ -284,8 +406,11 @@ impl ApplicationHandler<UserEvent> for Agent {
                 ..
             }) => self.open_window(),
             UserEvent::Tray(_) => {}
-            UserEvent::Menu(e) if e.id == self.quit_id => event_loop.exit(),
-            UserEvent::Menu(e) if e.id == self.open_id => self.open_window(),
+            UserEvent::Menu(e) if e.id == self.quit_id => self.quit(event_loop),
+            UserEvent::Menu(e) if e.id == self.open_id => {
+                self.last_open = None;
+                self.open_window();
+            }
             UserEvent::Menu(e) if e.id == *self.disconnect_item.id() => {
                 let _ = connect::disconnect();
             }
@@ -294,6 +419,12 @@ impl ApplicationHandler<UserEvent> for Agent {
             UserEvent::UpdateChecked(result) => {
                 self.update_item.set_enabled(true);
                 match result {
+                    // Linux packages update through the system's package manager.
+                    Ok(Some(version)) if cfg!(target_os = "linux") => {
+                        self.update_item
+                            .set_text(format!("Polytunnel {version} is available"));
+                        self.update_item.set_enabled(false);
+                    }
                     Ok(Some(version)) => {
                         self.update_item
                             .set_text(format!("Install Polytunnel {version}"));
@@ -303,16 +434,40 @@ impl ApplicationHandler<UserEvent> for Agent {
                     Err(_) => self.update_item.set_text("Could not check for updates"),
                 }
             }
-            UserEvent::UpdateStarted(result) => {
+            UserEvent::UpdateStarted(Ok(_)) => {
                 self.available = None;
-                self.update_item.set_enabled(result.is_err());
-                self.update_item.set_text(match result {
-                    Ok(_) => "Installing the update...",
-                    Err(_) => "The update could not start",
-                });
+                // The installer replaces Polytunnel's files: close the window and the icon,
+                // and come back once it is done.
+                #[cfg(windows)]
+                {
+                    reopen_after_update();
+                    let _ = instance::send(Role::Gui, Message::Quit);
+                    event_loop.exit();
+                }
+                #[cfg(not(windows))]
+                {
+                    self.update_item.set_text("Installing the update…");
+                    let p = self.proxy.clone();
+                    thread::spawn(move || {
+                        thread::sleep(INSTALL_TIMEOUT);
+                        forward(&p, UserEvent::UpdateTimedOut);
+                    });
+                }
             }
-            UserEvent::Ipc(Message::Quit) => event_loop.exit(),
-            UserEvent::Ipc(Message::Show) => self.open_window(),
+            UserEvent::UpdateStarted(Err(_)) => {
+                self.available = None;
+                self.update_item.set_enabled(true);
+                self.update_item.set_text("The update could not start");
+            }
+            UserEvent::UpdateTimedOut => {
+                self.update_item.set_enabled(true);
+                self.update_item.set_text("Check for updates");
+            }
+            UserEvent::Ipc(Message::Quit) => self.quit(event_loop),
+            UserEvent::Ipc(Message::Show) => {
+                self.last_open = None;
+                self.open_window();
+            }
             UserEvent::Status(status) => self.update(status),
         }
     }
@@ -324,8 +479,55 @@ mod tests {
 
     #[test]
     fn status_icons_differ() {
-        // Building icons must not panic, and the dot must change the pixels.
-        let _ = icon(true);
-        let _ = icon(false);
+        // Building icons must not panic.
+        for look in [Look::Idle, Look::Busy, Look::Connected, Look::Problem] {
+            let _ = icon(look);
+        }
+    }
+
+    #[test]
+    fn the_icon_and_menu_follow_the_status() {
+        let connected = Status::Connected {
+            profile: "work".into(),
+            server: "gw.example.com".into(),
+            addresses: vec!["10.0.0.2".into()],
+            transport: "esp".into(),
+            since_unix: 0,
+            notice: None,
+            gateway: None,
+            bytes_in: 0,
+            bytes_out: 0,
+        };
+        assert_eq!(look(&Ok(connected.clone())), Look::Connected);
+        assert!(active(&Ok(connected.clone())));
+        let mut restricted = connected;
+        if let Status::Connected { notice, .. } = &mut restricted {
+            *notice = Some("VPN Access Denied".into());
+        }
+        assert_eq!(look(&Ok(restricted)), Look::Busy);
+        assert_eq!(look(&Ok(Status::Idle {})), Look::Idle);
+        assert!(!active(&Ok(Status::Idle {})));
+        let failed = Status::Failed {
+            profile: "work".into(),
+            message: "no answer".into(),
+            since_unix: 0,
+        };
+        assert_eq!(look(&Ok(failed.clone())), Look::Problem);
+        assert!(!active(&Ok(failed)));
+        let down: Result<Status, String> =
+            Err("cannot reach the Polytunnel service (os error 2)".into());
+        assert_eq!(look(&down), Look::Problem);
+        assert!(status_text(&down).contains("isn't running"));
+        let old: Result<Status, String> =
+            Err("protocol version 1 is not supported (the service speaks 2)".into());
+        assert!(status_text(&old).contains("was updated"));
+    }
+
+    #[test]
+    fn tooltips_fit_windows() {
+        assert_eq!(tooltip("Not connected."), "Polytunnel: Not connected.");
+        let long = tooltip(&"x".repeat(300));
+        assert_eq!(long.chars().count(), TOOLTIP_MAX);
+        assert!(long.ends_with('…'));
     }
 }

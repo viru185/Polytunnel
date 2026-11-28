@@ -18,7 +18,7 @@ as light as possible.
   checks). It never runs commands, scripts or paths supplied by a client.
 - **`polytunnel`** runs as the user. By default it is a tray agent with no graphics context
   (a few MB). It does all authentication and keeps secrets in the OS keyring.
-- **`polytunnel --window`** is a separate process started on demand that fully exits when the
+- **`polytunnel window`** is a separate process started on demand that fully exits when the
   window closes, so the GPU driver's memory is returned.
 - Prompts that arise inside the daemon (XAuth, one-time codes, EAP) are relayed to the user
   side over the same IPC channel.

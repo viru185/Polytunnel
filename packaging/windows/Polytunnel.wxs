@@ -37,6 +37,11 @@
         <File Id="PolytunnelExe" Source="$(var.BinDir)/polytunnel.exe" KeyPath="yes" />
       </Component>
 
+      <!-- The window and tray without a console window (Start menu, sign-in, tray). -->
+      <Component Id="AppWindowed" Directory="INSTALLFOLDER">
+        <File Id="PolytunnelwExe" Source="$(var.BinDir)/polytunnelw.exe" KeyPath="yes" />
+      </Component>
+
       <Component Id="Daemon" Directory="INSTALLFOLDER">
         <File Id="DaemonExe" Source="$(var.BinDir)/polytunnel-daemon.exe" KeyPath="yes" />
         <ServiceInstall Id="PolytunnelService"
@@ -79,7 +84,7 @@
         <Shortcut Id="StartMenuShortcut"
                   Name="Polytunnel"
                   Description="Lightweight VPN client for GlobalProtect and Fortinet"
-                  Target="[INSTALLFOLDER]polytunnel.exe"
+                  Target="[INSTALLFOLDER]polytunnelw.exe"
                   WorkingDirectory="INSTALLFOLDER"
                   Icon="PolytunnelIcon" />
         <RegistryValue Root="HKLM" Key="Software\Polytunnel" Name="StartMenuShortcut"
