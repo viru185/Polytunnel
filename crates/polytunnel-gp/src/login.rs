@@ -65,6 +65,7 @@ pub fn request(base: &str, client: &ClientInfo, username: &str, auth: &GatewayAu
         ("jnlpReady", "jnlpReady".to_string()),
         ("ok", "Login".to_string()),
         ("direct", "yes".to_string()),
+        ("internal", "no".to_string()),
         ("host-id", client.host_id.clone()),
         ("user", username.to_string()),
     ];
@@ -115,10 +116,8 @@ pub fn parse(base: &str, computer: &str, response: &Response) -> Result<GatewayS
         }
         status => return Err(GpError::Status { step: STEP, status }),
     }
-    let root = Element::parse(&response.body).map_err(|e| GpError::BadResponse {
-        step: STEP,
-        detail: format!("not XML: {e}"),
-    })?;
+    let root =
+        Element::parse(&response.body).map_err(|e| GpError::not_xml(STEP, &response.body, e))?;
     if root.name == "response" && root.attr("status") == Some("error") {
         let msg = root.text_at("error").unwrap_or("unknown error").to_string();
         return Err(GpError::Server(msg));
@@ -133,10 +132,13 @@ pub fn parse(base: &str, computer: &str, response: &Response) -> Result<GatewayS
         .children_named("argument")
         .map(|a| {
             let v = a.text.trim();
-            if v == "(null)" {
+            // Gateways write "(null)" or "-1" for values they do not have, and URL-encode the
+            // values (`user%40example.com`, `%28empty_domain%29`): decoded here, as openconnect
+            // does, so they are sent back exactly as the gateway knows them.
+            if v == "(null)" || v == "-1" {
                 String::new()
             } else {
-                v.to_string()
+                percent_decode(v)
             }
         })
         .collect();
@@ -149,6 +151,14 @@ pub fn parse(base: &str, computer: &str, response: &Response) -> Result<GatewayS
             step: STEP,
             detail: "no authcookie in the answer".into(),
         });
+    }
+    for (value, what) in [(arg(ARG_USER), "user"), (arg(ARG_PORTAL), "portal")] {
+        if value.is_empty() {
+            return Err(GpError::BadResponse {
+                step: STEP,
+                detail: format!("no {what} in the answer"),
+            });
+        }
     }
     let connection_type = arg(ARG_CONNECTION_TYPE);
     if !connection_type.is_empty() && connection_type != "tunnel" {
@@ -168,6 +178,27 @@ pub fn parse(base: &str, computer: &str, response: &Response) -> Result<GatewayS
     })
 }
 
+/// Decodes `%XX` escapes (a `+` stays a `+`: user names may contain one).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (bytes[i], bytes.get(i + 1), bytes.get(i + 2)) {
+            (b'%', Some(&h), Some(&l)) if hex(h).is_some() && hex(l).is_some() => {
+                out.push((hex(h).unwrap_or(0) * 16 + hex(l).unwrap_or(0)) as u8);
+                i += 3;
+            }
+            (b, _, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     /// Built at run time so secret scanners do not mistake test data for a real password.
@@ -177,6 +208,67 @@ mod tests {
 
     use super::*;
     use crate::client::test_client;
+
+    #[test]
+    fn gateway_values_are_url_decoded_once() {
+        let encoded = jnlp("FAKE0123authcookie")
+            .replace(
+                "<argument>user@example.com</argument>",
+                "<argument>user%40example.com</argument>",
+            )
+            .replace(
+                "<argument>example.com</argument>",
+                "<argument>%28empty_domain%29</argument>",
+            )
+            .replace(
+                "<argument>vpn-portal</argument>",
+                "<argument>vpn%2Dportal</argument>",
+            );
+        let session = parse(
+            "https://gw.example.com",
+            "WORKSTATION-1",
+            &Response::new(200, encoded),
+        )
+        .unwrap();
+        assert_eq!(session.user, "user@example.com");
+        assert_eq!(session.domain, "(empty_domain)");
+        assert_eq!(session.portal, "vpn-portal");
+        // Sent back encoded exactly once.
+        let cookie = session.cookie_string();
+        assert!(
+            cookie.expose().contains("user=user%40example.com"),
+            "{}",
+            cookie.expose()
+        );
+        assert!(
+            cookie.expose().contains("domain=%28empty_domain%29"),
+            "{}",
+            cookie.expose()
+        );
+        // A '+' is not a space in a user name.
+        assert_eq!(percent_decode("a+b%2Bc"), "a+b+c");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
+    }
+
+    #[test]
+    fn a_session_without_user_or_portal_is_refused() {
+        for missing in [
+            "<argument>user@example.com</argument>",
+            "<argument>vpn-portal</argument>",
+        ] {
+            let body = jnlp("FAKE0123authcookie").replace(missing, "<argument>(null)</argument>");
+            assert!(
+                parse(
+                    "https://gw.example.com",
+                    "WORKSTATION-1",
+                    &Response::new(200, body)
+                )
+                .is_err(),
+                "{missing}"
+            );
+        }
+    }
 
     pub(crate) fn jnlp(authcookie: &str) -> String {
         let args = [
@@ -226,6 +318,15 @@ mod tests {
             "authcookie=FAKE0123authcookie&portal=vpn-portal&user=user%40example.com\
              &domain=example.com&computer=WORKSTATION-1&preferred-ip=10.20.30.40"
         );
+
+        let unset = jnlp("FAKE0123authcookie").replace("10.20.30.40", "-1");
+        let unset = parse(
+            "https://gw.example.com",
+            "WORKSTATION-1",
+            &Response::new(200, unset),
+        )
+        .unwrap();
+        assert_eq!(unset.preferred_ip, None, "-1 means no preferred address");
     }
 
     #[test]

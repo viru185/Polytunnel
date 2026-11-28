@@ -2,10 +2,15 @@
 //! tunnel. Sans I/O: feed it PPP packets, it returns [`Event`]s (packets to send, IP packets
 //! to deliver, link up/down).
 //!
+//! * Every packet we send starts with the address/control field `FF 03` and a two-byte
+//!   protocol, as openconnect sends them; received packets may have either form.
 //! * LCP: we ask for our MRU and a magic number; we accept the peer's MRU, ACCM, magic number,
-//!   protocol-field and address/control-field compression, and reject anything else.
-//! * IPCP: we ask for an address and two DNS servers (`0.0.0.0` until the peer suggests the
-//!   real ones in a Configure-Nak); the link is up once both sides have acknowledged.
+//!   protocol-field and address/control-field compression, and reject anything else. The
+//!   link's MTU is the smaller of the two MRUs.
+//! * IPCP: we ask for an address, and for two DNS servers only when the tunnel configuration
+//!   named none (`0.0.0.0` until the peer suggests real ones in a Configure-Nak). The peer's
+//!   IPCP request is answered even if it arrives before LCP is open; the link is up once both
+//!   sides have acknowledged.
 //! * Echo requests are answered; unknown protocols (e.g. IPv6CP) get a Protocol-Reject.
 
 use std::net::Ipv4Addr;
@@ -41,6 +46,8 @@ const IPCP_DNS2: u8 = 131;
 pub struct IpConfig {
     pub address: Ipv4Addr,
     pub dns: Vec<Ipv4Addr>,
+    /// The link's MTU: our MRU, or the peer's if smaller.
+    pub mtu: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +79,8 @@ impl Negotiation {
 pub struct Ppp {
     magic: u32,
     mru: u16,
+    /// The MRU the peer asked for.
+    peer_mru: Option<u16>,
     next_id: u8,
     send_mru: bool,
     send_magic: bool,
@@ -84,8 +93,12 @@ pub struct Ppp {
     up: bool,
 }
 
+/// The address/control field every packet we send starts with.
+const ADDRESS_CONTROL: [u8; 2] = [0xff, 0x03];
+
 fn packet(protocol: u16, code: u8, id: u8, data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(6 + data.len());
+    let mut out = Vec::with_capacity(8 + data.len());
+    out.extend_from_slice(&ADDRESS_CONTROL);
     out.extend_from_slice(&protocol.to_be_bytes());
     out.push(code);
     out.push(id);
@@ -124,11 +137,14 @@ fn ip_of(value: &[u8]) -> Option<Ipv4Addr> {
 }
 
 impl Ppp {
-    /// `address_hint`: the address from the tunnel configuration, if known.
-    pub fn new(magic: u32, mru: u16, address_hint: Option<Ipv4Addr>) -> Self {
+    /// `address_hint`: the address from the tunnel configuration, if known. `ask_dns`: ask
+    /// the peer for DNS servers (when the tunnel configuration named none).
+    pub fn new(magic: u32, mru: u16, address_hint: Option<Ipv4Addr>, ask_dns: bool) -> Self {
+        let dns = ask_dns.then_some(Ipv4Addr::UNSPECIFIED);
         Ppp {
             magic,
             mru,
+            peer_mru: None,
             next_id: 0,
             send_mru: true,
             send_magic: true,
@@ -136,8 +152,8 @@ impl Ppp {
             ipcp: Negotiation::default(),
             ipcp_started: false,
             address: address_hint.unwrap_or(Ipv4Addr::UNSPECIFIED),
-            dns1: Some(Ipv4Addr::UNSPECIFIED),
-            dns2: Some(Ipv4Addr::UNSPECIFIED),
+            dns1: dns,
+            dns2: dns,
             up: false,
         }
     }
@@ -201,7 +217,8 @@ impl Ppp {
         } else {
             PROTO_IPV4
         };
-        let mut out = protocol.to_be_bytes().to_vec();
+        let mut out = ADDRESS_CONTROL.to_vec();
+        out.extend_from_slice(&protocol.to_be_bytes());
         out.extend_from_slice(ip);
         out
     }
@@ -282,6 +299,10 @@ impl Ppp {
                 if rejected.is_empty() {
                     events.push(Event::Send(packet(PROTO_LCP, CONF_ACK, id, data)));
                     self.lcp.acked_peer = true;
+                    self.peer_mru = opts
+                        .iter()
+                        .find(|(kind, _)| *kind == LCP_MRU)
+                        .map(|(_, v)| u16::from_be_bytes([v[0], v[1]]));
                 } else {
                     events.push(Event::Send(packet(
                         PROTO_LCP,
@@ -291,7 +312,8 @@ impl Ppp {
                     )));
                 }
             }
-            CONF_ACK if id == self.lcp.request_id => self.lcp.acked_by_peer = true,
+            // Any Configure-Ack counts, as in openconnect (some servers reuse ids).
+            CONF_ACK => self.lcp.acked_by_peer = true,
             CONF_NAK if id == self.lcp.request_id => {
                 for (kind, value) in options(data)? {
                     if kind == LCP_MRU && value.len() == 2 {
@@ -336,10 +358,11 @@ impl Ppp {
     }
 
     fn ipcp(&mut self, body: &[u8]) -> Result<Vec<Event>, FortiError> {
-        if !self.lcp.open() {
+        let (code, id, data) = Self::header(body)?;
+        // Before LCP is open only the peer's own request is answered (openconnect does too).
+        if !self.lcp.open() && code != CONF_REQ {
             return Ok(Vec::new());
         }
-        let (code, id, data) = Self::header(body)?;
         let mut events = Vec::new();
         match code {
             CONF_REQ => {
@@ -361,7 +384,7 @@ impl Ppp {
                     )));
                 }
             }
-            CONF_ACK if id == self.ipcp.request_id => self.ipcp.acked_by_peer = true,
+            CONF_ACK => self.ipcp.acked_by_peer = true,
             CONF_NAK if id == self.ipcp.request_id => {
                 for (kind, value) in options(data)? {
                     match (kind, ip_of(&value)) {
@@ -401,6 +424,7 @@ impl Ppp {
             events.push(Event::Up(IpConfig {
                 address: self.address,
                 dns,
+                mtu: self.peer_mru.map_or(self.mru, |p| p.clamp(576, self.mru)),
             }));
         }
         Ok(events)
@@ -411,11 +435,15 @@ impl Ppp {
 mod tests {
     use super::*;
 
+    /// The packets sent, without their FF 03 prefix (checked here).
     fn sent(events: &[Event]) -> Vec<Vec<u8>> {
         events
             .iter()
             .filter_map(|e| match e {
-                Event::Send(p) => Some(p.clone()),
+                Event::Send(p) => {
+                    assert_eq!(p[..2], ADDRESS_CONTROL, "every packet starts with FF 03");
+                    Some(p[2..].to_vec())
+                }
                 _ => None,
             })
             .collect()
@@ -433,7 +461,7 @@ mod tests {
     /// The whole negotiation against a scripted FortiGate.
     #[test]
     fn negotiates_lcp_and_ipcp_then_carries_ip() {
-        let mut ppp = Ppp::new(0x11223344, 1354, None);
+        let mut ppp = Ppp::new(0x11223344, 1354, None, true);
         let start = sent(&ppp.start());
         assert_eq!(&start[0][..3], &[0xc0, 0x21, CONF_REQ]);
         let our_lcp_id = start[0][3];
@@ -488,13 +516,14 @@ mod tests {
             vec![Event::Up(IpConfig {
                 address: Ipv4Addr::new(10, 212, 134, 200),
                 dns: vec![Ipv4Addr::new(10, 0, 0, 53), Ipv4Addr::new(10, 0, 0, 54)],
+                mtu: 1354,
             })]
         );
         assert!(ppp.is_up());
 
         // Data in both directions.
         let ip = vec![0x45, 0, 0, 20];
-        assert_eq!(ppp.encode_ip(&ip)[..2], [0x00, 0x21]);
+        assert_eq!(ppp.encode_ip(&ip)[..4], [0xff, 0x03, 0x00, 0x21]);
         let mut incoming = vec![0x00, 0x21];
         incoming.extend_from_slice(&ip);
         assert_eq!(
@@ -508,7 +537,7 @@ mod tests {
     }
 
     fn opened() -> Ppp {
-        let mut ppp = Ppp::new(1, 1354, Some(Ipv4Addr::new(10, 0, 0, 5)));
+        let mut ppp = Ppp::new(1, 1354, Some(Ipv4Addr::new(10, 0, 0, 5)), true);
         let id = sent(&ppp.start())[0][3];
         ppp.receive(&packet(PROTO_LCP, CONF_REQ, 1, &[])).unwrap();
         ppp.receive(&packet(PROTO_LCP, CONF_ACK, id, &[])).unwrap();
@@ -544,7 +573,7 @@ mod tests {
 
     #[test]
     fn unsupported_options_are_rejected_and_rejections_honoured() {
-        let mut ppp = Ppp::new(1, 1354, None);
+        let mut ppp = Ppp::new(1, 1354, None, true);
         let id = sent(&ppp.start())[0][3];
         // Authentication protocol (3) is not something we do: Configure-Reject.
         let ev = ppp
@@ -571,11 +600,56 @@ mod tests {
 
     #[test]
     fn malformed_packets_are_errors() {
-        let mut ppp = Ppp::new(1, 1354, None);
+        let mut ppp = Ppp::new(1, 1354, None, true);
         assert!(ppp.receive(&[0xc0]).is_err());
         assert!(ppp.receive(&[0xc0, 0x21, 1, 1, 0, 99]).is_err());
         assert!(ppp.receive(&[0xc0, 0x21, 1, 1, 0, 6, 1, 9]).is_err());
         // IP before the link is up is dropped silently.
         assert!(ppp.receive(&[0x00, 0x21, 0x45]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn early_ipcp_smaller_peer_mru_and_configured_dns() {
+        // DNS came with the tunnel configuration: IPCP asks for the address only.
+        let mut ppp = Ppp::new(1, 1354, Some(Ipv4Addr::new(10, 0, 0, 5)), false);
+        let id = sent(&ppp.start())[0][3];
+        // The server's IPCP request before LCP is open is answered.
+        let ev = ppp
+            .receive(&packet(
+                PROTO_IPCP,
+                CONF_REQ,
+                4,
+                &opts(&[(IPCP_ADDRESS, &[192, 0, 2, 1])]),
+            ))
+            .unwrap();
+        assert_eq!(sent(&ev)[0][..4], [0x80, 0x21, CONF_ACK, 4]);
+        // The server wants a smaller MRU.
+        ppp.receive(&packet(
+            PROTO_LCP,
+            CONF_REQ,
+            1,
+            &opts(&[(LCP_MRU, &1300u16.to_be_bytes())]),
+        ))
+        .unwrap();
+        let ev = ppp.receive(&packet(PROTO_LCP, CONF_ACK, id, &[])).unwrap();
+        let request = &sent(&ev)[0];
+        assert_eq!(&request[6..], &opts(&[(IPCP_ADDRESS, &[10, 0, 0, 5])])[..]);
+        // An Ack with another id still counts.
+        let ev = ppp
+            .receive(&packet(
+                PROTO_IPCP,
+                CONF_ACK,
+                request[3].wrapping_add(9),
+                &[],
+            ))
+            .unwrap();
+        assert_eq!(
+            ev,
+            vec![Event::Up(IpConfig {
+                address: Ipv4Addr::new(10, 0, 0, 5),
+                dns: Vec::new(),
+                mtu: 1300,
+            })]
+        );
     }
 }

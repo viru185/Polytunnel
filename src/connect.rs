@@ -87,12 +87,21 @@ pub fn describe(status: &Status) -> String {
             server,
             addresses,
             transport,
+            notice,
             ..
-        } => format!(
-            "Connected to {server} ({profile}) over {}, address {}.",
-            transport.to_uppercase(),
-            addresses.join(", ")
-        ),
+        } => {
+            let connected = format!(
+                "Connected to {server} ({profile}) over {}, address {}.",
+                transport.to_uppercase(),
+                addresses.join(", ")
+            );
+            match notice {
+                Some(notice) => {
+                    format!("{connected} The server restricted the connection: {notice}")
+                }
+                None => connected,
+            }
+        }
         Status::Disconnecting { profile } => format!("Disconnecting ({profile})..."),
         Status::Failed { profile, message } => format!("Connection failed ({profile}): {message}"),
     }
@@ -105,8 +114,14 @@ fn label(args: &AuthArgs) -> String {
     }
 }
 
-/// The service request for a finished GlobalProtect login.
-pub fn gp_connect(profile: String, client: ClientInfo, session: GatewaySession) -> Connect {
+/// The service request for a finished GlobalProtect login. `app_version` is what the tunnel
+/// configuration request announces (see `polytunnel_gp::client::announced_version`).
+pub fn gp_connect(
+    profile: String,
+    client: ClientInfo,
+    session: GatewaySession,
+    app_version: Option<String>,
+) -> Connect {
     Connect::GlobalProtect(Box::new(GpConnect {
         profile,
         gateway: session.gateway,
@@ -121,18 +136,24 @@ pub fn gp_connect(profile: String, client: ClientInfo, session: GatewaySession) 
             os_version: client.os_version,
             computer: client.computer,
             host_id: client.host_id,
-            app_version: client.app_version,
+            app_version,
         },
         allow_esp: true,
     }))
 }
 
 /// The service request for a finished Fortinet login.
-pub fn forti_connect(profile: String, server: String, cookie: Secret) -> Connect {
+pub fn forti_connect(
+    profile: String,
+    server: String,
+    cookie: Secret,
+    server_cert: Option<polytunnel_core::pin::CertFingerprint>,
+) -> Connect {
     Connect::FortinetSsl(FortiConnect {
         profile,
         server,
         cookie,
+        server_cert,
     })
 }
 
@@ -142,11 +163,15 @@ fn connect_request(args: &AuthArgs) -> Result<Connect, String> {
     Ok(match auth::resolve(args)? {
         Profile::GlobalProtect(p) => {
             let GpLogin { client, result } = auth::gp_login(&p, args)?;
-            gp_connect(profile, client, result.session)
+            let version = polytunnel_gp::client::announced_version(
+                p.client_version.as_deref(),
+                result.config.version.as_deref(),
+            );
+            gp_connect(profile, client, result.session, version)
         }
         Profile::FortinetSsl(p) => {
             let FortiLogin { base, cookie, .. } = auth::forti_login(&p)?;
-            forti_connect(profile, base, cookie)
+            forti_connect(profile, base, cookie, p.server_cert)
         }
         Profile::FortinetIpsec(p) => {
             let io = |e: std::io::Error| e.to_string();
@@ -202,7 +227,8 @@ pub fn answer(id: u32, values: Vec<Secret>) -> Result<(), String> {
 
 /// Hands `connect` to the service.
 pub fn send_connect(connect: Connect) -> Result<(), String> {
-    match request(&Request::Connect { connect })? {
+    let trace = crate::trace::enabled();
+    match request(&Request::Connect { connect, trace })? {
         Response::Accepted {} => Ok(()),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected answer from the service: {other:?}")),
@@ -439,8 +465,21 @@ mod tests {
                 addresses: vec!["10.20.30.40".into()],
                 transport: "esp".into(),
                 since_unix: 0,
+                notice: None,
             }),
             "Connected to gw.example.com (work) over ESP, address 10.20.30.40."
+        );
+        assert_eq!(
+            describe(&Status::Connected {
+                profile: "work".into(),
+                server: "gw.example.com".into(),
+                addresses: vec!["10.20.30.40".into()],
+                transport: "tls".into(),
+                since_unix: 0,
+                notice: Some("VPN Access Denied".into()),
+            }),
+            "Connected to gw.example.com (work) over TLS, address 10.20.30.40. The server \
+             restricted the connection: VPN Access Denied"
         );
     }
 }

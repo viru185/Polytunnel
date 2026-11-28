@@ -102,6 +102,8 @@ struct Editor {
     gateway: String,
     preferred: String,
     realm: String,
+    /// Fortinet SSL: the trusted certificate's SHA-256 (empty: the system decides).
+    server_cert: String,
     strict_tiers: bool,
     tcp_probe: bool,
     embedded: bool,
@@ -128,6 +130,7 @@ impl Editor {
             gateway: String::new(),
             preferred: String::new(),
             realm: String::new(),
+            server_cert: String::new(),
             strict_tiers: false,
             tcp_probe: false,
             embedded: false,
@@ -164,6 +167,7 @@ impl Editor {
                 server: p.server.clone(),
                 username: text(&p.username),
                 realm: text(&p.realm),
+                server_cert: p.server_cert.map(|c| c.to_string()).unwrap_or_default(),
                 ..Editor::new(Kind::FortinetSsl)
             },
             Profile::FortinetIpsec(p) => Editor {
@@ -221,6 +225,13 @@ impl Editor {
                 server: self.server.trim().to_string(),
                 username: opt(&self.username),
                 realm: opt(&self.realm),
+                server_cert: match self.server_cert.trim() {
+                    "" => None,
+                    pin => Some(
+                        pin.parse()
+                            .map_err(|e| format!("Server certificate: {e}."))?,
+                    ),
+                },
             }),
             Kind::FortinetIpsec => {
                 let group: u16 = self
@@ -305,6 +316,8 @@ struct App {
     gateways: Option<GatewaysUi>,
     ipc_rx: Receiver<Message>,
     autostart: bool,
+    /// The troubleshooting trace switch.
+    trace: bool,
     link_status: String,
     /// The kill switch setting, when the service could be asked.
     killswitch: Option<polytunnel_core::ipc::KillSwitchSettings>,
@@ -381,6 +394,7 @@ impl App {
             gateways: None,
             ipc_rx,
             autostart: autostart::enabled(),
+            trace: crate::trace::enabled(),
             link_status: link_status_text(),
             killswitch: connect::killswitch(None).ok().map(|(s, _, _)| s),
             update: None,
@@ -549,6 +563,12 @@ impl App {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let (text, color) = match &self.status {
+                // Connected, but the server restricts it (e.g. a HIP verdict): amber.
+                Ok(
+                    s @ Status::Connected {
+                        notice: Some(_), ..
+                    },
+                ) => (connect::describe(s), egui::Color32::from_rgb(217, 119, 6)),
                 Ok(s @ Status::Connected { .. }) => {
                     (connect::describe(s), egui::Color32::from_rgb(22, 163, 74))
                 }
@@ -704,6 +724,16 @@ impl App {
                     Kind::FortinetSsl => {
                         ui.label("Realm (optional)");
                         ui.text_edit_singleline(&mut editor.realm);
+                        ui.end_row();
+                        ui.label("Server certificate (optional)").on_hover_text(
+                            "The SHA-256 fingerprint of the FortiGate's certificate, when the \
+                             system does not trust it (a factory certificate). Polytunnel then \
+                             trusts exactly that certificate for this server.",
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut editor.server_cert)
+                                .hint_text("sha256:... (from the sign-in error)"),
+                        );
                         ui.end_row();
                     }
                     Kind::FortinetIpsec => {
@@ -964,6 +994,36 @@ impl App {
                     self.link_status = link_status_text();
                 }
             });
+            ui.separator();
+            let mut trace = self.trace;
+            if ui
+                .checkbox(
+                    &mut trace,
+                    "Record a troubleshooting trace (passwords and cookies are removed)",
+                )
+                .changed()
+            {
+                match crate::trace::set(trace) {
+                    Ok(()) => {
+                        self.trace = trace;
+                        self.log(if trace {
+                            format!(
+                                "Recording connection traces in {} (the service's are in                                  its own folder).",
+                                crate::trace::file().display()
+                            )
+                        } else {
+                            "Connection traces are off.".to_string()
+                        });
+                    }
+                    Err(e) => self.log(format!("Could not change the trace setting: {e}")),
+                }
+            }
+            if self.trace {
+                ui.label(format!("App: {}", crate::trace::file().display()));
+                if cfg!(windows) {
+                    ui.label(r"Service: %ProgramData%\Polytunnel\trace.log (administrators only)");
+                }
+            }
         });
     }
 
@@ -1143,6 +1203,7 @@ mod tests {
             server: "vpn.example.net:10443".into(),
             username: Some("me".into()),
             realm: None,
+            server_cert: Some("0123456789abcdef".repeat(4).parse().unwrap()),
         });
         assert_eq!(
             Editor::from_profile("office", &forti).to_profile(),

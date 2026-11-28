@@ -18,7 +18,6 @@ use polytunnel_gp::flow::{self, LoginOptions, PasswordPrompt, PortalSession, Pro
 use polytunnel_gp::portal::Gateway;
 use polytunnel_gp::prelogin::{Interface, SamlRequest};
 use polytunnel_gp::sso::{self, SsoResult};
-use polytunnel_http::UreqTransport;
 
 use crate::gateways::{self, GatewayPrefs};
 use crate::{browser, callback, connect, ipsec, sysinfo, uri};
@@ -210,12 +209,22 @@ fn login_gp(
             method: p.probe.unwrap_or_default(),
         },
     };
-    let result = flow::login(&UreqTransport::new(), &client, &options, &mut prompter)
-        .map_err(|e| e.to_string())?;
+    let result = flow::login(
+        &crate::trace::transport(None),
+        &client,
+        &options,
+        &mut prompter,
+    )
+    .map_err(|e| e.to_string())?;
+    let version = polytunnel_gp::client::announced_version(
+        p.client_version.as_deref(),
+        result.config.version.as_deref(),
+    );
     Ok(connect::gp_connect(
         name.to_string(),
         client,
         result.session,
+        version,
     ))
 }
 
@@ -239,9 +248,9 @@ fn login_fortinet(
         "Logging in to {}...",
         base.trim_start_matches("https://")
     ));
-    let realm = p.realm.clone().unwrap_or_default();
+    let realm = crate::auth::forti_realm(p);
     let cookie = polytunnel_forti::login(
-        &UreqTransport::new(),
+        &crate::trace::transport(p.server_cert),
         &base,
         &username,
         &password,
@@ -267,8 +276,13 @@ fn login_fortinet(
             answer.recv().ok().flatten().ok_or(FortiError::Cancelled)
         },
     )
-    .map_err(|e| e.to_string())?;
-    Ok(connect::forti_connect(name.to_string(), base, cookie))
+    .map_err(|e| crate::auth::forti_error(&base, p.server_cert, e))?;
+    Ok(connect::forti_connect(
+        name.to_string(),
+        base,
+        cookie,
+        p.server_cert,
+    ))
 }
 
 struct GuiPrompter<'a> {

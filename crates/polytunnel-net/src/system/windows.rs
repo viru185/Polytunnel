@@ -17,16 +17,20 @@ use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, ERROR_SUCCESS,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    CreateIpForwardEntry2, DeleteIpForwardEntry2, GetBestRoute2, InitializeIpForwardEntry,
-    MIB_IPFORWARD_ROW2,
+    ConvertInterfaceIndexToLuid, ConvertInterfaceLuidToGuid, CreateIpForwardEntry2,
+    DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_DOMAIN,
+    DeleteIpForwardEntry2, GetBestRoute2, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2,
 };
+use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, MIB_IPPROTO_NETMGMT, SOCKADDR_INET,
 };
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_DWORD, REG_MULTI_SZ, REG_SZ, RegCloseKey,
     RegDeleteKeyW, RegDeleteTreeW, RegOpenKeyExW, RegQueryInfoKeyW, RegSetKeyValueW,
 };
+use windows_sys::core::GUID;
 
 use super::System;
 use crate::plan::{Change, Via};
@@ -193,6 +197,62 @@ fn flush_dns() {
     let _ = Command::new("ipconfig").arg("/flushdns").output();
 }
 
+fn interface_guid(if_index: u32) -> io::Result<GUID> {
+    // SAFETY: plain data out-parameters, written by the calls.
+    let mut luid: NET_LUID_LH = unsafe { zeroed() };
+    let rc = unsafe { ConvertInterfaceIndexToLuid(if_index, &mut luid) };
+    if rc != ERROR_SUCCESS {
+        return Err(os_error(rc));
+    }
+    let mut guid: GUID = unsafe { zeroed() };
+    let rc = unsafe { ConvertInterfaceLuidToGuid(&luid, &mut guid) };
+    if rc != ERROR_SUCCESS {
+        return Err(os_error(rc));
+    }
+    Ok(guid)
+}
+
+type SetInterfaceDnsSettings =
+    unsafe extern "system" fn(GUID, *const DNS_INTERFACE_SETTINGS) -> u32;
+
+/// Sets (`""`: clears) the interface's connection-specific DNS suffix, which Windows appends
+/// to short names, so `host` is looked up as `host.<suffix>` (and the NRPT rule sends that to
+/// the tunnel's DNS servers).
+///
+/// `SetInterfaceDnsSettings` tells the DNS client at once; it exists from Windows 10 2004 on
+/// and is looked up at run time, so older systems still start (without the suffix).
+fn set_dns_suffix(if_index: u32, suffix: &str) -> io::Result<()> {
+    let guid = interface_guid(if_index)?;
+    let module = wide("iphlpapi.dll");
+    // SAFETY: NUL-terminated names; iphlpapi.dll is already loaded (its other functions are
+    // imported), and a missing function comes back as None.
+    let function = unsafe {
+        let handle = GetModuleHandleW(module.as_ptr());
+        if handle.is_null() {
+            None
+        } else {
+            GetProcAddress(handle, c"SetInterfaceDnsSettings".as_ptr().cast())
+        }
+    };
+    let Some(function) = function else {
+        return Err(io::Error::from(io::ErrorKind::Unsupported));
+    };
+    // SAFETY: the export has exactly this signature.
+    let set: SetInterfaceDnsSettings = unsafe { std::mem::transmute(function) };
+    let mut domain = wide(suffix);
+    let settings = DNS_INTERFACE_SETTINGS {
+        Version: DNS_INTERFACE_SETTINGS_VERSION1,
+        Flags: u64::from(DNS_SETTING_DOMAIN),
+        Domain: domain.as_mut_ptr(),
+        ..Default::default()
+    };
+    // SAFETY: `settings` and the string it points to live across the call.
+    match unsafe { set(guid, &settings) } {
+        ERROR_SUCCESS => Ok(()),
+        rc => Err(os_error(rc)),
+    }
+}
+
 impl System for Windows {
     fn apply(&mut self, change: &Change) -> io::Result<bool> {
         match change {
@@ -209,6 +269,7 @@ impl System for Windows {
                 if_index,
                 servers,
                 domains,
+                search,
             } => {
                 let key = nrpt_key(*if_index);
                 let names: Vec<String> = domains
@@ -228,6 +289,12 @@ impl System for Windows {
                 set_dword(&key, "ConfigOptions", 8)?;
                 set_sz(&key, "IPSECCARestriction", "")?;
                 set_sz(&key, "Comment", "Polytunnel")?;
+                // Short names are a convenience: the rule above is what matters, so a suffix
+                // that cannot be set does not fail the connection. One suffix per interface:
+                // the server's first (main) domain.
+                if let Some(suffix) = search.first() {
+                    let _ = set_dns_suffix(*if_index, suffix);
+                }
                 flush_dns();
                 Ok(true)
             }
@@ -244,7 +311,13 @@ impl System for Windows {
                     rc => Err(os_error(rc)),
                 }
             }
-            Change::Dns { if_index, .. } => {
+            Change::Dns {
+                if_index, search, ..
+            } => {
+                // The adapter may be gone already, taking its suffix with it.
+                if !search.is_empty() {
+                    let _ = set_dns_suffix(*if_index, "");
+                }
                 for base in [NRPT_LOCAL, NRPT_POLICY] {
                     delete_tree(&format!(
                         r"{base}\{{8b3d2a1e-5c7f-4e2a-9d61-{if_index:012x}}}"

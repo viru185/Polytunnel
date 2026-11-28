@@ -63,11 +63,14 @@ pub enum Change {
         prefix: Prefix,
         via: Via,
     },
-    /// Send DNS queries for `domains` (`"."`: all queries) to `servers` over the tunnel.
+    /// Send DNS queries for `domains` (`"."`: all queries) to `servers` over the tunnel, and
+    /// complete short names with the `search` domains.
     Dns {
         if_index: u32,
         servers: Vec<IpAddr>,
         domains: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        search: Vec<String>,
     },
 }
 
@@ -159,21 +162,24 @@ pub fn plan(config: &TunnelConfig, ctx: &Context) -> Vec<Change> {
     }
 
     if !config.dns_servers.is_empty() {
+        let mut search: Vec<String> = Vec::new();
+        for domain in &config.dns_domains {
+            let domain = domain.trim().trim_matches('.').to_ascii_lowercase();
+            if domain != "." && valid_domain(&domain) && !search.contains(&domain) {
+                search.push(domain);
+            }
+        }
         let domains = if config.is_full_tunnel() || config.dns_domains.is_empty() {
             vec![".".to_string()]
         } else {
-            config
-                .dns_domains
-                .iter()
-                .map(|d| d.trim().trim_matches('.').to_ascii_lowercase())
-                .filter(|d| valid_domain(d))
-                .collect()
+            search.clone()
         };
         if !domains.is_empty() {
             changes.push(Change::Dns {
                 if_index: ctx.tunnel_if,
                 servers: config.dns_servers.clone(),
                 domains,
+                search,
             });
         }
     }
@@ -255,7 +261,8 @@ mod tests {
                 Change::Dns {
                     if_index: 42,
                     servers: vec![ip("10.0.0.53")],
-                    domains: vec![".".into()]
+                    domains: vec![".".into()],
+                    search: vec!["corp.example.com".into()]
                 },
             ]
         );
@@ -298,8 +305,24 @@ mod tests {
             Some(&Change::Dns {
                 if_index: 42,
                 servers: vec![ip("10.0.0.53")],
-                domains: vec!["corp.example.com".into()]
+                domains: vec!["corp.example.com".into()],
+                search: vec!["corp.example.com".into()]
             })
+        );
+    }
+
+    #[test]
+    fn journals_from_before_search_domains_still_load() {
+        let old = r#"{"change":"dns","if_index":3,"servers":["10.0.0.53"],"domains":["."]}"#;
+        let change: Change = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            change,
+            Change::Dns {
+                if_index: 3,
+                servers: vec![ip("10.0.0.53")],
+                domains: vec![".".into()],
+                search: Vec::new()
+            }
         );
     }
 

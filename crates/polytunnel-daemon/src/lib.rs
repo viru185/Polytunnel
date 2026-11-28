@@ -18,7 +18,9 @@ pub mod log;
 pub mod manager;
 pub mod packets;
 pub mod paths;
+pub mod posture;
 pub mod service;
+pub mod trace;
 pub mod update;
 
 use std::ffi::OsString;

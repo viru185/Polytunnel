@@ -20,39 +20,48 @@ use polytunnel_core::xml::Element;
 use crate::client::{self, ClientInfo};
 use crate::error::GpError;
 use crate::login::GatewaySession;
-use crate::portal::host_of;
 
-/// Fields that identify the session in every gateway request.
+/// The session's fields, once each, in the order the gateway login returned them (as
+/// openconnect documents): authcookie, portal, user, domain, preferred addresses, computer.
 fn session_fields(session: &GatewaySession) -> Vec<(&'static str, String)> {
     let mut fields = vec![
-        ("user", session.user.clone()),
-        ("portal", session.portal.clone()),
         ("authcookie", session.authcookie.expose().to_string()),
-        ("domain", session.domain.clone()),
-        ("computer", session.computer.clone()),
+        ("portal", session.portal.clone()),
+        ("user", session.user.clone()),
     ];
+    // A missing domain is left out, as openconnect does.
+    if !session.domain.is_empty() {
+        fields.push(("domain", session.domain.clone()));
+    }
     if let Some(ip) = &session.preferred_ip {
         fields.push(("preferred-ip", ip.clone()));
     }
     if let Some(ip) = &session.preferred_ipv6 {
         fields.push(("preferred-ipv6", ip.clone()));
     }
+    fields.push(("computer", session.computer.clone()));
     fields
 }
 
+/// The tunnel configuration request: the fields official clients send, in their order, then
+/// the session. The ESP algorithms are the ones Polytunnel implements (no MD5).
 pub fn getconfig_request(client: &ClientInfo, session: &GatewaySession) -> Request {
     let mut fields = vec![
         ("client-type", "1".to_string()),
         ("protocol-version", "p1".to_string()),
-        // ESP algorithms Polytunnel implements (no MD5).
-        ("enc-algo", "aes-256-cbc,aes-128-cbc".to_string()),
-        ("hmac-algo", "sha256,sha1".to_string()),
+        ("internal", "no".to_string()),
     ];
-    fields.extend(client.base_fields());
-    fields.extend(session_fields(session));
     if let Some(version) = &client.app_version {
         fields.push(("app-version", version.clone()));
     }
+    fields.extend([
+        ("ipv6-support", "yes".to_string()),
+        ("clientos", client.os.gp_name().to_string()),
+        ("os-version", client.os_version.clone()),
+        ("hmac-algo", "sha256,sha1".to_string()),
+        ("enc-algo", "aes-256-cbc,aes-128-cbc".to_string()),
+    ]);
+    fields.extend(session_fields(session));
     client::post(
         format!("{}/ssl-vpn/getconfig.esp", session.gateway),
         &fields,
@@ -60,7 +69,12 @@ pub fn getconfig_request(client: &ClientInfo, session: &GatewaySession) -> Reque
 }
 
 pub fn logout_request(client: &ClientInfo, session: &GatewaySession) -> Request {
-    let mut fields = client.base_fields();
+    // `computer` comes with the session.
+    let mut fields: Vec<_> = client
+        .base_fields()
+        .into_iter()
+        .filter(|(name, _)| *name != "computer")
+        .collect();
     fields.extend(session_fields(session));
     client::post(format!("{}/ssl-vpn/logout.esp", session.gateway), &fields)
 }
@@ -199,10 +213,8 @@ pub fn parse_getconfig(response: &Response) -> Result<TunnelSettings, GpError> {
         512 | 401 | 403 => return Err(GpError::AuthFailed("the gateway session expired".into())),
         status => return Err(GpError::Status { step: STEP, status }),
     }
-    let root = Element::parse(&response.body).map_err(|e| GpError::BadResponse {
-        step: STEP,
-        detail: format!("not XML: {e}"),
-    })?;
+    let root =
+        Element::parse(&response.body).map_err(|e| GpError::not_xml(STEP, &response.body, e))?;
     if root.attr("status").is_some_and(|s| s != "success") {
         let msg = root
             .text_at("error")
@@ -270,13 +282,9 @@ pub fn tunnel_request(session: &GatewaySession, path: &str) -> Vec<u8> {
     let mut query = form_urlencoded::Serializer::new(String::new());
     query.append_pair("user", &session.user);
     query.append_pair("authcookie", session.authcookie.expose());
-    format!(
-        "GET {path}?{} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\n\r\n",
-        query.finish(),
-        host_of(&session.gateway),
-        client::USER_AGENT
-    )
-    .into_bytes()
+    // Only the request line, exactly as openconnect sends it; the gateway answers
+    // "START_TUNNEL".
+    format!("GET {path}?{} HTTP/1.1\r\n\r\n", query.finish()).into_bytes()
 }
 
 /// What the gateway sends when the TLS tunnel is up.
@@ -479,14 +487,41 @@ mod tests {
             Some("10.20.30.40")
         );
         assert_eq!(req.form_value("app-version"), None);
+        assert_eq!(req.form_value("internal").as_deref(), Some("no"));
+        let body = req.body.clone().unwrap();
+        let names: Vec<&str> = body
+            .split('&')
+            .map(|pair| pair.split('=').next().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "client-type",
+                "protocol-version",
+                "internal",
+                "ipv6-support",
+                "clientos",
+                "os-version",
+                "hmac-algo",
+                "enc-algo",
+                "authcookie",
+                "portal",
+                "user",
+                "domain",
+                "preferred-ip",
+                "computer"
+            ],
+            "every field once, in the official order"
+        );
         let logout = logout_request(&test_client(), &session());
         assert_eq!(logout.url, "https://gw.example.com/ssl-vpn/logout.esp");
+        let body = logout.body.clone().unwrap();
+        assert_eq!(body.matches("computer=").count(), 1, "{body}");
         let tunnel =
             String::from_utf8(tunnel_request(&session(), "/ssl-tunnel-connect.sslvpn")).unwrap();
         assert_eq!(
             tunnel,
-            "GET /ssl-tunnel-connect.sslvpn?user=user%40example.com&authcookie=FAKEcookie HTTP/1.1\r\n\
-             Host: gw.example.com\r\nUser-Agent: PAN GlobalProtect\r\n\r\n"
+            "GET /ssl-tunnel-connect.sslvpn?user=user%40example.com&authcookie=FAKEcookie HTTP/1.1\r\n\r\n"
         );
     }
 

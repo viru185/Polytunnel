@@ -6,6 +6,30 @@ use polytunnel_core::profile::ClientOs;
 /// The protocol version GlobalProtect clients announce.
 pub const CLIENT_VER: &str = "4100";
 
+/// The app version announced in the tunnel configuration request when neither the profile
+/// nor the portal names one (openconnect's default).
+pub const DEFAULT_APP_VERSION: &str = "6.3.0-33";
+
+/// A version string a server may name: short, printable, no spaces.
+pub fn valid_version(v: &str) -> bool {
+    !v.is_empty() && v.len() <= 32 && v.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// The app version to announce in the tunnel configuration request, as openconnect does:
+/// the profile's `client-version` (empty turns it off), else the portal's, else the default.
+pub fn announced_version(profile: Option<&str>, portal: Option<&str>) -> Option<String> {
+    match profile.map(str::trim) {
+        Some("") => None,
+        Some(v) => Some(v.to_string()),
+        None => Some(
+            portal
+                .filter(|v| valid_version(v))
+                .unwrap_or(DEFAULT_APP_VERSION)
+                .to_string(),
+        ),
+    }
+}
+
 /// GlobalProtect servers expect this user agent on protocol requests.
 pub const USER_AGENT: &str = "PAN GlobalProtect";
 
@@ -63,5 +87,32 @@ pub(crate) fn test_client() -> ClientInfo {
         computer: "WORKSTATION-1".into(),
         host_id: "00000000-0000-4000-8000-000000000001".into(),
         app_version: None,
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn the_announced_version_follows_openconnect() {
+        // Profile first (empty turns it off), then the portal's, then the default.
+        assert_eq!(
+            announced_version(Some("6.1.0-10"), Some("6.2.8-223")).as_deref(),
+            Some("6.1.0-10")
+        );
+        assert_eq!(announced_version(Some("  "), Some("6.2.8-223")), None);
+        assert_eq!(
+            announced_version(None, Some("6.2.8-223")).as_deref(),
+            Some("6.2.8-223")
+        );
+        assert_eq!(
+            announced_version(None, None).as_deref(),
+            Some(DEFAULT_APP_VERSION)
+        );
+        assert_eq!(
+            announced_version(None, Some("bad version")).as_deref(),
+            Some(DEFAULT_APP_VERSION)
+        );
     }
 }

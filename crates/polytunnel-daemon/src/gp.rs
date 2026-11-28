@@ -16,7 +16,6 @@ use polytunnel_esp::{Cipher, InboundSa, Integrity, Keys, OutboundSa};
 use polytunnel_gp::login::GatewaySession;
 use polytunnel_gp::tunnel::{self, EspHmac, EspSettings, TunnelSettings, frame};
 use polytunnel_gp::{ClientInfo, hip};
-use polytunnel_http::UreqTransport;
 use polytunnel_net::journal::Journal;
 use polytunnel_net::system::System;
 use polytunnel_net::{Prefix, TunnelConfig};
@@ -31,12 +30,20 @@ use crate::common::{
 use crate::packets::{self, Channels, Pump};
 use crate::{info, paths, warn};
 
-const TLS_KEEPALIVE: Duration = Duration::from_secs(30);
+/// Keepalive on the TLS tunnel, every 10 seconds like the official client and openconnect.
+const TLS_KEEPALIVE: Duration = Duration::from_secs(10);
 const ESP_KEEPALIVE: Duration = Duration::from_secs(10);
 const ESP_DEAD_AFTER: Duration = Duration::from_secs(45);
 const TLS_RECONNECTS: usize = 3;
-const PROBE_ID: u16 = 0x7054;
-const PROBE_PAYLOAD: &[u8] = b"polytunnel esp probe";
+/// The HIP report is sent again this often while connected, as openconnect does.
+const HIP_RECHECK: Duration = Duration::from_secs(3600);
+/// Reading the device's security state from Windows must not hold up the connection.
+const POSTURE_TIMEOUT: Duration = Duration::from_secs(20);
+/// The ESP probe is an ICMP echo to the gateway's `gw-address` that the gateway only answers
+/// with this payload ("monitor", two zero bytes, "pan ha "), sent with this identifier, as
+/// openconnect documents.
+const PROBE_ID: u16 = 0x4747;
+const PROBE_PAYLOAD: &[u8] = b"monitor\x00\x00pan ha ";
 
 /// `MM/DD/YYYY HH:MM:SS` in UTC (for HIP reports).
 fn hip_time() -> String {
@@ -148,17 +155,8 @@ async fn connect_and_run(
     let (client, session) = client_and_session(c);
     info!("connecting to {}", c.gateway);
 
-    let settings = {
-        let (client, session) = (client.clone(), session.clone());
-        blocking(move || {
-            let response = UreqTransport::new()
-                .send(&tunnel::getconfig_request(&client, &session))
-                .map_err(|e| e.to_string())?;
-            tunnel::parse_getconfig(&response).map_err(|e| e.to_string())
-        })
-        .await?
-    };
-
+    // The gateway is resolved once, before the tunnel points DNS at servers that may only be
+    // reachable through it. Every request (configuration, HIP, logout) goes to that address.
     let (host, port) = host_port(&session.gateway);
     let gateway_addrs: Vec<SocketAddr> =
         timeout(STEP_TIMEOUT, tokio::net::lookup_host((host.clone(), port)))
@@ -167,22 +165,56 @@ async fn connect_and_run(
             .map_err(|e| format!("cannot resolve the gateway: {e}"))?
             .collect();
     let gateway_addr = *gateway_addrs.first().ok_or("the gateway has no address")?;
-    let mut servers: Vec<IpAddr> = gateway_addrs.iter().map(SocketAddr::ip).collect();
-    servers.extend(settings.gateway_address);
+    let gateway_ips: Vec<IpAddr> = gateway_addrs.iter().map(SocketAddr::ip).collect();
+    let pinned = Some((host.clone(), gateway_ips.clone()));
 
+    let settings = {
+        let (client, session, pinned) = (client.clone(), session.clone(), pinned.clone());
+        blocking(move || {
+            let response = crate::trace::transport_to(None, pinned)
+                .send(&tunnel::getconfig_request(&client, &session))
+                .map_err(|e| e.to_string())?;
+            tunnel::parse_getconfig(&response).map_err(|e| e.to_string())
+        })
+        .await?
+    };
+
+    // HIP comes before any network change, as in openconnect: many gateways pass no traffic
+    // until they have it.
+    let notice = match settings.address_v4 {
+        Some((ip, _)) => hip_round(&client, &session, pinned.clone(), ip.to_string(), true).await,
+        None => None,
+    };
+
+    let mut servers = gateway_ips.clone();
+    servers.extend(settings.gateway_address);
     let config = tunnel_config(&settings, servers.clone());
     let device = bring_up(&c.profile, &config, journal, system)?;
 
-    if let Some((ip, _)) = settings.address_v4 {
-        let (client, session) = (client.clone(), session.clone());
-        let hip = blocking(move || hip_exchange(&client, &session, &ip.to_string())).await;
-        if let Err(e) = hip {
-            warn!("HIP report: {e}");
-        }
-    }
-
     let (pump, mut channels) =
         Pump::start(device.clone(), config.mtu).map_err(|e| e.to_string())?;
+    // The report is sent again every hour; the gateway's verdict updates the status.
+    let recheck = settings.address_v4.map(|(ip, _)| {
+        let (client, session, pinned, status) = (
+            client.clone(),
+            session.clone(),
+            pinned.clone(),
+            status.clone(),
+        );
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(HIP_RECHECK);
+            every.tick().await;
+            loop {
+                every.tick().await;
+                let notice =
+                    hip_round(&client, &session, pinned.clone(), ip.to_string(), false).await;
+                let mut current = status.lock().unwrap_or_else(|e| e.into_inner());
+                if let Status::Connected { notice: shown, .. } = &mut *current {
+                    *shown = notice;
+                }
+            }
+        })
+    });
     let addresses: Vec<String> = config
         .addresses
         .iter()
@@ -198,14 +230,18 @@ async fn connect_and_run(
         stop,
         status,
         &addresses,
+        notice,
     )
     .await;
+    if let Some(task) = recheck {
+        task.abort();
+    }
     drop(channels);
     pump.stop();
 
     let (client, session) = (client.clone(), session.clone());
     let _ = blocking(move || {
-        UreqTransport::new()
+        crate::trace::transport_to(None, pinned)
             .send(&tunnel::logout_request(&client, &session))
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -214,25 +250,70 @@ async fn connect_and_run(
     result
 }
 
-fn hip_exchange(client: &ClientInfo, session: &GatewaySession, ip: &str) -> Result<(), String> {
-    let (report, md5) = hip::report(client, session, ip, &hip_time());
-    let http = UreqTransport::new();
+/// Reads the device's security state, sends the HIP report if the gateway wants it, and
+/// returns what the gateway says about the connection (its notice), if anything.
+async fn hip_round(
+    client: &ClientInfo,
+    session: &GatewaySession,
+    pinned: Option<(String, Vec<IpAddr>)>,
+    ip: String,
+    first: bool,
+) -> Option<String> {
+    let posture = timeout(POSTURE_TIMEOUT, blocking(|| Ok(crate::posture::read())))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    if first {
+        info!(
+            "device security for the HIP report: {}",
+            crate::posture::describe(&posture)
+        );
+    }
+    let (client, session) = (client.clone(), session.clone());
+    let result = blocking(move || {
+        let http = crate::trace::transport_to(None, pinned);
+        hip_exchange(&http, &client, &session, &ip, &posture)
+    })
+    .await;
+    match result {
+        Ok(messages) => {
+            for message in &messages {
+                warn!("the gateway's HIP verdict: {message}");
+            }
+            (!messages.is_empty()).then(|| messages.join(" "))
+        }
+        Err(e) => {
+            warn!("HIP report: {e}");
+            Some(format!("the HIP report could not be sent ({e})"))
+        }
+    }
+}
+
+fn hip_exchange(
+    http: &dyn Transport,
+    client: &ClientInfo,
+    session: &GatewaySession,
+    ip: &str,
+    posture: &hip::Posture,
+) -> Result<Vec<String>, String> {
+    let (report, md5) = hip::report(client, session, ip, &hip_time(), posture);
     let needed = hip::parse_check(
         &http
             .send(&hip::check_request(session, ip, &md5))
             .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    if needed {
-        info!("submitting the HIP report (host information only)");
-        hip::parse_submit(
-            &http
-                .send(&hip::submit_request(session, ip, &report))
-                .map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
+    if !needed {
+        return Ok(Vec::new());
     }
-    Ok(())
+    info!("submitting the HIP report");
+    hip::parse_submit(
+        &http
+            .send(&hip::submit_request(session, ip, &report))
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -246,6 +327,7 @@ async fn transports(
     stop: &mut watch::Receiver<bool>,
     status: &StatusCell,
     addresses: &[String],
+    notice: Option<String>,
 ) -> Result<(), String> {
     let connected = |transport: &str| Status::Connected {
         profile: c.profile.clone(),
@@ -253,8 +335,11 @@ async fn transports(
         addresses: addresses.to_vec(),
         transport: transport.to_string(),
         since_unix: now_unix(),
+        notice: notice.clone(),
     };
 
+    // Without an IPv6 address on the tunnel, the system's own IPv6 traffic stays out of it.
+    let ipv6 = settings.address_v6.is_some();
     if c.allow_esp
         && let (Some(esp), Some((tunnel_ip, _))) = (&settings.esp, settings.address_v4)
     {
@@ -270,7 +355,17 @@ async fn transports(
                 Ok((socket, out, inb)) => {
                     info!("ESP is working; using UDP");
                     set(status, connected("esp"));
-                    match esp_loop(socket, out, inb, channels, stop, (tunnel_ip, probe_to)).await {
+                    match esp_loop(
+                        socket,
+                        out,
+                        inb,
+                        channels,
+                        stop,
+                        (tunnel_ip, probe_to),
+                        ipv6,
+                    )
+                    .await
+                    {
                         Ended::Stopped => return Ok(()),
                         Ended::Lost(e) => warn!("ESP stopped ({e}); switching to the TLS tunnel"),
                     }
@@ -297,7 +392,7 @@ async fn transports(
             }
         };
         set(status, connected("tls"));
-        match tls_loop(stream, channels, stop).await {
+        match tls_loop(stream, channels, stop, ipv6).await {
             Ended::Stopped => return Ok(()),
             Ended::Lost(e) => {
                 warn!("the TLS tunnel dropped: {e}");
@@ -346,6 +441,7 @@ pub async fn tls_loop<S: AsyncRead + AsyncWrite>(
     stream: S,
     channels: &mut Channels,
     stop: &mut watch::Receiver<bool>,
+    ipv6: bool,
 ) -> Ended {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut decoder = frame::Decoder::default();
@@ -361,6 +457,7 @@ pub async fn tls_loop<S: AsyncRead + AsyncWrite>(
                 return Ended::Stopped;
             },
             packet = channels.from_system.recv() => match packet {
+                Some(packet) if !ipv6 && is_ipv6(&packet) => {}
                 Some(packet) => if let Err(e) = writer.write_all(&frame::encode_packet(&packet)).await {
                     return Ended::Lost(e.to_string());
                 },
@@ -390,6 +487,10 @@ pub async fn tls_loop<S: AsyncRead + AsyncWrite>(
             },
         }
     }
+}
+
+fn is_ipv6(packet: &[u8]) -> bool {
+    packet.first().map(|b| b >> 4) == Some(6)
 }
 
 fn esp_sas(esp: &EspSettings) -> Result<(OutboundSa, InboundSa), String> {
@@ -459,6 +560,7 @@ pub async fn esp_loop(
     channels: &mut Channels,
     stop: &mut watch::Receiver<bool>,
     (tunnel_ip, probe_to): (Ipv4Addr, Ipv4Addr),
+    ipv6: bool,
 ) -> Ended {
     let mut buf = vec![0u8; 65_536];
     let mut keepalive = tokio::time::interval(ESP_KEEPALIVE);
@@ -474,6 +576,7 @@ pub async fn esp_loop(
                 return Ended::Stopped;
             },
             packet = channels.from_system.recv() => match packet {
+                Some(packet) if !ipv6 && is_ipv6(&packet) => {}
                 Some(packet) => match out.seal(packets::next_header(&packet), &packet) {
                     Ok(sealed) => if let Err(e) = socket.send(&sealed).await {
                         return Ended::Lost(e.to_string());
@@ -537,7 +640,8 @@ mod tests {
         let (client_side, mut gateway_side) = tokio::io::duplex(64 * 1024);
         let (mut ch, system_out, mut system_in) = channels();
         let (stop_tx, mut stop_rx) = watch::channel(false);
-        let task = tokio::spawn(async move { tls_loop(client_side, &mut ch, &mut stop_rx).await });
+        let task =
+            tokio::spawn(async move { tls_loop(client_side, &mut ch, &mut stop_rx, false).await });
 
         // System -> gateway.
         system_out.send(vec![0x45, 1, 2, 3]).await.unwrap();
@@ -564,7 +668,7 @@ mod tests {
         let (_stop_tx, mut stop_rx) = watch::channel(false);
         drop(gateway_side);
         assert!(matches!(
-            tls_loop(client_side, &mut ch, &mut stop_rx).await,
+            tls_loop(client_side, &mut ch, &mut stop_rx, false).await,
             Ended::Lost(_)
         ));
     }
@@ -638,6 +742,7 @@ mod tests {
                 &mut ch,
                 &mut stop_rx,
                 (tunnel_ip, probe_to),
+                false,
             )
             .await
         });

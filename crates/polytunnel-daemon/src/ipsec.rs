@@ -559,6 +559,7 @@ impl Tunnel<'_> {
                     .collect(),
                 transport: transport.into(),
                 since_unix: now_unix(),
+                notice: None,
             },
         );
         info!("connected to {} over IPsec", self.c.server);

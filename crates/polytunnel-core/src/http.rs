@@ -123,12 +123,22 @@ impl Response {
             .map(|(_, v)| v.as_str())
     }
 
-    /// The value of cookie `name` from the `Set-Cookie` headers.
+    /// The value of cookie `name` from the `Set-Cookie` headers: the last one wins, as in a
+    /// browser (servers may clear a cookie before setting it again).
     pub fn set_cookie(&self, name: &str) -> Option<String> {
-        self.headers_all("set-cookie").find_map(|header| {
+        self.set_cookies()
+            .filter(|(k, _)| k == name)
+            .map(|(_, v)| v)
+            .last()
+    }
+
+    /// Every `(name, value)` from the `Set-Cookie` headers, in order.
+    pub fn set_cookies(&self) -> impl Iterator<Item = (String, String)> + '_ {
+        self.headers_all("set-cookie").filter_map(|header| {
             let pair = header.split(';').next()?.trim();
             let (k, v) = pair.split_once('=')?;
-            (k.trim() == name).then(|| v.trim().to_string())
+            let k = k.trim();
+            (!k.is_empty()).then(|| (k.to_string(), v.trim().to_string()))
         })
     }
 
@@ -162,9 +172,92 @@ pub trait Transport {
     fn send(&self, request: &Request) -> Result<Response, HttpError>;
 }
 
+/// The cookies a server has set during one session, as a browser keeps them: the last
+/// `Set-Cookie` for a name wins, and an empty value deletes the cookie.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct CookieJar(Vec<(String, String)>);
+
+impl CookieJar {
+    /// From a `Cookie` header value (`a=1; b=2`).
+    pub fn from_header(header: &str) -> Self {
+        let mut jar = CookieJar::default();
+        for pair in header.split(';') {
+            if let Some((k, v)) = pair.split_once('=') {
+                jar.set(k.trim(), v.trim());
+            }
+        }
+        jar
+    }
+
+    fn set(&mut self, name: &str, value: &str) {
+        self.0.retain(|(k, _)| k != name);
+        if !value.is_empty() {
+            self.0.push((name.to_string(), value.to_string()));
+        }
+    }
+
+    /// Takes in the cookies a response sets.
+    pub fn update(&mut self, response: &Response) {
+        for (name, value) in response.set_cookies() {
+            self.set(&name, &value);
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The `Cookie` header value.
+    pub fn header(&self) -> String {
+        self.0
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+/// Cookie values are secrets: only the names are shown.
+impl fmt::Debug for CookieJar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(k, _)| k))
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_jar_keeps_cookies_like_a_browser() {
+        let mut jar = CookieJar::from_header("lang=en; SVPNCOOKIE=old");
+        let res = Response::new(200, "")
+            .with_header(
+                "Set-Cookie",
+                "SVPNCOOKIE=; path=/; expires=Thu, 01 Jan 1970",
+            )
+            .with_header("Set-Cookie", "SVPNCOOKIE=new; path=/; secure")
+            .with_header("Set-Cookie", "lang=; path=/");
+        jar.update(&res);
+        assert_eq!(jar.get("SVPNCOOKIE"), Some("new"));
+        assert_eq!(jar.get("lang"), None, "an empty value deletes");
+        assert_eq!(jar.header(), "SVPNCOOKIE=new");
+        assert_eq!(format!("{jar:?}"), "[\"SVPNCOOKIE\"]");
+        assert_eq!(
+            res.set_cookie("SVPNCOOKIE").as_deref(),
+            Some("new"),
+            "last wins"
+        );
+    }
 
     #[test]
     fn form_bodies_round_trip() {

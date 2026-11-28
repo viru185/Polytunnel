@@ -85,6 +85,15 @@
         <RegistryValue Root="HKLM" Key="Software\Polytunnel" Name="StartMenuShortcut"
                        Type="integer" Value="1" KeyPath="yes" />
       </Component>
+
+      <!-- `polytunnel status`, `polytunnel killswitch`, ... in any new terminal; removed on
+           uninstall. -->
+      <Component Id="PathEntry" Directory="INSTALLFOLDER">
+        <Environment Id="PathEntry" Name="PATH" Value="[INSTALLFOLDER]" Action="set" Part="last"
+                     System="yes" Permanent="no" />
+        <RegistryValue Root="HKLM" Key="Software\Polytunnel" Name="PathEntry"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
     </Feature>
   </Package>
 </Wix>

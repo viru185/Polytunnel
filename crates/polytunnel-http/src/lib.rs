@@ -1,11 +1,23 @@
 //! The real HTTP transport for Polytunnel: ureq with the operating system's TLS stack and
 //! trust store. Shared by the app (logins) and the daemon (tunnel setup, HIP, logout).
 
+mod pinned;
+pub mod trace;
+
+use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use polytunnel_core::http::{HttpError, Method, Request, Response, Transport};
+use polytunnel_core::pin::CertFingerprint;
 use ureq::Agent;
+use ureq::config::Config;
+use ureq::http::Uri;
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{Connector, DefaultConnector, NextTimeout, TcpConnector};
+
+pub use pinned::{check_pin, fingerprint, tls_connector, untrusted_certificate};
 
 /// Response bodies larger than this are refused (VPN login answers are a few KB).
 const MAX_BODY: u64 = 4 * 1024 * 1024;
@@ -15,24 +27,95 @@ pub struct UreqTransport {
 }
 
 impl UreqTransport {
+    /// HTTPS checked by the system's TLS stack and trust store.
     pub fn new() -> Self {
-        let tls = TlsConfig::builder()
-            .provider(TlsProvider::NativeTls)
-            .root_certs(RootCerts::PlatformVerifier)
-            .build();
-        let agent: Agent = Agent::config_builder()
-            .tls_config(tls)
-            // Protocol code interprets every status itself.
-            .http_status_as_error(false)
-            // ...and must see redirects instead of following them.
-            .max_redirects(0)
-            .max_redirects_will_error(false)
-            .timeout_connect(Some(Duration::from_secs(15)))
-            .timeout_global(Some(Duration::from_secs(60)))
-            .build()
-            .into();
+        Self::configured(None, None)
+    }
+
+    /// With a pin, HTTPS that accepts exactly that certificate (see [`pinned`]); without
+    /// one, the same as [`UreqTransport::new`].
+    pub fn with_server_cert(pin: Option<CertFingerprint>) -> Self {
+        Self::configured(pin, None)
+    }
+
+    /// `server`: a host name and the addresses to use for it instead of asking DNS. The
+    /// service resolves the VPN server once, before a tunnel points DNS at servers that may
+    /// only be reachable through it, and keeps talking to that same server.
+    pub fn configured(pin: Option<CertFingerprint>, server: Option<(String, Vec<IpAddr>)>) -> Self {
+        let resolver = FixedResolver {
+            fixed: server.filter(|(_, addrs)| !addrs.is_empty()),
+            system: DefaultResolver::default(),
+        };
+        let agent = match pin {
+            Some(pin) => Agent::with_parts(
+                config(),
+                TcpConnector::default().chain(pinned::PinnedTls { pin }),
+                resolver,
+            ),
+            None => Agent::with_parts(config(), DefaultConnector::new(), resolver),
+        };
         UreqTransport { agent }
     }
+}
+
+/// Answers one host name with fixed addresses and asks the system for any other.
+struct FixedResolver {
+    fixed: Option<(String, Vec<IpAddr>)>,
+    system: DefaultResolver,
+}
+
+impl fmt::Debug for FixedResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FixedResolver")
+            .field("fixed", &self.fixed)
+            .finish()
+    }
+}
+
+impl Resolver for FixedResolver {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        config: &Config,
+        timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        if let Some((host, addrs)) = &self.fixed {
+            let asked = uri
+                .host()
+                .unwrap_or_default()
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+            if asked.eq_ignore_ascii_case(host) {
+                let port = uri.port_u16().unwrap_or(443);
+                let mut out = self.empty();
+                for ip in addrs.iter().take(16) {
+                    out.push(SocketAddr::new(*ip, port));
+                }
+                return Ok(out);
+            }
+        }
+        self.system.resolve(uri, config, timeout)
+    }
+}
+
+fn config() -> Config {
+    let tls = TlsConfig::builder()
+        .provider(TlsProvider::NativeTls)
+        .root_certs(RootCerts::PlatformVerifier)
+        .build();
+    Agent::config_builder()
+        .tls_config(tls)
+        // Protocol code interprets every status itself.
+        .http_status_as_error(false)
+        // ...and must see redirects instead of following them.
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_global(Some(Duration::from_secs(60)))
+        // The app and the service run with different environments, and the tunnel itself
+        // never uses a proxy: no proxy from environment variables either.
+        .proxy(None)
+        .build()
 }
 
 impl Default for UreqTransport {
@@ -70,11 +153,13 @@ impl Transport for UreqTransport {
         let headers = response
             .headers()
             .iter()
-            .filter_map(|(name, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|v| (name.as_str().to_string(), v.to_string()))
+            // Kept even if a value has bytes outside visible ASCII (a cookie must never be
+            // dropped because of one odd character).
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
             })
             .collect();
         let body = response

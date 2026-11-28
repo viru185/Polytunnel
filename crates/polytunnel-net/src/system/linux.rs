@@ -37,10 +37,11 @@ impl System for Linux {
             if_index,
             servers,
             domains,
+            search,
         } = change
         {
             let name = if_name(*if_index)?;
-            for args in args::linux_dns(&name, servers, domains) {
+            for args in args::linux_dns(&name, servers, domains, search) {
                 run("resolvectl", &args)?;
             }
         }

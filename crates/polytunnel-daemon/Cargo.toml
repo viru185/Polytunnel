@@ -38,6 +38,7 @@ tokio-native-tls.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+wmi.workspace = true
 widestring.workspace = true
 windows-service.workspace = true
 windows-sys = { workspace = true, features = [

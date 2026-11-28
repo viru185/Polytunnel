@@ -42,6 +42,10 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $dir = "$env:ProgramFiles\Polytunnel"
+          function Get-PathEntries {
+            @([Environment]::GetEnvironmentVariable('Path', 'Machine') -split ';' |
+              Where-Object { $_.TrimEnd('\') -eq $dir })
+          }
           function Invoke-Msi($action, $msi, $log) {
             $path = (Resolve-Path $msi).Path
             $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
@@ -68,6 +72,9 @@ jobs:
             if (-not (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Polytunnel.lnk")) {
               throw 'missing Start menu shortcut'
             }
+            # `polytunnel ...` works in any new terminal.
+            $entries = Get-PathEntries
+            if ($entries.Count -ne 1) { throw "expected $dir once in the system PATH, found $($entries.Count)" }
             # The app reaches the service over its pipe, with no elevation.
             $out = ''
             for ($i = 0; $i -lt 30; $i++) {
@@ -87,6 +94,7 @@ jobs:
           Invoke-Msi '/x' 'dist\polytunnel-0.0.2-windows-x64.msi' 'uninstall.log'
           if (Get-Service | Where-Object Name -eq 'Polytunnel') { throw 'service left behind' }
           if (Test-Path $dir) { throw "$dir left behind" }
+          if ((Get-PathEntries).Count -ne 0) { throw 'PATH entry left behind' }
           Write-Host 'Uninstalled cleanly.'
           exit 0
       - name: Upload the installer logs

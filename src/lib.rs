@@ -20,6 +20,7 @@ pub mod paths;
 pub mod probe;
 pub mod prompter;
 pub mod sysinfo;
+pub mod trace;
 pub mod uri;
 #[cfg(windows)]
 pub mod win;

@@ -50,10 +50,13 @@ impl System for MacOs {
                 Err(e) => Err(e),
             };
         }
+        // Supplemental match domains also complete short names unless told not to, so the
+        // search domains need nothing more here.
         if let Change::Dns {
             if_index,
             servers,
             domains,
+            ..
         } = change
         {
             scutil(&args::macos_dns_script(
