@@ -268,7 +268,7 @@ pub fn run() -> i32 {
         Ok(Some(instance)) => instance,
         Ok(None) => return 0,
         Err(e) => {
-            eprintln!("polytunnel: cannot start the tray icon: {e}");
+            crate::applog::write("WARN", &format!("cannot start the tray icon: {e}"));
             return 1;
         }
     };
@@ -285,7 +285,7 @@ pub fn run() -> i32 {
     let event_loop = match builder.build() {
         Ok(event_loop) => event_loop,
         Err(e) => {
-            eprintln!("polytunnel: cannot start the tray icon: {e}");
+            crate::applog::write("WARN", &format!("cannot start the tray icon: {e}"));
             return 1;
         }
     };
@@ -298,7 +298,7 @@ pub fn run() -> i32 {
     MenuEvent::set_event_handler(Some(Arc::new(move |e| forward(&p, UserEvent::Menu(e)))));
     let p = proxy.clone();
     if let Err(e) = instance.listen(Role::Agent, move |m| forward(&p, UserEvent::Ipc(m))) {
-        eprintln!("polytunnel: agent IPC unavailable: {e}");
+        crate::applog::write("WARN", &format!("tray IPC unavailable: {e}"));
     }
     if std::env::var_os("POLYTUNNEL_NO_UPDATE_CHECK").is_none() {
         let p = proxy.clone();
@@ -342,6 +342,7 @@ pub fn run() -> i32 {
         last_status: None,
         prefs,
         prefs_seen: prefs::changed_at(),
+        icon_gone: false,
         guid: std::env::current_exe()
             .map(|e| notify::tray_guid(&e.display().to_string()))
             .unwrap_or(0x5054_554e_4e45_4c00_8000_4000_0000_0001),
@@ -360,7 +361,7 @@ pub fn run() -> i32 {
     match event_loop.run_app(&mut agent) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("polytunnel: {e}");
+            crate::applog::write("WARN", &format!("the tray stopped: {e}"));
             1
         }
     }
@@ -379,6 +380,9 @@ struct Agent {
     prefs_seen: Option<SystemTime>,
     /// The tray icon's GUID (notifications are sent to it).
     guid: u128,
+    /// The tray icon's window was destroyed (an installer closing Polytunnel does that): the
+    /// icon is gone, so this process ends and a fresh tray can start.
+    icon_gone: bool,
     status_item: MenuItem,
     disconnect_item: MenuItem,
     update_item: MenuItem,
@@ -420,7 +424,7 @@ impl Agent {
             .build()
         {
             Ok(tray) => self.tray = Some(tray),
-            Err(e) => eprintln!("polytunnel: cannot create the tray icon: {e}"),
+            Err(e) => crate::applog::write("WARN", &format!("cannot create the tray icon: {e}")),
         }
     }
 
@@ -486,6 +490,15 @@ impl Agent {
     }
 
     fn update(&mut self, status: Result<Status, String>) {
+        #[cfg(windows)]
+        if let Some(tray) = &self.tray {
+            use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
+            // SAFETY: IsWindow accepts any handle value.
+            if unsafe { IsWindow(tray.window_handle()) } == 0 {
+                self.icon_gone = true;
+                return;
+            }
+        }
         self.refresh_prefs();
         self.notify_change(&status);
         let connected_profile = match &status {
@@ -646,7 +659,13 @@ impl ApplicationHandler<UserEvent> for Agent {
                 self.open_window();
             }
             UserEvent::Ipc(Message::Connect(name)) => self.connect_profile(name),
-            UserEvent::Status(status) => self.update(status),
+            UserEvent::Status(status) => {
+                self.update(status);
+                if self.icon_gone {
+                    crate::applog::write("INFO", "the tray icon's window was closed; exiting");
+                    event_loop.exit();
+                }
+            }
         }
     }
 }
