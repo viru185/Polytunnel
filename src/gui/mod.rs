@@ -573,21 +573,21 @@ fn backup_list(ui: &mut egui::Ui, backups: &mut Vec<String>) {
                         .hint_text("host or host:port"),
                 );
                 if ui
-                    .add_enabled(i > 0, egui::Button::new("\u{2191}").small())
+                    .add_enabled(i > 0, egui::Button::new("Up").small())
                     .on_hover_text("Try earlier")
                     .clicked()
                 {
                     action = Some((i, -1));
                 }
                 if ui
-                    .add_enabled(i + 1 < count, egui::Button::new("\u{2193}").small())
+                    .add_enabled(i + 1 < count, egui::Button::new("Down").small())
                     .on_hover_text("Try later")
                     .clicked()
                 {
                     action = Some((i, 1));
                 }
                 if ui
-                    .add(egui::Button::new("\u{2715}").small())
+                    .add(egui::Button::new("Remove").small())
                     .on_hover_text("Remove")
                     .clicked()
                 {
@@ -667,7 +667,7 @@ fn status_line(
             ..
         }) => {
             let details = format!(
-                "{server} ({profile}) over {} · {} · {} · ↓ {} ↑ {}",
+                "{server} ({profile}) over {} · {} · {} · {} received · {} sent",
                 connect::transport_name(transport),
                 addresses.join(", "),
                 elapsed(*since_unix),
@@ -2385,7 +2385,7 @@ mod tests {
         }));
         let (text, color, _) = status_line(&connected, None);
         assert!(text.starts_with("Connected to gw.example.com (work) over ESP over TCP"));
-        assert!(text.contains("↓ 5.0 MB ↑ 900 B"));
+        assert!(text.contains("5.0 MB received · 900 B sent"));
         assert_eq!(color, Some(GREEN));
         assert_eq!(active_profile(&connected), Some("work"));
         let failed = Some(Ok(Status::Failed {
