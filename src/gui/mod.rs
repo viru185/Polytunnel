@@ -2,6 +2,13 @@
 //! the always-on tray agent ([`agent`]) is a separate, tiny process.
 
 pub mod agent;
+mod dialogs;
+mod icons;
+mod notify;
+mod prefs;
+mod screens;
+mod theme;
+mod widgets;
 mod worker;
 
 use std::collections::VecDeque;
@@ -13,12 +20,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use polytunnel_core::Secret;
-use polytunnel_core::ipc::{KillSwitchMode, KillSwitchSettings, Status};
+use polytunnel_core::ipc::{KillSwitchSettings, Status};
 use polytunnel_core::profile::{
     EapMethodName, FortinetIpsecProfile, FortinetSslProfile, GatewayPolicy, GlobalProtectProfile,
     IpsecTransport, ProbeMethod, Profile, Profiles, normalize_server, valid_host,
 };
-use polytunnel_gp::rank::{self, Probe, Ranking};
+use polytunnel_gp::rank::Ranking;
 
 use crate::instance::{self, Instance, Message, Role};
 use crate::{autostart, connect, forticlient, gateways, paths, uri};
@@ -31,12 +38,17 @@ const POLL_UNREACHABLE: Duration = Duration::from_secs(10);
 /// The kill switch is asked about once every this many status polls.
 const KILLSWITCH_EVERY: u32 = 4;
 
-const GREEN: egui::Color32 = egui::Color32::from_rgb(22, 163, 74);
-const AMBER: egui::Color32 = egui::Color32::from_rgb(217, 119, 6);
-const RED: egui::Color32 = egui::Color32::from_rgb(220, 38, 38);
+/// The window's size by default and at least, in points.
+const WINDOW_SIZE: [f32; 2] = [380.0, 680.0];
+const WINDOW_MIN: [f32; 2] = [340.0, 520.0];
 
 /// Opens the window (or brings the open one to the front) and makes sure the tray agent runs.
 pub fn run_window() -> i32 {
+    run_window_with(None)
+}
+
+/// [`run_window`], then connects with profile `connect` (a request from the tray).
+pub fn run_window_with(connect: Option<String>) -> i32 {
     #[cfg(windows)]
     crate::win::hide_own_console();
     let instance = match instance::claim(Role::Gui) {
@@ -44,7 +56,11 @@ pub fn run_window() -> i32 {
         Ok(None) => {
             // The window is open already; the tray may have been quit since.
             agent::ensure_running();
-            return match instance::send(Role::Gui, Message::Show) {
+            let message = match connect {
+                Some(name) => Message::Connect(name),
+                None => Message::Show,
+            };
+            return match instance::send(Role::Gui, message) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("polytunnel: the window is already open ({e})");
@@ -59,18 +75,30 @@ pub fn run_window() -> i32 {
     };
     agent::ensure_running();
 
+    let prefs = prefs::load();
+    let place = prefs.window.and_then(|place| {
+        prefs::placement(place, prefs::screens()?, (WINDOW_MIN[0], WINDOW_MIN[1]))
+    });
     let icon = egui::IconData {
         rgba: include_bytes!(concat!(env!("OUT_DIR"), "/icon48.rgba")).to_vec(),
         width: 48,
         height: 48,
     };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(TITLE)
+        .with_app_id("polytunnel")
+        .with_icon(icon)
+        .with_inner_size(WINDOW_SIZE)
+        .with_min_inner_size(WINDOW_MIN)
+        .with_maximize_button(false);
+    if let Some(place) = place {
+        viewport = viewport
+            .with_inner_size([place.width, place.height])
+            .with_position([place.x, place.y]);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(TITLE)
-            .with_app_id("polytunnel")
-            .with_icon(icon)
-            .with_inner_size([820.0, 580.0])
-            .with_min_inner_size([560.0, 400.0]),
+        viewport,
+        centered: place.is_none(),
         ..Default::default()
     };
     let result = eframe::run_native(
@@ -85,7 +113,15 @@ pub fn run_window() -> i32 {
                     ctx.request_repaint();
                 });
             }
-            Ok(Box::new(App::new(&cc.egui_ctx, ipc_rx, instance)))
+            theme::fonts(&cc.egui_ctx);
+            theme::apply(&cc.egui_ctx, prefs.appearance);
+            Ok(Box::new(App::new(
+                &cc.egui_ctx,
+                ipc_rx,
+                instance,
+                prefs,
+                connect,
+            )))
         }),
     );
     match result {
@@ -392,8 +428,34 @@ enum Confirm {
 }
 
 enum Leave {
-    Select(String),
     New(Kind),
+    /// Back to the profiles.
+    Close,
+}
+
+/// The window's screens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Home,
+    Profiles,
+    Edit,
+    Settings,
+    Activity,
+}
+
+/// How an activity log line is marked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Level {
+    Info,
+    Good,
+    Warning,
+    Problem,
+}
+
+struct LogLine {
+    time: String,
+    level: Level,
+    text: String,
 }
 
 #[derive(Default)]
@@ -420,7 +482,17 @@ struct App {
     worker: Option<worker::Worker>,
     prompt: Option<PromptUi>,
     browser: Option<BrowserUi>,
-    log: VecDeque<(String, String)>,
+    log: VecDeque<LogLine>,
+    screen: Screen,
+    prefs: prefs::Prefs,
+    /// Where the window is now (saved when it closes).
+    place: Option<prefs::WindowPlace>,
+    /// The profile opened in the Profiles list.
+    expanded: Option<String>,
+    /// The activity log shows only warnings and problems.
+    problems_only: bool,
+    /// A connection the tray asked for, started on the first frame.
+    pending_connect: Option<String>,
     gateways: Option<GatewaysUi>,
     ipc_rx: Receiver<Message>,
     job_tx: Sender<Job>,
@@ -560,55 +632,6 @@ fn backup_note(count: usize) -> String {
     }
 }
 
-/// The editor's list of backup gateways: each can be edited, moved up or down, or removed.
-fn backup_list(ui: &mut egui::Ui, backups: &mut Vec<String>) {
-    ui.vertical(|ui| {
-        let count = backups.len();
-        let mut action: Option<(usize, i8)> = None;
-        for (i, gateway) in backups.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(gateway)
-                        .desired_width(220.0)
-                        .hint_text("host or host:port"),
-                );
-                if ui
-                    .add_enabled(i > 0, egui::Button::new("Up").small())
-                    .on_hover_text("Try earlier")
-                    .clicked()
-                {
-                    action = Some((i, -1));
-                }
-                if ui
-                    .add_enabled(i + 1 < count, egui::Button::new("Down").small())
-                    .on_hover_text("Try later")
-                    .clicked()
-                {
-                    action = Some((i, 1));
-                }
-                if ui
-                    .add(egui::Button::new("Remove").small())
-                    .on_hover_text("Remove")
-                    .clicked()
-                {
-                    action = Some((i, 0));
-                }
-            });
-        }
-        match action {
-            Some((i, 0)) => {
-                backups.remove(i);
-            }
-            Some((i, -1)) => backups.swap(i, i - 1),
-            Some((i, _)) => backups.swap(i, i + 1),
-            None => {}
-        }
-        if backups.len() < 16 && ui.small_button("Add a gateway").clicked() {
-            backups.push(String::new());
-        }
-    });
-}
-
 /// The profile of the connection that is on, on its way, or stopping.
 fn active_profile(status: &Option<Result<Status, String>>) -> Option<&str> {
     match status {
@@ -623,91 +646,14 @@ fn active_profile(status: &Option<Result<Status, String>>) -> Option<&str> {
     }
 }
 
-/// The status bar's line: text, colour (`None`: normal text) and whether something is under
-/// way (a spinner).
-fn status_line(
-    status: &Option<Result<Status, String>>,
-    killswitch: Option<&KillSwitchState>,
-) -> (String, Option<egui::Color32>, bool) {
-    let Some(status) = status else {
-        return ("Checking…".into(), None, true);
-    };
-    match status {
-        Err(e) => (connect::service_problem(e), Some(RED), false),
-        Ok(Status::Idle {}) => match killswitch {
-            Some((settings, true, _)) if settings.mode == KillSwitchMode::Always => (
-                "Not connected. The kill switch blocks internet traffic (lockdown).".into(),
-                Some(AMBER),
-                false,
-            ),
-            Some((_, true, _)) => (
-                "Not connected. The kill switch keeps blocking internet traffic until you \
-                 disconnect."
-                    .into(),
-                Some(AMBER),
-                false,
-            ),
-            _ => ("Not connected.".into(), None, false),
-        },
-        Ok(Status::Connecting { profile }) => (format!("Connecting ({profile})…"), None, true),
-        Ok(Status::NeedsInput { profile, .. }) => (
-            format!("Waiting for your sign-in details ({profile})…"),
-            Some(AMBER),
-            true,
-        ),
-        Ok(Status::Connected {
-            profile,
-            server,
-            addresses,
-            transport,
-            since_unix,
-            notice,
-            bytes_in,
-            bytes_out,
-            ..
-        }) => {
-            let details = format!(
-                "{server} ({profile}) over {} · {} · {} · {} received · {} sent",
-                connect::transport_name(transport),
-                addresses.join(", "),
-                elapsed(*since_unix),
-                bytes(*bytes_in),
-                bytes(*bytes_out),
-            );
-            match notice {
-                Some(notice) => (
-                    format!("Connected, with limits: {notice} · {details}"),
-                    Some(AMBER),
-                    false,
-                ),
-                None => (format!("Connected to {details}"), Some(GREEN), false),
-            }
-        }
-        Ok(Status::Reconnecting {
-            profile,
-            server,
-            attempt,
-            ..
-        }) => (
-            format!("The connection dropped. Reconnecting to {server} ({profile}), try {attempt}…"),
-            Some(AMBER),
-            true,
-        ),
-        Ok(Status::Disconnecting { profile }) => {
-            (format!("Disconnecting ({profile})…"), None, true)
-        }
-        Ok(Status::Failed {
-            profile, message, ..
-        }) => (
-            format!("Couldn't connect ({profile}): {message}"),
-            Some(RED),
-            false,
-        ),
-    }
-}
-
 impl App {
-    fn new(ctx: &egui::Context, ipc_rx: Receiver<Message>, instance: Option<Instance>) -> Self {
+    fn new(
+        ctx: &egui::Context,
+        ipc_rx: Receiver<Message>,
+        instance: Option<Instance>,
+        prefs: prefs::Prefs,
+        pending_connect: Option<String>,
+    ) -> Self {
         let (poll_tx, poll_rx) = mpsc::channel();
         let repaint = ctx.clone();
         thread::Builder::new()
@@ -745,6 +691,12 @@ impl App {
             prompt: None,
             browser: None,
             log: VecDeque::new(),
+            screen: debug_screen().unwrap_or(Screen::Home),
+            prefs,
+            place: None,
+            expanded: None,
+            problems_only: false,
+            pending_connect,
             gateways: None,
             ipc_rx,
             job_tx,
@@ -762,10 +714,44 @@ impl App {
     }
 
     fn log(&mut self, line: impl Into<String>) {
+        self.log_at(Level::Info, line);
+    }
+
+    fn log_at(&mut self, level: Level, line: impl Into<String>) {
         if self.log.len() >= LOG_LINES {
             self.log.pop_front();
         }
-        self.log.push_back((clock(), line.into()));
+        self.log.push_back(LogLine {
+            time: clock(),
+            level,
+            text: line.into(),
+        });
+    }
+
+    /// Leaves the profile form (back to the profiles).
+    fn close_editor(&mut self) {
+        self.editor = None;
+        self.editor_initial = None;
+        if self.screen == Screen::Edit {
+            self.screen = Screen::Profiles;
+        }
+    }
+
+    /// Changes the appearance now and remembers it.
+    fn set_appearance(&mut self, ctx: &egui::Context, appearance: prefs::Appearance) {
+        self.prefs.appearance = appearance;
+        theme::apply(ctx, appearance);
+        self.save_prefs();
+    }
+
+    /// Saves the window's preferences (keeping the remembered place as it is on disk).
+    fn save_prefs(&mut self) {
+        let mut stored = prefs::load();
+        stored.appearance = self.prefs.appearance;
+        stored.notifications = self.prefs.notifications;
+        if let Err(e) = prefs::save(&stored) {
+            self.log_at(Level::Problem, format!("Could not save the settings: {e}"));
+        }
     }
 
     fn busy(&self) -> bool {
@@ -828,18 +814,15 @@ impl App {
 
     fn do_leave(&mut self, leave: Leave) {
         match leave {
-            Leave::Select(name) => {
-                self.selected = Some(name);
-                self.editor = None;
-                self.editor_initial = None;
-            }
             Leave::New(kind) => self.open_editor(Editor::new(kind)),
+            Leave::Close => self.close_editor(),
         }
     }
 
     fn open_editor(&mut self, editor: Editor) {
         self.editor_initial = Some(editor.clone());
         self.editor = Some(editor);
+        self.screen = Screen::Edit;
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
@@ -851,9 +834,20 @@ impl App {
                     {
                         self.logged_problem = Some(e.clone());
                         let line = format!("Service: {e}");
-                        self.log(line);
+                        self.log_at(Level::Problem, line);
                     } else if status.is_ok() {
                         self.logged_problem = None;
+                    }
+                    if let Some((level, line)) =
+                        change_line(self.status.as_ref(), &status, self.worker.is_some())
+                    {
+                        self.log_at(level, line);
+                    }
+                    // Home shows the connection that is on.
+                    if let Some(active) = active_profile(&Some(status.clone()))
+                        && self.profiles.get(active).is_some()
+                    {
+                        self.selected = Some(active.to_string());
                     }
                     self.status = Some(status);
                 }
@@ -869,6 +863,12 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 Message::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Message::Connect(name) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.pending_connect = Some(name);
+                }
             }
         }
         while let Ok(job) = self.job_rx.try_recv() {
@@ -879,7 +879,7 @@ impl App {
         if let Some(worker) = &self.worker {
             while let Ok(event) = worker.events.try_recv() {
                 match event {
-                    worker::Event::Progress(line) => lines.push(line),
+                    worker::Event::Progress(line) => lines.push((Level::Info, line)),
                     worker::Event::Prompt(worker::Prompt::Credentials {
                         title,
                         message,
@@ -954,17 +954,17 @@ impl App {
                     worker::Event::BrowserDone => self.browser = None,
                     worker::Event::Finished(result) => {
                         lines.push(match result {
-                            Ok(message) => message,
-                            Err(e) if e == connect::CANCELLED => "Cancelled.".into(),
-                            Err(e) => format!("Could not connect: {e}"),
+                            Ok(message) => (Level::Good, message),
+                            Err(e) if e == connect::CANCELLED => (Level::Info, "Cancelled.".into()),
+                            Err(e) => (Level::Problem, format!("Could not connect: {e}")),
                         });
                         finished = true;
                     }
                 }
             }
         }
-        for line in lines {
-            self.log(line);
+        for (level, line) in lines {
+            self.log_at(level, line);
         }
         if finished {
             self.worker = None;
@@ -994,7 +994,7 @@ impl App {
                 self.running.disconnect = false;
                 match result {
                     Ok(()) => self.log("Disconnected."),
-                    Err(e) => self.log(format!("Could not disconnect: {e}")),
+                    Err(e) => self.log_at(Level::Problem, format!("Could not disconnect: {e}")),
                 }
             }
             Job::KillSwitch(result) => {
@@ -1008,7 +1008,12 @@ impl App {
                         ));
                         self.killswitch = Some(state);
                     }
-                    Err(e) => self.log(format!("Could not change the kill switch: {e}")),
+                    Err(e) => {
+                        self.log_at(
+                            Level::Problem,
+                            format!("Could not change the kill switch: {e}"),
+                        );
+                    }
                 }
             }
             Job::UpdateChecked(result) => {
@@ -1088,130 +1093,6 @@ impl App {
         });
     }
 
-    fn set_preferred(&mut self, name: &str, label: Option<String>) {
-        let before = self.profiles.clone();
-        if let Some(Profile::GlobalProtect(p)) = self.profiles.profiles.get_mut(name) {
-            p.preferred_gateway = label;
-            if let Err(e) = save_profiles(&self.profiles) {
-                self.profiles = before;
-                self.log(format!("Could not save the profiles: {e}"));
-            }
-        }
-    }
-
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
-        let (text, color, working) = status_line(&self.status, self.killswitch.as_ref());
-        let can_disconnect = matches!(
-            &self.status,
-            Some(Ok(Status::Connected { .. }
-                | Status::Connecting { .. }
-                | Status::NeedsInput { .. }
-                | Status::Reconnecting { .. }))
-        ) && !self.running.disconnect;
-        let failed = matches!(&self.status, Some(Ok(Status::Failed { .. })));
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if can_disconnect && ui.button("Disconnect").clicked() {
-                    self.disconnect(ui.ctx());
-                }
-                if failed
-                    && ui
-                        .button("Dismiss")
-                        .on_hover_text("Clear this message")
-                        .clicked()
-                {
-                    self.disconnect(ui.ctx());
-                }
-                if self.running.disconnect {
-                    ui.add(egui::Spinner::new());
-                }
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    if working {
-                        ui.add(egui::Spinner::new());
-                    }
-                    let label = match color {
-                        Some(color) => egui::RichText::new(text).color(color),
-                        None => egui::RichText::new(text),
-                    };
-                    ui.add(egui::Label::new(label).wrap());
-                });
-            });
-        });
-    }
-
-    fn profile_list(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Profiles");
-        if let Some(e) = self.load_error.clone() {
-            ui.colored_label(RED, "Your profiles file could not be read:");
-            ui.add(egui::Label::new(egui::RichText::new(&e).small()).wrap());
-            ui.label("Fix or remove it, then reopen Polytunnel. Nothing is changed until then.");
-            if let Some(path) = paths::profiles_file()
-                && ui.small_button("Copy the file's location").clicked()
-            {
-                ui.ctx().copy_text(path.display().to_string());
-            }
-            ui.separator();
-        }
-        let active = active_profile(&self.status).map(str::to_string);
-        let connected = matches!(
-            &self.status,
-            Some(Ok(Status::Connected { notice: None, .. }))
-        );
-        let names: Vec<String> = self.profiles.profiles.keys().cloned().collect();
-        let mut clicked = None;
-        egui::ScrollArea::vertical()
-            .id_salt("profile-list")
-            .max_height((ui.available_height() - 140.0).max(80.0))
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                for name in &names {
-                    let kind = self
-                        .profiles
-                        .get(name)
-                        .map(Profile::kind)
-                        .unwrap_or_default();
-                    let selected =
-                        self.selected.as_deref() == Some(name.as_str()) && self.editor.is_none();
-                    let is_active = active.as_deref() == Some(name.as_str());
-                    let mut text = egui::RichText::new(format!("{name}  ·  {kind}"));
-                    if is_active {
-                        text = text.color(if connected { GREEN } else { AMBER });
-                    }
-                    let response = ui.selectable_label(selected, text);
-                    let response = if is_active {
-                        response.on_hover_text(if connected {
-                            "Connected"
-                        } else {
-                            "Connecting or reconnecting"
-                        })
-                    } else {
-                        response
-                    };
-                    if response.clicked() {
-                        clicked = Some(name.clone());
-                    }
-                }
-            });
-        if let Some(name) = clicked {
-            self.leave_editor(Leave::Select(name));
-        }
-        ui.separator();
-        ui.add_enabled_ui(!self.read_only(), |ui| {
-            if ui.button("Add GlobalProtect").clicked() {
-                self.leave_editor(Leave::New(Kind::GlobalProtect));
-            }
-            if ui.button("Add Fortinet SSL VPN").clicked() {
-                self.leave_editor(Leave::New(Kind::FortinetSsl));
-            }
-            if ui.button("Add Fortinet IPsec").clicked() {
-                self.leave_editor(Leave::New(Kind::FortinetIpsec));
-            }
-            if cfg!(windows) && ui.button("Import from FortiClient").clicked() {
-                self.import_forticlient();
-            }
-        });
-    }
-
     /// The name of a profile that already connects to the same place as `profile`.
     fn same_profile(&self, profile: &Profile) -> Option<String> {
         let target = |p: &Profile| -> (String, String) {
@@ -1275,158 +1156,12 @@ impl App {
         match save_profiles(&self.profiles) {
             Ok(()) => {
                 self.selected = Some(first);
-                self.editor = None;
-                self.editor_initial = None;
+                self.close_editor();
             }
             Err(e) => {
                 self.profiles = before;
                 self.log(format!("Could not save the profiles: {e}"));
             }
-        }
-    }
-
-    fn editor_form(&mut self, ui: &mut egui::Ui) {
-        let Some(editor) = &mut self.editor else {
-            return;
-        };
-        ui.heading(match editor.kind {
-            Kind::GlobalProtect => "GlobalProtect profile",
-            Kind::FortinetSsl => "Fortinet SSL VPN profile",
-            Kind::FortinetIpsec => "Fortinet IPsec profile",
-        });
-        egui::Grid::new("editor")
-            .num_columns(2)
-            .spacing([12.0, 8.0])
-            .show(ui, |ui| {
-                ui.label("Name");
-                ui.text_edit_singleline(&mut editor.name);
-                ui.end_row();
-                ui.label(match editor.kind {
-                    Kind::GlobalProtect => "Portal",
-                    Kind::FortinetSsl => "Server",
-                    Kind::FortinetIpsec => "Gateway",
-                });
-                ui.text_edit_singleline(&mut editor.server);
-                ui.end_row();
-                if editor.kind != Kind::GlobalProtect {
-                    ui.label("Backup gateways").on_hover_text(
-                        "Tried from the top when the gateway above cannot be reached. A wrong \
-                         password stops there.",
-                    );
-                    backup_list(ui, &mut editor.backups);
-                    ui.end_row();
-                }
-                ui.label("Username (optional)");
-                ui.text_edit_singleline(&mut editor.username);
-                ui.end_row();
-                match editor.kind {
-                    Kind::GlobalProtect => {
-                        ui.label("Always use gateway");
-                        ui.text_edit_singleline(&mut editor.gateway);
-                        ui.end_row();
-                        ui.label("Preferred gateway");
-                        ui.text_edit_singleline(&mut editor.preferred);
-                        ui.end_row();
-                        ui.label("");
-                        ui.checkbox(
-                            &mut editor.strict_tiers,
-                            "Rank strictly by priority, then speed",
-                        );
-                        ui.end_row();
-                        ui.label("");
-                        ui.checkbox(
-                            &mut editor.tcp_probe,
-                            "Measure the TCP handshake instead of TLS",
-                        );
-                        ui.end_row();
-                        if crate::embedded::helper().is_some() {
-                            ui.label("");
-                            ui.checkbox(
-                                &mut editor.embedded,
-                                "Sign in in Polytunnel's own window instead of the browser",
-                            );
-                            ui.end_row();
-                        }
-                    }
-                    Kind::FortinetSsl => {
-                        ui.label("Realm (optional)");
-                        ui.text_edit_singleline(&mut editor.realm);
-                        ui.end_row();
-                        ui.label("Server certificate (optional)").on_hover_text(
-                            "The SHA-256 fingerprint of the FortiGate's certificate, when the \
-                             system does not trust it (a factory certificate). Polytunnel then \
-                             trusts exactly that certificate for this server.",
-                        );
-                        ui.add(
-                            egui::TextEdit::singleline(&mut editor.server_cert)
-                                .hint_text("sha256:... (from the sign-in error)"),
-                        );
-                        ui.end_row();
-                    }
-                    Kind::FortinetIpsec => {
-                        ui.label("Local ID (optional)");
-                        ui.text_edit_singleline(&mut editor.local_id);
-                        ui.end_row();
-                        ui.label("DH group");
-                        ui.text_edit_singleline(&mut editor.dh_group);
-                        ui.end_row();
-                        ui.label("");
-                        ui.checkbox(&mut editor.pfs, "Perfect forward secrecy");
-                        ui.end_row();
-                        ui.label("");
-                        ui.checkbox(&mut editor.ike2, "IKEv2");
-                        ui.end_row();
-                        if editor.ike2 {
-                            ui.label("");
-                            ui.checkbox(
-                                &mut editor.eap,
-                                "Sign in with username and password (EAP-MSCHAPv2)",
-                            );
-                            ui.end_row();
-                            ui.label("");
-                            ui.checkbox(
-                                &mut editor.tcp,
-                                "IPsec over TCP (port 443 unless profiles.toml says otherwise)",
-                            );
-                            ui.end_row();
-                        } else {
-                            ui.label("");
-                            ui.checkbox(
-                                &mut editor.xauth,
-                                "Sign in with username and password (XAuth)",
-                            );
-                            ui.end_row();
-                        }
-                    }
-                }
-            });
-        if let Some(e) = &editor.error {
-            ui.colored_label(RED, e);
-        }
-        let mut action = None;
-        ui.horizontal(|ui| {
-            if ui.button("Save").clicked() {
-                action = Some("save");
-            }
-            if ui.button("Cancel").clicked() {
-                action = Some("cancel");
-            }
-            if editor.original.is_some() && ui.button("Delete…").clicked() {
-                action = Some("delete");
-            }
-        });
-        match action {
-            Some("save") => self.save_editor(),
-            Some("cancel") => {
-                self.editor = None;
-                self.editor_initial = None;
-            }
-            Some("delete") => {
-                if let Some(original) = self.editor.as_ref().and_then(|e| e.original.clone()) {
-                    self.confirm = Some(Confirm::Delete(original));
-                }
-            }
-            _ => {}
         }
     }
 
@@ -1459,8 +1194,7 @@ impl App {
         match save_profiles(&self.profiles) {
             Ok(()) => {
                 self.selected = Some(name);
-                self.editor = None;
-                self.editor_initial = None;
+                self.close_editor();
             }
             Err(e) => {
                 self.profiles = before;
@@ -1478,8 +1212,7 @@ impl App {
             Ok(()) => {
                 self.log(format!("Deleted the profile '{name}'."));
                 self.selected = self.profiles.profiles.keys().next().cloned();
-                self.editor = None;
-                self.editor_initial = None;
+                self.close_editor();
             }
             Err(e) => {
                 self.profiles = before;
@@ -1487,619 +1220,90 @@ impl App {
             }
         }
     }
+}
 
-    fn profile_view(&mut self, ui: &mut egui::Ui) {
-        let Some(name) = self.selected.clone() else {
-            ui.heading("Welcome to Polytunnel");
-            ui.label("Add a GlobalProtect or Fortinet profile on the left to get started.");
-            return;
-        };
-        let Some(profile) = self.profiles.get(&name).cloned() else {
-            return;
-        };
-        ui.heading(&name);
-        match &profile {
-            Profile::GlobalProtect(p) => ui.label(format!("GlobalProtect portal {}", p.portal)),
-            Profile::FortinetSsl(p) => ui.label(format!(
-                "Fortinet SSL VPN {}{}",
-                p.server,
-                backup_note(p.servers().len())
-            )),
-            Profile::FortinetIpsec(p) => ui.label(format!(
-                "Fortinet IPsec {}{}",
-                p.server,
-                backup_note(p.servers().len())
-            )),
-        };
-        let active = active_profile(&self.status).map(str::to_string);
-        let this_active = active.as_deref() == Some(name.as_str());
-        let up = matches!(
-            &self.status,
-            Some(Ok(Status::Connected { .. } | Status::Reconnecting { .. }))
-        );
-        ui.horizontal(|ui| {
-            let busy = self.busy();
-            if this_active && (busy || !up) {
-                if ui.button("Cancel").clicked() {
-                    self.disconnect(ui.ctx());
-                }
-            } else if this_active {
-                if ui
-                    .add_enabled(!self.running.disconnect, egui::Button::new("Disconnect"))
-                    .clicked()
-                {
-                    self.disconnect(ui.ctx());
-                }
-            } else {
-                let label = match &active {
-                    Some(other) => format!("Switch from {other} to {name}"),
-                    None => "Connect".into(),
-                };
-                if ui
-                    .add_enabled(!busy, egui::Button::new(label))
-                    .on_disabled_hover_text("Wait until the current connection attempt finishes.")
-                    .clicked()
-                {
-                    self.connect(ui.ctx(), name.clone());
-                }
-            }
-            if ui
-                .add_enabled(
-                    !busy && !this_active && !self.read_only(),
-                    egui::Button::new("Edit"),
-                )
-                .on_disabled_hover_text("Disconnect first to change this profile.")
-                .clicked()
-            {
-                self.open_editor(Editor::from_profile(&name, &profile));
-            }
-        });
+/// The bottom bar's tabs.
+const NAV: [(Screen, icons::Icon, &str); 4] = [
+    (Screen::Home, icons::Icon::Power, "Connect"),
+    (Screen::Profiles, icons::Icon::List, "Profiles"),
+    (Screen::Activity, icons::Icon::Activity, "Activity"),
+    (Screen::Settings, icons::Icon::Gear, "Settings"),
+];
 
-        if let Profile::GlobalProtect(p) = &profile {
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.strong("Gateways");
-                let measuring = self.gateways.as_ref().is_some_and(|g| g.pending.is_some());
-                let shown = self.gateways.as_ref().is_some_and(|g| g.profile == name);
-                if ui
-                    .add_enabled(
-                        !measuring,
-                        egui::Button::new(if shown {
-                            "Measure again"
-                        } else {
-                            "Find best gateway"
-                        }),
-                    )
-                    .clicked()
-                {
-                    self.find_best_gateway(ui.ctx(), &name, p);
-                }
-                if measuring {
-                    ui.add(egui::Spinner::new());
-                }
-                if let Some(preferred) = &p.preferred_gateway {
-                    ui.label(format!("Preferred: {preferred}"));
-                    if ui.small_button("Clear").clicked() {
-                        self.set_preferred(&name, None);
-                        if shown {
-                            let mut p = p.clone();
-                            p.preferred_gateway = None;
-                            self.find_best_gateway(ui.ctx(), &name, &p);
-                        }
-                    }
-                }
-            });
-            let mut prefer = None;
-            if let Some(view) = self.gateways.as_ref().filter(|g| g.profile == name) {
-                if let Some(ranking) = &view.ranking {
-                    egui::Grid::new("gateways")
-                        .striped(true)
-                        .num_columns(5)
-                        .show(ui, |ui| {
-                            for header in ["Gateway", "Priority", "Response", "Status", ""] {
-                                ui.strong(header);
-                            }
-                            ui.end_row();
-                            for (i, r) in ranking.gateways.iter().enumerate() {
-                                let is_preferred =
-                                    p.preferred_gateway.as_deref() == Some(r.gateway.label());
-                                ui.label(format!("{} ({})", r.gateway.label(), r.gateway.host()));
-                                ui.label(if r.priority == u32::MAX {
-                                    "-"
-                                } else {
-                                    rank::priority_name(r.priority)
-                                });
-                                ui.label(match r.probe {
-                                    Probe::Answered(t) => format!("{} ms", t.as_millis()),
-                                    Probe::Failed => "no answer".into(),
-                                    Probe::Unknown => "-".into(),
-                                });
-                                let status = match (ranking.chosen == Some(i), is_preferred) {
-                                    (true, true) => "best · preferred".to_string(),
-                                    (true, false) => "best".to_string(),
-                                    (false, true) => {
-                                        format!("preferred · {}", rank::describe(&r.status))
-                                    }
-                                    (false, false) => rank::describe(&r.status).to_string(),
-                                };
-                                ui.label(status);
-                                if !is_preferred && ui.small_button("Prefer").clicked() {
-                                    prefer = Some(r.gateway.label().to_string());
-                                }
-                                if is_preferred {
-                                    ui.label("");
-                                }
-                                ui.end_row();
-                            }
-                        });
-                }
-                if let Some(note) = &view.note {
-                    ui.label(note);
-                }
-            }
-            if let Some(label) = prefer {
-                self.set_preferred(&name, Some(label.clone()));
-                let mut p = p.clone();
-                p.preferred_gateway = Some(label);
-                self.find_best_gateway(ui.ctx(), &name, &p);
-            }
-        }
+/// A debug build can open on a given screen and theme (`POLYTUNNEL_SCREEN`,
+/// `POLYTUNNEL_THEME`), for screenshots.
+fn debug_screen() -> Option<Screen> {
+    if !cfg!(debug_assertions) {
+        return None;
     }
-
-    fn settings(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Settings").show(ui, |ui| {
-            if autostart::SUPPORTED
-                && ui
-                    .checkbox(
-                        &mut self.autostart,
-                        "Start Polytunnel in the tray when I sign in",
-                    )
-                    .changed()
-            {
-                if let Err(e) = autostart::set(self.autostart) {
-                    self.log(format!("Could not change the start-up setting: {e}"));
-                }
-                self.autostart = autostart::enabled();
-            }
-
-            ui.separator();
-            ui.strong("Kill switch");
-            match self.killswitch.clone() {
-                None => {
-                    ui.label("Unavailable while the Polytunnel service isn't running.");
-                }
-                Some((settings, active, problem)) => {
-                    let mut ks = settings;
-                    ui.add_enabled_ui(!self.running.killswitch, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.radio_value(&mut ks.mode, KillSwitchMode::Off, "Off");
-                            ui.radio_value(
-                                &mut ks.mode,
-                                KillSwitchMode::Connected,
-                                "While connected",
-                            );
-                            ui.radio_value(
-                                &mut ks.mode,
-                                KillSwitchMode::Always,
-                                "Always (lockdown)",
-                            );
-                            if self.running.killswitch {
-                                ui.add(egui::Spinner::new());
-                            }
-                        });
-                        ui.add_enabled(
-                            ks.mode != KillSwitchMode::Off,
-                            egui::Checkbox::new(&mut ks.allow_lan, "Allow the local network"),
-                        );
-                    });
-                    ui.label(
-                        egui::RichText::new(connect::describe_killswitch(
-                            &settings,
-                            active,
-                            problem.as_deref(),
-                        ))
-                        .small(),
-                    );
-                    if ks != settings {
-                        if ks.mode == KillSwitchMode::Always
-                            && settings.mode != KillSwitchMode::Always
-                        {
-                            self.confirm = Some(Confirm::Lockdown(ks));
-                        } else {
-                            self.set_killswitch(ui.ctx(), ks);
-                        }
-                    }
-                }
-            }
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(!self.running.update, egui::Button::new("Check for updates"))
-                    .clicked()
-                {
-                    self.running.update = true;
-                    self.spawn_job(ui.ctx(), || Job::UpdateChecked(connect::update(false)));
-                }
-                if self.running.update {
-                    ui.add(egui::Spinner::new());
-                }
-                if let Some(version) = self.update.clone()
-                    && ui
-                        .add_enabled(
-                            !self.running.update,
-                            egui::Button::new(format!("Install Polytunnel {version}")),
-                        )
-                        .clicked()
-                {
-                    self.confirm = Some(Confirm::Install(version));
-                }
-            });
-
-            if !self.link_status.is_empty() {
-                ui.separator();
-                ui.label(&self.link_status);
-                ui.horizontal(|ui| {
-                    if ui.button("Handle GlobalProtect browser sign-ins").clicked() {
-                        match uri::register() {
-                            Ok(()) => self.log("Polytunnel now handles GlobalProtect sign-ins."),
-                            Err(e) => self.log(format!("Could not register: {e}")),
-                        }
-                        self.link_status = link_status_text();
-                    }
-                    if ui.button("Stop handling them").clicked() {
-                        match uri::unregister() {
-                            Ok(()) => self.log(
-                                "Polytunnel no longer handles GlobalProtect sign-ins (it \
-                                 registers again the next time a browser sign-in needs it).",
-                            ),
-                            Err(e) => self.log(format!("Could not unregister: {e}")),
-                        }
-                        self.link_status = link_status_text();
-                    }
-                });
-            }
-
-            ui.separator();
-            let mut trace = self.trace;
-            if ui
-                .checkbox(
-                    &mut trace,
-                    "Record a troubleshooting trace (passwords and cookies are removed)",
-                )
-                .changed()
-            {
-                match crate::trace::set(trace) {
-                    Ok(()) => {
-                        self.trace = crate::trace::enabled();
-                        self.log(if self.trace {
-                            format!(
-                                "Recording connection traces in {} (the service keeps its own \
-                                 in its folder).",
-                                crate::trace::file().display()
-                            )
-                        } else {
-                            "Connection traces are off.".to_string()
-                        });
-                    }
-                    Err(e) => self.log(format!("Could not change the trace setting: {e}")),
-                }
-            }
-            if std::env::var_os("POLYTUNNEL_TRACE").is_some() {
-                ui.label(
-                    egui::RichText::new("POLYTUNNEL_TRACE is set, so traces stay on.").small(),
-                );
-            }
-            if self.trace {
-                ui.label(format!("App: {}", crate::trace::file().display()));
-                if cfg!(windows) {
-                    ui.label(r"Service: %ProgramData%\Polytunnel\trace.log (administrators only)");
-                }
-            }
-        });
+    match std::env::var("POLYTUNNEL_SCREEN").ok()?.as_str() {
+        "profiles" => Some(Screen::Profiles),
+        "settings" => Some(Screen::Settings),
+        "activity" => Some(Screen::Activity),
+        _ => Some(Screen::Home),
     }
+}
 
-    fn confirmations(&mut self, ctx: &egui::Context) {
-        let Some(confirm) = &self.confirm else {
-            return;
-        };
-        let (title, text, yes) = match confirm {
-            Confirm::Delete(name) => (
-                format!("Delete '{name}'?"),
-                "The profile is removed from Polytunnel. This cannot be undone (a copy of the \
-                 previous profiles file is kept as profiles.toml.bak)."
-                    .to_string(),
-                "Delete",
-            ),
-            Confirm::Lockdown(_) => (
-                "Turn on lockdown?".to_string(),
-                "Lockdown blocks all internet traffic whenever the VPN is not connected, \
-                 including right now, and after restarts."
-                    .to_string(),
-                "Turn on lockdown",
-            ),
-            Confirm::Install(version) => (
-                format!("Install Polytunnel {version}?"),
-                "The VPN disconnects and Polytunnel closes while the update installs, then the \
-                 tray icon comes back."
-                    .to_string(),
-                "Install",
-            ),
-            Confirm::Discard(_) => (
-                "Discard your changes?".to_string(),
-                "The profile has changes that are not saved.".to_string(),
-                "Discard",
-            ),
-        };
-        let mut answer = None;
-        let modal = egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
-            ui.set_max_width(400.0);
-            ui.heading(title);
-            ui.add(egui::Label::new(text).wrap());
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button(yes).clicked() {
-                    answer = Some(true);
-                }
-                if ui.button("Cancel").clicked() {
-                    answer = Some(false);
-                }
-            });
-        });
-        if modal.should_close() && answer.is_none() {
-            answer = Some(false);
-        }
-        let Some(yes) = answer else {
-            return;
-        };
-        let Some(confirm) = self.confirm.take() else {
-            return;
-        };
-        if !yes {
-            return;
-        }
-        match confirm {
-            Confirm::Delete(name) => self.delete_profile(&name),
-            Confirm::Lockdown(settings) => self.set_killswitch(ctx, settings),
-            Confirm::Install(_) => {
-                self.running.update = true;
-                self.spawn_job(ctx, || Job::UpdateStarted(connect::update(true)));
-            }
-            Confirm::Discard(leave) => self.do_leave(leave),
-        }
+fn debug_appearance() -> Option<prefs::Appearance> {
+    if !cfg!(debug_assertions) {
+        return None;
     }
-
-    fn prompts(&mut self, ctx: &egui::Context) {
-        let mut close = false;
-        if let Some(prompt) = &mut self.prompt {
-            let modal = egui::Modal::new(egui::Id::unique("prompt")).show(ctx, |ui| {
-                ui.set_min_width(340.0);
-                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                match prompt {
-                    PromptUi::Credentials {
-                        title,
-                        message,
-                        username_label,
-                        password_label,
-                        username,
-                        password,
-                        reply,
-                        focused,
-                    } => {
-                        ui.heading(title.as_str());
-                        if let Some(m) = message {
-                            ui.add(egui::Label::new(m.as_str()).wrap());
-                        }
-                        ui.label(username_label.as_str());
-                        let user_field = ui.text_edit_singleline(username);
-                        ui.label(password_label.as_str());
-                        let pass_field =
-                            ui.add(egui::TextEdit::singleline(password).password(true));
-                        if !*focused {
-                            if username.is_empty() {
-                                user_field.request_focus();
-                            } else {
-                                pass_field.request_focus();
-                            }
-                            *focused = true;
-                        }
-                        let ready = !username.trim().is_empty() && !password.is_empty();
-                        ui.horizontal(|ui| {
-                            let sign_in = ui.add_enabled(ready, egui::Button::new("Sign in"));
-                            if sign_in.clicked() || (ready && enter) {
-                                let _ = reply.send(Some((
-                                    username.trim().to_string(),
-                                    Secret::new(std::mem::take(password)),
-                                )));
-                                close = true;
-                            }
-                            if ui.button("Cancel").clicked() {
-                                let _ = reply.send(None);
-                                close = true;
-                            }
-                        });
-                    }
-                    PromptUi::Code {
-                        title,
-                        message,
-                        code,
-                        reply,
-                        focused,
-                    } => {
-                        ui.heading(title.as_str());
-                        ui.add(egui::Label::new(message.as_str()).wrap());
-                        let field = ui.add(egui::TextEdit::singleline(code).password(true));
-                        if !*focused {
-                            field.request_focus();
-                            *focused = true;
-                        }
-                        let ready = !code.trim().is_empty();
-                        ui.horizontal(|ui| {
-                            let ok = ui.add_enabled(ready, egui::Button::new("OK"));
-                            if ok.clicked() || (ready && enter) {
-                                let _ = reply.send(Some(Secret::new(std::mem::take(code))));
-                                close = true;
-                            }
-                            if ui.button("Cancel").clicked() {
-                                let _ = reply.send(None);
-                                close = true;
-                            }
-                        });
-                    }
-                    PromptUi::Fields {
-                        title,
-                        message,
-                        fields,
-                        reply,
-                        focused,
-                    } => {
-                        ui.heading(title.as_str());
-                        ui.add(egui::Label::new(message.as_str()).wrap());
-                        for (i, (label, secret, value)) in fields.iter_mut().enumerate() {
-                            ui.label(label.as_str());
-                            let field = ui.add(egui::TextEdit::singleline(value).password(*secret));
-                            if i == 0 && !*focused {
-                                field.request_focus();
-                                *focused = true;
-                            }
-                        }
-                        let ready = fields.iter().all(|(_, _, v)| !v.trim().is_empty());
-                        ui.horizontal(|ui| {
-                            let ok = ui.add_enabled(ready, egui::Button::new("OK"));
-                            if ok.clicked() || (ready && enter) {
-                                let values = fields
-                                    .iter_mut()
-                                    .map(|(_, _, v)| Secret::new(std::mem::take(v)))
-                                    .collect();
-                                let _ = reply.send(Some(values));
-                                close = true;
-                            }
-                            if ui.button("Cancel").clicked() {
-                                let _ = reply.send(None);
-                                close = true;
-                            }
-                        });
-                    }
-                }
-            });
-            // Escape (or a click outside) cancels.
-            if modal.should_close() && !close {
-                match prompt {
-                    PromptUi::Credentials { reply, .. } => {
-                        let _ = reply.send(None);
-                    }
-                    PromptUi::Code { reply, .. } => {
-                        let _ = reply.send(None);
-                    }
-                    PromptUi::Fields { reply, .. } => {
-                        let _ = reply.send(None);
-                    }
-                }
-                close = true;
-            }
-        }
-        if close {
-            self.prompt = None;
-        }
-
-        let mut cancel = false;
-        if let Some(browser) = &mut self.browser {
-            let modal = egui::Modal::new(egui::Id::unique("browser")).show(ctx, |ui| {
-                ui.set_max_width(480.0);
-                ui.heading("Finish signing in in your browser");
-                match &browser.not_opened {
-                    None => ui.add(
-                        egui::Label::new(format!(
-                            "Your browser opened the sign-in page for {}. Polytunnel continues \
-                             by itself when you are done.",
-                            browser.server
-                        ))
-                        .wrap(),
-                    ),
-                    Some(e) => ui.colored_label(
-                        RED,
-                        format!("The browser could not be opened ({e}). Open the link below."),
-                    ),
-                };
-                ui.horizontal(|ui| {
-                    if ui.button("Open the browser again").clicked() {
-                        browser.not_opened = crate::browser::open(&browser.url).err();
-                    }
-                    if ui.button("Copy the link").clicked() {
-                        ui.ctx().copy_text(browser.url.clone());
-                    }
-                });
-                ui.separator();
-                ui.add(
-                    egui::Label::new(
-                        "If the browser cannot hand the result back, paste the \
-                         globalprotectcallback: link (or the final page's source) here:",
-                    )
-                    .wrap(),
-                );
-                ui.add(egui::TextEdit::multiline(&mut browser.pasted).desired_rows(3));
-                if let Some(e) = &browser.paste_error {
-                    ui.colored_label(RED, e);
-                }
-                ui.horizontal(|ui| {
-                    let ready = !browser.pasted.trim().is_empty();
-                    if ui
-                        .add_enabled(ready, egui::Button::new("Use pasted result"))
-                        .clicked()
-                    {
-                        browser.paste_error = None;
-                        let _ = browser.paste.send(browser.pasted.clone());
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
-            if modal.should_close() {
-                cancel = true;
-            }
-        }
-        if cancel {
-            if let Some(worker) = &self.worker {
-                worker.cancel();
-            }
-            self.browser = None;
-        }
+    match std::env::var("POLYTUNNEL_THEME").ok()?.as_str() {
+        "light" => Some(prefs::Appearance::Light),
+        "dark" => Some(prefs::Appearance::Dark),
+        _ => None,
     }
+}
 
-    fn activity(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.strong("Activity");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Clear").clicked() {
-                    self.log.clear();
-                }
-                if ui.small_button("Copy").clicked() {
-                    let text: Vec<String> = self
-                        .log
-                        .iter()
-                        .map(|(time, line)| format!("{time}  {line}"))
-                        .collect();
-                    ui.ctx().copy_text(text.join("\n"));
-                }
-            });
-        });
-        egui::ScrollArea::vertical()
-            .stick_to_bottom(true)
-            .auto_shrink(false)
-            .show(ui, |ui| {
-                for (time, line) in &self.log {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new(time).weak().monospace());
-                        ui.add(egui::Label::new(line).wrap());
-                    });
-                }
-            });
+/// A log line for a change of the connection the window did not start itself (or that
+/// happened later): dropped, back, failed.
+fn change_line(
+    before: Option<&Result<Status, String>>,
+    now: &Result<Status, String>,
+    own_attempt: bool,
+) -> Option<(Level, String)> {
+    let before = before.and_then(|b| b.as_ref().ok());
+    match (before, now) {
+        (Some(Status::Connected { .. }), Ok(Status::Reconnecting { server, .. })) => Some((
+            Level::Warning,
+            format!("The connection to {server} dropped; reconnecting..."),
+        )),
+        (Some(Status::Reconnecting { .. }), Ok(Status::Connected { server, .. })) => {
+            Some((Level::Good, format!("The connection to {server} is back.")))
+        }
+        (
+            Some(Status::Connected { .. } | Status::Reconnecting { .. }),
+            Ok(Status::Failed { message, .. }),
+        ) if !own_attempt => Some((Level::Problem, format!("The connection ended: {message}"))),
+        _ => None,
     }
 }
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(name) = self.pending_connect.take() {
+            if self.busy() {
+                self.log_at(
+                    Level::Warning,
+                    format!("Not connecting to '{name}': another connection is being set up."),
+                );
+            } else if self.profiles.get(&name).is_some() {
+                self.selected = Some(name.clone());
+                self.screen = Screen::Home;
+                self.connect(ctx, name);
+            } else {
+                self.log_at(
+                    Level::Problem,
+                    format!("There is no profile named '{name}'."),
+                );
+            }
+        }
+        if let Some(appearance) = debug_appearance()
+            && appearance != self.prefs.appearance
+        {
+            self.prefs.appearance = appearance;
+            theme::apply(ctx, appearance);
+        }
         self.poll(ctx);
         // Back in the window: settings changed elsewhere (Task Manager, another program)
         // show as they are now.
@@ -2109,42 +1313,75 @@ impl eframe::App for App {
             self.link_status = link_status_text();
         }
         self.was_focused = focused;
+        // Where the window is, to open it there next time.
+        let (outer, inner, scale) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.outer_rect, v.inner_rect, v.native_pixels_per_point)
+        });
+        if let (Some(outer), Some(inner)) = (outer, inner) {
+            self.place = Some(prefs::WindowPlace {
+                x: outer.min.x,
+                y: outer.min.y,
+                width: inner.width(),
+                height: inner.height(),
+                scale: scale.unwrap_or(1.0),
+            });
+        }
         ctx.request_repaint_after(Duration::from_secs(1));
     }
 
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Panel::top("status").show(ui, |ui| {
-            ui.add_space(4.0);
-            self.status_bar(ui);
-            ui.add_space(4.0);
-        });
-        egui::Panel::bottom("log")
-            .resizable(true)
-            .default_size(130.0)
-            .show(ui, |ui| self.activity(ui));
-        egui::Panel::left("profiles")
-            .resizable(true)
-            .default_size(230.0)
-            .show(ui, |ui| self.profile_list(ui));
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink(false)
+        let p = theme::palette(ui.ctx());
+        let bar = egui::Frame::NONE
+            .fill(p.surface)
+            .inner_margin(egui::Margin::symmetric(6, 4));
+        if self.screen == Screen::Edit && self.editor.is_none() {
+            self.screen = Screen::Profiles;
+        }
+        if self.screen == Screen::Edit {
+            egui::Panel::bottom("editor-actions")
+                .exact_size(56.0)
+                .frame(bar.inner_margin(egui::Margin::symmetric(14, 10)))
+                .show(ui, |ui| self.editor_footer(ui));
+        } else {
+            egui::Panel::bottom("nav")
+                .exact_size(56.0)
+                .frame(bar)
                 .show(ui, |ui| {
-                    if self.editor.is_some() {
-                        self.editor_form(ui);
-                    } else {
-                        self.profile_view(ui);
-                    }
-                    ui.separator();
-                    self.settings(ui);
+                    let mut screen = self.screen;
+                    widgets::nav_bar(ui, &mut screen, &NAV);
+                    self.screen = screen;
                 });
-        });
+        }
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::NONE
+                    .fill(p.bg)
+                    .inner_margin(egui::Margin::symmetric(14, 10)),
+            )
+            .show(ui, |ui| match self.screen {
+                Screen::Home => self.home_screen(ui),
+                Screen::Profiles => self.profiles_screen(ui),
+                Screen::Edit => self.editor_screen(ui),
+                Screen::Settings => self.settings_screen(ui),
+                Screen::Activity => self.activity_screen(ui),
+            });
         let ctx = ui.ctx().clone();
         self.prompts(&ctx);
         self.confirmations(&ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Remember where the window was.
+        if let Some(place) = self.place {
+            let mut stored = prefs::load();
+            stored.window = Some(place);
+            let _ = prefs::save(&stored);
+        }
         // A connection still being set up is stopped (nobody could answer its questions any
         // more); one that is up keeps running in the service.
         let setting_up = matches!(
@@ -2352,49 +1589,45 @@ mod tests {
     }
 
     #[test]
-    fn status_lines_read_well() {
-        assert_eq!(status_line(&None, None).0, "Checking…");
-        let down = Some(Err(
-            "cannot reach the Polytunnel service (os error 2)".to_string()
-        ));
-        let (text, color, _) = status_line(&down, None);
-        assert!(text.contains("isn't running") && color == Some(RED));
-        let lockdown = (
-            KillSwitchSettings {
-                mode: KillSwitchMode::Always,
-                allow_lan: false,
-            },
-            true,
-            None,
-        );
-        assert!(
-            status_line(&Some(Ok(Status::Idle {})), Some(&lockdown))
-                .0
-                .contains("lockdown")
-        );
-        let connected = Some(Ok(Status::Connected {
+    fn connection_changes_are_logged_once() {
+        let connected = Ok(Status::Connected {
             profile: "work".into(),
             server: "gw.example.com".into(),
-            addresses: vec!["10.0.0.2".into()],
-            transport: "esp-tcp".into(),
-            since_unix: now_unix(),
+            addresses: vec![],
+            transport: "esp".into(),
+            since_unix: 0,
             notice: None,
             gateway: None,
-            bytes_in: 5 * 1024 * 1024,
-            bytes_out: 900,
-        }));
-        let (text, color, _) = status_line(&connected, None);
-        assert!(text.starts_with("Connected to gw.example.com (work) over ESP over TCP"));
-        assert!(text.contains("5.0 MB received · 900 B sent"));
-        assert_eq!(color, Some(GREEN));
-        assert_eq!(active_profile(&connected), Some("work"));
-        let failed = Some(Ok(Status::Failed {
+            bytes_in: 0,
+            bytes_out: 0,
+        });
+        let reconnecting = Ok(Status::Reconnecting {
+            profile: "work".into(),
+            server: "gw.example.com".into(),
+            attempt: 1,
+            since_unix: 0,
+        });
+        let failed = Ok(Status::Failed {
             profile: "work".into(),
             message: "no answer".into(),
             since_unix: 0,
-        }));
-        assert_eq!(active_profile(&failed), None);
-        assert!(status_line(&failed, None).0.starts_with("Couldn't connect"));
+        });
+        assert_eq!(
+            change_line(Some(&connected), &reconnecting, false).map(|l| l.0),
+            Some(Level::Warning)
+        );
+        assert_eq!(
+            change_line(Some(&reconnecting), &connected, false).map(|l| l.0),
+            Some(Level::Good)
+        );
+        assert_eq!(
+            change_line(Some(&connected), &failed, false).map(|l| l.0),
+            Some(Level::Problem)
+        );
+        // The window's own attempt reports its failure itself; no change, no line.
+        assert_eq!(change_line(Some(&connected), &failed, true), None);
+        assert_eq!(change_line(Some(&connected), &connected, false), None);
+        assert_eq!(change_line(None, &connected, false), None);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //!
 //! `main.rs` only collects the arguments and calls [`run`].
 
+pub mod applog;
 pub mod auth;
 pub mod author;
 pub mod autostart;
