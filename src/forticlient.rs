@@ -33,13 +33,14 @@ pub struct IpsecImport {
     pub skipped: Vec<String>,
 }
 
-/// The first `host:port` of FortiClient's `Server` value (`a:10443;b:10443`).
-pub fn first_server(value: &str) -> Option<String> {
+/// Every `host:port` of FortiClient's `Server` value (`a:10443;b:10443`), in order.
+pub fn servers(value: &str) -> Vec<String> {
     value
         .split(';')
         .map(str::trim)
-        .find(|s| !s.is_empty())
+        .filter(|s| !s.is_empty())
         .map(str::to_string)
+        .collect()
 }
 
 /// A FortiClient tunnel name made safe as a profile name.
@@ -115,12 +116,15 @@ pub fn ipsec_profile(v: &IpsecValues) -> Result<FortinetIpsecProfile, String> {
     if v.mode_config.unwrap_or(1) == 0 {
         return Err("has a fixed address instead of mode-config, which Polytunnel needs".into());
     }
-    let server = v
+    let mut gateways = v
         .remote_gw
         .as_deref()
-        .and_then(first_server)
-        .filter(|s| valid_host(s))
-        .ok_or("has no usable remote gateway")?;
+        .map(servers)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| valid_host(s));
+    let server = gateways.next().ok_or("has no usable remote gateway")?;
+    let backup_servers: Vec<String> = gateways.collect();
     let group = match v.p1_dh_groups {
         Some(mask) => {
             dh_group_from_mask(mask).ok_or("uses DH groups Polytunnel does not support")?
@@ -144,6 +148,7 @@ pub fn ipsec_profile(v: &IpsecValues) -> Result<FortinetIpsecProfile, String> {
     let differs = |value: Option<u32>, default: u32| value.filter(|v| *v != default);
     Ok(FortinetIpsecProfile {
         server,
+        backup_servers,
         username: text(&v.user),
         local_id: text(&v.local_id),
         dh_group: (group != DEFAULT_DH_GROUP).then_some(group),
@@ -180,16 +185,19 @@ pub fn ssl_tunnels() -> Vec<ImportedSsl> {
     reg_subkeys(Hive::LocalMachine, BASE)
         .into_iter()
         .filter_map(|tunnel| {
-            let server = reg_get_string(Hive::LocalMachine, &format!(r"{BASE}\{tunnel}"), "Server")
-                .as_deref()
-                .and_then(first_server)?;
+            let mut gateways = servers(&reg_get_string(
+                Hive::LocalMachine,
+                &format!(r"{BASE}\{tunnel}"),
+                "Server",
+            )?)
+            .into_iter();
+            let server = gateways.next()?;
             Some(ImportedSsl {
                 name: profile_name(&tunnel),
                 profile: FortinetSslProfile {
                     server,
-                    username: None,
-                    realm: None,
-                    server_cert: None,
+                    backup_servers: gateways.collect(),
+                    ..Default::default()
                 },
             })
         })
@@ -258,10 +266,10 @@ mod tests {
     #[test]
     fn servers_and_names() {
         assert_eq!(
-            first_server(" 192.0.2.10:10443;198.51.100.10:10443").as_deref(),
-            Some("192.0.2.10:10443")
+            servers(" 192.0.2.10:10443;198.51.100.10:10443"),
+            ["192.0.2.10:10443", "198.51.100.10:10443"]
         );
-        assert_eq!(first_server(";;"), None);
+        assert!(servers(";;").is_empty());
         assert_eq!(profile_name("OFFICE VPN (main)"), "office-vpn--main");
         assert_eq!(profile_name("***"), "fortinet");
     }
@@ -300,6 +308,17 @@ mod tests {
                 ..Default::default()
             })
         );
+    }
+
+    #[test]
+    fn every_remote_gateway_is_imported_in_order() {
+        let v = IpsecValues {
+            remote_gw: Some("vpn.example.net; 198.51.100.10 ;not a host".into()),
+            ..typical()
+        };
+        let p = ipsec_profile(&v).unwrap();
+        assert_eq!(p.server, "vpn.example.net");
+        assert_eq!(p.backup_servers, ["198.51.100.10"]);
     }
 
     #[test]

@@ -62,7 +62,7 @@ windows() {
     # Portable zip (run polytunnel-daemon.exe install as administrator to register the service).
     local stage="$work/polytunnel"
     mkdir -p "$stage"
-    cp "$bin/polytunnel.exe" "$bin/polytunnel-daemon.exe" "$bin/polytunnel-sso.exe"         "$work/wintun/bin/$dll/wintun.dll" "$stage/"
+    cp "$bin/polytunnel.exe" "$bin/polytunnelw.exe" "$bin/polytunnel-daemon.exe" "$bin/polytunnel-sso.exe"         "$work/wintun/bin/$dll/wintun.dll" "$stage/"
     cp LICENSE "$stage/LICENSE.txt"
     cp README.md "$notices" "$stage/"
     cp "$work/wintun/LICENSE.txt" "$stage/wintun-LICENSE.txt"

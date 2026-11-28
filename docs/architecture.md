@@ -12,7 +12,7 @@ exists while you look at it.
 │  callback, keyring, gateway  │  typed JSON │  Fortinet PPP, IKEv1/IKEv2   │
 │  probes, update checks       │   frames    │  TUN, routes, DNS, journal   │
 ├──────────────────────────────┤             │  kill switch, HIP, updates   │
-│ polytunnel --window (egui)   │             └──────────────────────────────┘
+│ polytunnel window (egui)     │             └──────────────────────────────┘
 │  only while open             │
 ├──────────────────────────────┤
 │ polytunnel-sso (optional)    │
@@ -25,7 +25,7 @@ exists while you look at it.
 | Process | Runs as | Lifetime | Job |
 |---|---|---|---|
 | `polytunnel` (agent) | the user | from login, in the tray | Logins (browser SSO, portal/gateway exchanges, Fortinet logincheck), keyring access, gateway probing, update checks, talking to the daemon |
-| `polytunnel --window` | the user | while the window is open | Profiles, connect/disconnect, gateway table, prompts, logs, settings |
+| `polytunnel window` | the user | while the window is open | Profiles, connect/disconnect, gateway table, prompts, logs, settings |
 | `polytunnel <subcommand>` | the user | one command | The same features from a terminal |
 | `polytunnel-daemon` | LocalSystem / root | always (service) | Tunnel engines, network configuration and rollback journal, kill switch, honest HIP reports, verified updates |
 | `polytunnel-sso` | the user | one login | Embedded browser for portals that cannot use the default browser |

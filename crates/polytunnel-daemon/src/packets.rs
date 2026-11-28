@@ -2,10 +2,17 @@
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::thread::{self, JoinHandle};
 
 use polytunnel_net::tun::{InterruptEvent, SyncDevice};
 use tokio::sync::mpsc;
+
+use crate::common::Counters;
+
+/// Why a connection ends when the tunnel interface's packet threads stop (the interface
+/// failed or was removed): a failure, never a stop the user asked for.
+pub const INTERFACE_STOPPED: &str = "the tunnel interface stopped working";
 
 /// Packets from the system (to send through the tunnel) and to the system (received).
 pub struct Channels {
@@ -17,29 +24,38 @@ pub struct Channels {
 pub struct Pump {
     interrupt: Arc<InterruptEvent>,
     threads: Vec<JoinHandle<()>>,
+    counters: Arc<Counters>,
 }
 
 impl Pump {
     pub fn start(device: Arc<SyncDevice>, mtu: u16) -> std::io::Result<(Pump, Channels)> {
         let interrupt = Arc::new(InterruptEvent::new()?);
+        let counters = Arc::new(Counters::default());
         let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(256);
         let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(256);
         let reader = {
-            let (device, interrupt) = (device.clone(), interrupt.clone());
+            let (device, interrupt, counters) =
+                (device.clone(), interrupt.clone(), counters.clone());
             thread::spawn(move || {
                 let mut buf = vec![0u8; usize::from(mtu) + 64];
                 read_packets(&device, &interrupt, &mut buf, |packet| {
+                    counters
+                        .bytes_out
+                        .fetch_add(packet.len() as u64, Ordering::Relaxed);
                     out_tx.blocking_send(packet.to_vec()).is_ok()
                 });
             })
         };
         let writer = {
-            let device = device.clone();
+            let (device, counters) = (device.clone(), counters.clone());
             thread::spawn(move || {
                 while let Some(packet) = in_rx.blocking_recv() {
                     if device.send(&packet).is_err() {
                         break;
                     }
+                    counters
+                        .bytes_in
+                        .fetch_add(packet.len() as u64, Ordering::Relaxed);
                 }
             })
         };
@@ -47,12 +63,18 @@ impl Pump {
             Pump {
                 interrupt,
                 threads: vec![reader, writer],
+                counters,
             },
             Channels {
                 from_system: out_rx,
                 to_system: in_tx,
             },
         ))
+    }
+
+    /// Bytes moved so far, for the status.
+    pub fn counters(&self) -> Arc<Counters> {
+        self.counters.clone()
     }
 
     /// Unblocks and joins the threads (the writer ends when its channel closes).

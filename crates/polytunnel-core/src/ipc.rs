@@ -16,7 +16,7 @@ use crate::profile::{
     normalize_server, parse_ipv4_network, valid_host,
 };
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Largest frame accepted in either direction.
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -140,6 +140,9 @@ pub struct IpsecConnect {
     pub profile: String,
     /// Host name or IPv4 address of the FortiGate.
     pub server: String,
+    /// More gateways, tried in order when the ones before do not answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backup_servers: Vec<String>,
     pub psk: Secret,
     /// Username and password for XAuth (IKEv1) or EAP (IKEv2); `None` when not used.
     pub xauth: Option<XauthLogin>,
@@ -274,6 +277,23 @@ pub enum Status {
         /// GlobalProtect gateway's HIP verdict: "VPN Access Denied ...").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notice: Option<String>,
+        /// The address the tunnel runs to (the server resolved), when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gateway: Option<String>,
+        /// Bytes received from and sent into the tunnel (IP packets) since it came up.
+        #[serde(default)]
+        bytes_in: u64,
+        #[serde(default)]
+        bytes_out: u64,
+    },
+    /// The tunnel dropped and is being brought back; the network stays set up meanwhile.
+    Reconnecting {
+        profile: String,
+        server: String,
+        /// 1 for the first try.
+        attempt: u32,
+        /// When the connection first came up (kept across reconnects).
+        since_unix: u64,
     },
     Disconnecting {
         profile: String,
@@ -281,6 +301,9 @@ pub enum Status {
     Failed {
         profile: String,
         message: String,
+        /// When it failed.
+        #[serde(default)]
+        since_unix: u64,
     },
 }
 
@@ -407,9 +430,24 @@ impl Connect {
 }
 
 impl IpsecConnect {
+    /// Every gateway, in the order to try them.
+    pub fn servers(&self) -> Vec<String> {
+        let mut list = vec![self.server.clone()];
+        for server in &self.backup_servers {
+            if !list.iter().any(|s| s.eq_ignore_ascii_case(server)) {
+                list.push(server.clone());
+            }
+        }
+        list
+    }
+
     fn validate(&self) -> Result<(), String> {
         check(printable(&self.profile, 128), "profile name")?;
         check(valid_host(&self.server), "server")?;
+        check(self.backup_servers.len() <= 16, "number of gateways")?;
+        for server in &self.backup_servers {
+            check(valid_host(server), "backup gateway")?;
+        }
         check(matches!(self.ike_version, 1 | 2), "IKE version")?;
         if self.ike_version == 1 {
             check(
@@ -579,6 +617,7 @@ mod tests {
         IpsecConnect {
             profile: "office".into(),
             server: "vpn.example.net".into(),
+            backup_servers: vec!["198.51.100.8".into()],
             psk: Secret::new(["shared", "key"].join("-")),
             xauth: Some(XauthLogin {
                 username: "user".into(),
@@ -618,6 +657,11 @@ mod tests {
         };
         assert!(bad(|c| c.server = "https://vpn.example.net".into()));
         assert!(bad(|c| c.server = "-o".into()));
+        assert!(bad(
+            |c| c.backup_servers = vec!["vpn.example.net:443".into()]
+        ));
+        assert!(bad(|c| c.backup_servers = vec!["198.51.100.9".into(); 17]));
+        assert_eq!(ipsec().servers(), ["vpn.example.net", "198.51.100.8"]);
         assert!(bad(|c| c.psk = Secret::new("")));
         assert!(bad(|c| c.psk = Secret::new("line\nbreak")));
         assert!(bad(|c| c.ike_proposals = vec!["aes256; rm".into()]));

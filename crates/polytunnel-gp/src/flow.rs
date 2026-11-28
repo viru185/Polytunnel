@@ -42,6 +42,10 @@ pub trait Prompter {
     /// A short progress message ("Contacting the portal...").
     fn progress(&mut self, _message: &str) {}
 
+    /// The portal's configuration arrived (its gateway list, for a cache), whether or not a
+    /// gateway is then chosen with [`Prompter::select_gateway`].
+    fn portal_ready(&mut self, _portal: &PortalSession) {}
+
     /// Picks the gateway when the user did not name one. `Ok(None)`: use the default
     /// [`choose_gateway`]. Implementations usually probe the gateways and call
     /// [`crate::rank::rank`].
@@ -93,6 +97,7 @@ pub fn login(
     prompter: &mut dyn Prompter,
 ) -> Result<LoginResult, GpError> {
     let portal = portal_login(transport, client, options, prompter)?;
+    prompter.portal_ready(&portal);
     let gateway = match options.gateway.as_deref() {
         Some(wanted) => choose_gateway(&portal.portal, &portal.config, Some(wanted))?,
         None => match prompter.select_gateway(&portal)? {

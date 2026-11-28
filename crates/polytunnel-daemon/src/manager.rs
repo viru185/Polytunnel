@@ -11,15 +11,40 @@ use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::common::StatusCell;
+use crate::common::{StatusCell, set};
 use crate::{gp, ipsec, killswitch};
 use crate::{info, paths, warn};
+
+/// How long a stopping connection gets to clean up before it is given up on.
+const STOP_WAIT: Duration = Duration::from_secs(20);
 
 struct Running {
     stop: watch::Sender<bool>,
     task: JoinHandle<()>,
     /// Where answers to the connection's prompts go (IPsec only).
     answers: Option<mpsc::Sender<ipsec::Answer>>,
+    /// The connection's own handle on the status.
+    status: StatusCell,
+}
+
+/// A stop was asked for: an active connection shows it is disconnecting.
+fn mark_disconnecting(status: &StatusCell) {
+    status.update(|s| {
+        if let Status::Connected { profile, .. }
+        | Status::Connecting { profile }
+        | Status::NeedsInput { profile, .. }
+        | Status::Reconnecting { profile, .. } = s
+        {
+            *s = Status::Disconnecting {
+                profile: profile.clone(),
+            };
+        }
+    });
+}
+
+/// After a stop the connection ends idle, a failure the user dismissed included.
+fn settle(status: &StatusCell) {
+    status.update(|s| *s = Status::Idle {});
 }
 
 pub struct Manager {
@@ -52,16 +77,13 @@ impl Manager {
         killswitch::load();
         Ok(Arc::new(Manager {
             runtime,
-            status: Arc::new(Mutex::new(Status::Idle {})),
+            status: StatusCell::new(),
             current: Mutex::new(None),
         }))
     }
 
     pub fn status(&self) -> Status {
-        self.status
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.status.get()
     }
 
     pub fn handle(&self, request: Request) -> Response {
@@ -83,7 +105,7 @@ impl Manager {
                 self.connect(connect)
             }
             Request::Disconnect {} => {
-                self.stop_current();
+                self.disconnect();
                 Response::Accepted {}
             }
             Request::Answer { id, values } => self.answer(id, values),
@@ -128,56 +150,99 @@ impl Manager {
         }
         self.stop_current();
         let profile = connect.profile().to_string();
-        *self.status.lock().unwrap_or_else(|e| e.into_inner()) = Status::Connecting {
-            profile: profile.clone(),
-        };
+        let status = self.status.next_run();
+        set(
+            &status,
+            Status::Connecting {
+                profile: profile.clone(),
+            },
+        );
         let (stop, stop_rx) = watch::channel(false);
-        let status = self.status.clone();
+        let run_status = status.clone();
         let mut answers = None;
         let task = match connect {
             Connect::GlobalProtect(gp) => {
                 info!("connect request for profile '{profile}' (GlobalProtect)");
-                self.runtime.spawn(gp::run(*gp, status, stop_rx))
+                self.runtime.spawn(gp::run(*gp, run_status, stop_rx))
             }
             Connect::FortinetSsl(forti) => {
                 info!("connect request for profile '{profile}' (Fortinet SSL VPN)");
                 self.runtime
-                    .spawn(crate::forti::run(forti, status, stop_rx))
+                    .spawn(crate::forti::run(forti, run_status, stop_rx))
             }
             Connect::FortinetIpsec(c) => {
                 info!("connect request for profile '{profile}' (Fortinet IPsec)");
                 let (tx, rx) = mpsc::channel(4);
                 answers = Some(tx);
-                self.runtime.spawn(ipsec::run(*c, status, stop_rx, rx))
+                self.runtime.spawn(ipsec::run(*c, run_status, stop_rx, rx))
             }
         };
         *self.current.lock().unwrap_or_else(|e| e.into_inner()) = Some(Running {
             stop,
             task,
             answers,
+            status,
         });
         Response::Accepted {}
     }
 
-    /// Stops the active connection and waits (bounded) for its cleanup.
-    pub fn stop_current(&self) {
-        let running = self
-            .current
+    fn take_current(&self) -> Option<Running> {
+        self.current
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(Running { stop, task, .. }) = running {
-            if let Status::Connected { profile, .. }
-            | Status::Connecting { profile }
-            | Status::NeedsInput { profile, .. } = self.status()
-            {
-                *self.status.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Status::Disconnecting { profile };
-            }
+            .take()
+    }
+
+    /// Stops the active connection and waits (bounded) for its cleanup, giving up on it after
+    /// that: whatever it does later can no longer change the status.
+    pub fn stop_current(&self) {
+        if let Some(Running {
+            stop,
+            mut task,
+            status,
+            ..
+        }) = self.take_current()
+        {
+            mark_disconnecting(&status);
             let _ = stop.send(true);
-            let _ = self
+            let finished = self
                 .runtime
-                .block_on(async { tokio::time::timeout(Duration::from_secs(20), task).await });
+                .block_on(async { tokio::time::timeout(STOP_WAIT, &mut task).await.is_ok() });
+            if !finished {
+                warn!("the connection did not stop within {STOP_WAIT:?}; giving up on it");
+                task.abort();
+            }
+            settle(&status);
+        }
+    }
+
+    /// The user's disconnect: answers at once and stops in the background. It also clears a
+    /// failure and ends a kill switch block held after a drop.
+    fn disconnect(&self) {
+        match self.take_current() {
+            Some(Running {
+                stop,
+                mut task,
+                status,
+                ..
+            }) => {
+                mark_disconnecting(&status);
+                let _ = stop.send(true);
+                self.runtime.spawn(async move {
+                    if tokio::time::timeout(STOP_WAIT, &mut task).await.is_err() {
+                        warn!("the connection did not stop within {STOP_WAIT:?}; giving up on it");
+                        task.abort();
+                    }
+                    settle(&status);
+                    killswitch::release();
+                });
+            }
+            None => {
+                if !matches!(self.status(), Status::Idle {}) {
+                    self.status.force(Status::Idle {});
+                }
+                killswitch::release();
+            }
         }
     }
 

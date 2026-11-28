@@ -40,7 +40,10 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 use zeroize::Zeroizing;
 
-use crate::common::{STEP_TIMEOUT, StatusCell, blocking, bring_up, now_unix, set};
+use crate::common::{
+    STEP_TIMEOUT, StatusCell, blocking, bring_up, conclude, connected_status, failed, set,
+    tunnel_ended, until_stopped,
+};
 use crate::packets::{self, Pump};
 use crate::{info, paths, warn};
 
@@ -49,6 +52,8 @@ const MTU: u16 = 1400;
 const TICK: Duration = Duration::from_millis(500);
 /// How long a prompt may wait for the user before the attempt is abandoned.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(180);
+/// Sends that keep failing this long mean the network is gone.
+const SEND_FAILING_FOR: Duration = Duration::from_secs(30);
 const IKE_PORT: u16 = 500;
 
 /// A prompt's ID and the user's values.
@@ -66,12 +71,14 @@ pub async fn run(
     let mut journal = match Journal::open(paths::journal_file()) {
         Ok(j) => j,
         Err(e) => {
+            warn!("cannot open the network journal: {e}");
             set(
                 &status,
-                Status::Failed {
+                failed(
                     profile,
-                    message: format!("network journal: {e}"),
-                },
+                    "Polytunnel could not prepare the network settings. Restart the computer                      and try again."
+                        .into(),
+                ),
             );
             return;
         }
@@ -85,20 +92,11 @@ pub async fn run(
         system.as_mut(),
     )
     .await;
-    crate::killswitch::tunnel_down();
+    let held = tunnel_ended(&status, &result);
     if let Err(e) = journal.rollback(system.as_mut()) {
         warn!("could not undo every network change: {e}");
     }
-    match result {
-        Ok(()) => {
-            info!("disconnected from {}", c.server);
-            set(&status, Status::Idle {});
-        }
-        Err(message) => {
-            warn!("connection to {} failed: {message}", c.server);
-            set(&status, Status::Failed { profile, message });
-        }
-    }
+    conclude(&status, profile, &c.server, result, held);
 }
 
 fn proposals<T>(
@@ -349,7 +347,8 @@ impl Link {
         ))
     }
 
-    async fn send_ike(&mut self, natt: bool, message: &[u8]) {
+    /// Sends an IKE message; false when it could not be sent.
+    async fn send_ike(&mut self, natt: bool, message: &[u8]) -> bool {
         let sent = match self {
             Link::Udp {
                 socket,
@@ -371,12 +370,14 @@ impl Link {
             }
             Link::Tcp { writer, .. } => writer.write_all(&tcp::frame_ike(message)).await,
         };
-        if let Err(e) = sent {
+        if let Err(e) = &sent {
             warn!("cannot send to the gateway: {e}");
         }
+        sent.is_ok()
     }
 
-    async fn send_esp(&mut self, packet: &[u8]) {
+    /// Sends an ESP packet; false when it could not be sent.
+    async fn send_esp(&mut self, packet: &[u8]) -> bool {
         let sent = match self {
             Link::Udp {
                 socket, gateway, ..
@@ -386,9 +387,10 @@ impl Link {
                 .map(|_| ()),
             Link::Tcp { writer, .. } => writer.write_all(&tcp::frame_esp(packet)).await,
         };
-        if let Err(e) = sent {
+        if let Err(e) = &sent {
             warn!("cannot send to the gateway: {e}");
         }
+        sent.is_ok()
     }
 
     async fn keepalive(&mut self) {
@@ -463,9 +465,20 @@ struct Tunnel<'a> {
     from_system: Option<mpsc::Receiver<Vec<u8>>>,
     to_system: Option<mpsc::Sender<Vec<u8>>>,
     pump: Option<Pump>,
+    /// Since when nothing could be sent to the gateway (the network went away).
+    failing_since: Option<Instant>,
 }
 
 impl Tunnel<'_> {
+    /// Notes whether a send worked.
+    fn sent(&mut self, ok: bool) {
+        if ok {
+            self.failing_since = None;
+        } else {
+            self.failing_since.get_or_insert_with(Instant::now);
+        }
+    }
+
     /// Carries out what IKE asked for. `Some`: the session is over.
     async fn carry_out(
         &mut self,
@@ -475,7 +488,10 @@ impl Tunnel<'_> {
     ) -> Option<Result<(), String>> {
         for out in outs {
             match out {
-                Output::Send { natt, message } => self.link.send_ike(natt, &message).await,
+                Output::Send { natt, message } => {
+                    let ok = self.link.send_ike(natt, &message).await;
+                    self.sent(ok);
+                }
                 Output::Prompt(p) => {
                     self.prompt_seq += 1;
                     self.prompt = Some((self.prompt_seq, Instant::now()));
@@ -538,8 +554,9 @@ impl Tunnel<'_> {
             .as_ref()
             .ok_or("the IPsec SA came up before the address was assigned")?;
         let config = tunnel_config(mc, IpAddr::V4(self.gateway), self.remote_network)?;
-        let device = bring_up(&self.c.profile, &config, journal, system)?;
+        let device = bring_up(&self.c.profile, &config, journal, system, self.status)?;
         let (pump, channels) = Pump::start(device, config.mtu).map_err(|e| e.to_string())?;
+        self.status.set_counters(pump.counters());
         self.from_system = Some(channels.from_system);
         self.to_system = Some(channels.to_system);
         self.pump = Some(pump);
@@ -549,18 +566,19 @@ impl Tunnel<'_> {
         };
         set(
             self.status,
-            Status::Connected {
-                profile: self.c.profile.clone(),
-                server: self.c.server.clone(),
-                addresses: config
+            connected_status(
+                self.status,
+                &self.c.profile,
+                &self.c.server,
+                Some(self.gateway.to_string()),
+                config
                     .addresses
                     .iter()
                     .map(|a| a.addr().to_string())
                     .collect(),
-                transport: transport.into(),
-                since_unix: now_unix(),
-                notice: None,
-            },
+                transport,
+                None,
+            ),
         );
         info!("connected to {} over IPsec", self.c.server);
         Ok(())
@@ -593,7 +611,10 @@ impl Tunnel<'_> {
             return;
         };
         match sa.seal(packets::next_header(packet), packet) {
-            Ok(sealed) => self.link.send_esp(&sealed).await,
+            Ok(sealed) => {
+                let ok = self.link.send_esp(&sealed).await;
+                self.sent(ok);
+            }
             Err(e) => warn!("cannot encrypt a packet: {e}"),
         }
     }
@@ -607,6 +628,9 @@ impl Tunnel<'_> {
     }
 }
 
+/// Connects to the first of the request's gateways that answers, in order (FortiClient's
+/// remote gateway list). A gateway that cannot be resolved or reached, or never answers IKE,
+/// is skipped; one that answered and then refused stops there.
 async fn connect_and_run(
     c: &IpsecConnect,
     status: &StatusCell,
@@ -615,6 +639,38 @@ async fn connect_and_run(
     journal: &mut Journal,
     system: &mut dyn System,
 ) -> Result<(), String> {
+    let servers = c.servers();
+    let mut silent: Vec<String> = Vec::new();
+    for (i, server) in servers.iter().enumerate() {
+        let mut one = c.clone();
+        one.server.clone_from(server);
+        match connect_to(&one, status, stop, answers, journal, system).await {
+            Ok(()) => return Ok(()),
+            Err((e, false)) if i + 1 < servers.len() => {
+                warn!("{server} did not answer ({e}); trying the next gateway");
+                silent.push(server.clone());
+            }
+            Err((e, _)) if silent.is_empty() => return Err(e),
+            Err((e, _)) => {
+                return Err(format!("{e} (no answer from {} either)", silent.join(", ")));
+            }
+        }
+    }
+    Err("the profile names no gateway".into())
+}
+
+/// One gateway. `Err((message, answered))`: `answered` is false when the gateway never
+/// answered (another one may be tried).
+async fn connect_to(
+    c: &IpsecConnect,
+    status: &StatusCell,
+    stop: &mut watch::Receiver<bool>,
+    answers: &mut mpsc::Receiver<Answer>,
+    journal: &mut Journal,
+    system: &mut dyn System,
+) -> Result<(), (String, bool)> {
+    let unanswered = |e: String| (e, false);
+    let answered = |e: String| (e, true);
     let over_tcp = c.transport == IpsecTransport::Tcp;
     info!(
         "connecting to {} (IKEv{} over {})",
@@ -622,26 +678,41 @@ async fn connect_and_run(
         c.ike_version,
         if over_tcp { "TCP" } else { "UDP" }
     );
-    let gateway = resolve(&c.server).await?;
-    let (link, local) = if over_tcp {
-        Link::tcp(gateway, c.tcp_port).await?
-    } else {
-        Link::udp(gateway).await?
+    let gateway = match until_stopped(stop, resolve(&c.server)).await {
+        Some(gateway) => gateway.map_err(unanswered)?,
+        None => return Ok(()),
+    };
+    let link = async {
+        if over_tcp {
+            Link::tcp(gateway, c.tcp_port).await
+        } else {
+            Link::udp(gateway).await
+        }
+    };
+    let (link, local) = match until_stopped(stop, link).await {
+        Some(link) => link.map_err(unanswered)?,
+        None => return Ok(()),
     };
     let remote = SocketAddr::new(
         IpAddr::V4(gateway),
         if over_tcp { c.tcp_port } else { IKE_PORT },
     );
-    let remote_network = remote_network(c)?;
+    // Problems with the request itself are not the gateway's: no other gateway is tried.
+    let remote_network = remote_network(c).map_err(answered)?;
     let ike: Box<dyn Session> = if c.ike_version == 2 {
         let request = c.clone();
-        let config = blocking(move || ike2_config(&request, local, remote)).await?;
-        Box::new(v2::Initiator::new(config, Instant::now())?)
+        let config = blocking(move || ike2_config(&request, local, remote))
+            .await
+            .map_err(answered)?;
+        Box::new(v2::Initiator::new(config, Instant::now()).map_err(answered)?)
     } else {
-        Box::new(v1::Initiator::new(
-            ike_config(c, local, remote)?,
-            Instant::now(),
-        )?)
+        Box::new(
+            v1::Initiator::new(
+                ike_config(c, local, remote).map_err(answered)?,
+                Instant::now(),
+            )
+            .map_err(answered)?,
+        )
     };
     let mut tunnel = Tunnel {
         c,
@@ -658,6 +729,7 @@ async fn connect_and_run(
         from_system: None,
         to_system: None,
         pump: None,
+        failing_since: None,
     };
     let mut outs = tunnel.ike.start(Instant::now());
     let mut tick = tokio::time::interval(TICK);
@@ -665,6 +737,8 @@ async fn connect_and_run(
     let mut keepalive = tokio::time::interval(keepalive_every);
     let mut buf = vec![0u8; 65_536];
     let mut answers_open = true;
+    // Whether the gateway has answered at all (before that, another gateway may be tried).
+    let mut heard = false;
     let result = loop {
         if let Some(end) = tunnel
             .carry_out(std::mem::take(&mut outs), journal, system)
@@ -681,7 +755,10 @@ async fn connect_and_run(
                 break Ok(());
             },
             received = tunnel.link.recv(&mut buf) => match received {
-                Ok(Incoming::Ike(message)) => outs = tunnel.ike.receive(Instant::now(), &message),
+                Ok(Incoming::Ike(message)) => {
+                    heard = true;
+                    outs = tunnel.ike.receive(Instant::now(), &message);
+                }
                 Ok(Incoming::Esp(packet)) => tunnel.on_esp(&packet).await,
                 Ok(Incoming::Nothing) => {}
                 Err(e) => break Err(e),
@@ -693,7 +770,7 @@ async fn connect_and_run(
                 }
             } => match packet {
                 Some(packet) => tunnel.on_packet(&packet).await,
-                None => break Ok(()),
+                None => break Err(packets::INTERFACE_STOPPED.into()),
             },
             answer = answers.recv(), if answers_open => match answer {
                 Some((id, values)) if tunnel.prompt.is_some_and(|(p, _)| p == id) => {
@@ -710,6 +787,10 @@ async fn connect_and_run(
                 if tunnel.prompt.is_some_and(|(_, since)| since.elapsed() > PROMPT_TIMEOUT) {
                     break Err("nobody answered the sign-in prompt".into());
                 }
+                // Without dead-peer detection nothing else would notice the network going.
+                if tunnel.failing_since.is_some_and(|since| since.elapsed() > SEND_FAILING_FOR) {
+                    break Err("nothing can be sent to the gateway any more".into());
+                }
                 outs = tunnel.ike.poll(Instant::now());
             },
             _ = keepalive.tick(), if c.nat_keepalive > 0 => tunnel.link.keepalive().await,
@@ -719,12 +800,12 @@ async fn connect_and_run(
     if !tunnel.ike.is_closed() {
         for out in tunnel.ike.close() {
             if let Output::Send { natt, message } = out {
-                tunnel.link.send_ike(natt, &message).await;
+                let _ = tunnel.link.send_ike(natt, &message).await;
             }
         }
     }
     tunnel.stop_pump();
-    result
+    result.map_err(|e| (e, heard))
 }
 
 #[cfg(test)]
@@ -737,6 +818,7 @@ mod tests {
         IpsecConnect {
             profile: "office".into(),
             server: "vpn.example.net".into(),
+            backup_servers: Vec::new(),
             psk: Secret::new(["shared", "key"].join("-")),
             xauth: Some(XauthLogin {
                 username: "user".into(),

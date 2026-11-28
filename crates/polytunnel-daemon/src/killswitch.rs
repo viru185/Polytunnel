@@ -16,8 +16,11 @@ struct Controller {
     settings: KillSwitchSettings,
     /// The active rules' backend, and whether it is the persistent (lockdown) kind.
     backend: Option<(Box<dyn KillSwitch>, bool)>,
-    /// The tunnel interface and VPN servers while a tunnel is up.
-    tunnel: Option<(u32, Vec<IpAddr>)>,
+    /// The connection (its generation), tunnel interface and VPN servers while a tunnel is up.
+    tunnel: Option<(u64, u32, Vec<IpAddr>)>,
+    /// A tunnel dropped without being asked to: in "while connected" mode traffic stays
+    /// blocked until the user disconnects or a new tunnel comes up.
+    held: bool,
     /// The last VPN servers, for lockdown while disconnected.
     last_servers: Vec<IpAddr>,
     problem: Option<String>,
@@ -30,6 +33,7 @@ static CONTROLLER: Mutex<Controller> = Mutex::new(Controller {
     },
     backend: None,
     tunnel: None,
+    held: false,
     last_servers: Vec::new(),
     problem: None,
 });
@@ -77,6 +81,38 @@ fn decode(text: &str) -> (KillSwitchSettings, Vec<IpAddr>) {
     (settings, servers)
 }
 
+/// The rules for `settings`, the tunnel (interface, servers) and whether a dropped tunnel is
+/// being held; `None`: nothing is blocked.
+fn desired(
+    settings: &KillSwitchSettings,
+    tunnel: Option<(u32, &[IpAddr])>,
+    held: bool,
+    last_servers: &[IpAddr],
+    programs: impl FnOnce() -> Vec<PathBuf>,
+) -> Option<Rules> {
+    match (settings.mode, tunnel) {
+        (KillSwitchMode::Off, _) => None,
+        (KillSwitchMode::Connected, Some((index, servers))) => Some(Rules {
+            tunnel_if: Some(index),
+            servers: servers.to_vec(),
+            allow_lan: settings.allow_lan,
+            programs: Vec::new(),
+        }),
+        (KillSwitchMode::Connected, None) if !held => None,
+        // Held after a drop, or lockdown: only the VPN servers (and Polytunnel itself, to
+        // sign in again) get out.
+        (KillSwitchMode::Connected | KillSwitchMode::Always, tunnel) => Some(Rules {
+            tunnel_if: tunnel.map(|(index, _)| index),
+            servers: match tunnel {
+                Some((_, servers)) => servers.to_vec(),
+                None => last_servers.to_vec(),
+            },
+            allow_lan: settings.allow_lan,
+            programs: programs(),
+        }),
+    }
+}
+
 /// The Polytunnel programs, allowed out during lockdown (logins while disconnected).
 fn programs() -> Vec<PathBuf> {
     let Some(dir) = std::env::current_exe()
@@ -86,10 +122,15 @@ fn programs() -> Vec<PathBuf> {
         return Vec::new();
     };
     let ext = std::env::consts::EXE_SUFFIX;
-    ["polytunnel-daemon", "polytunnel", "polytunnel-sso"]
-        .iter()
-        .map(|name| dir.join(format!("{name}{ext}")))
-        .collect()
+    [
+        "polytunnel-daemon",
+        "polytunnel",
+        "polytunnelw",
+        "polytunnel-sso",
+    ]
+    .iter()
+    .map(|name| dir.join(format!("{name}{ext}")))
+    .collect()
 }
 
 impl Controller {
@@ -102,24 +143,15 @@ impl Controller {
 
     /// Brings the rules in line with the setting and the tunnel.
     fn apply(&mut self) {
-        let rules = match (self.settings.mode, &self.tunnel) {
-            (KillSwitchMode::Off, _) | (KillSwitchMode::Connected, None) => None,
-            (KillSwitchMode::Connected, Some((index, servers))) => Some(Rules {
-                tunnel_if: Some(*index),
-                servers: servers.clone(),
-                allow_lan: self.settings.allow_lan,
-                programs: Vec::new(),
-            }),
-            (KillSwitchMode::Always, tunnel) => Some(Rules {
-                tunnel_if: tunnel.as_ref().map(|(index, _)| *index),
-                servers: match tunnel {
-                    Some((_, servers)) => servers.clone(),
-                    None => self.last_servers.clone(),
-                },
-                allow_lan: self.settings.allow_lan,
-                programs: programs(),
-            }),
-        };
+        let rules = desired(
+            &self.settings,
+            self.tunnel
+                .as_ref()
+                .map(|(_, index, servers)| (*index, servers.as_slice())),
+            self.held,
+            &self.last_servers,
+            programs,
+        );
         let persistent = self.settings.mode == KillSwitchMode::Always;
         // Switching between the kinds: take the old rules away first.
         if let Some((mut old, kind)) = self.backend.take() {
@@ -187,21 +219,47 @@ pub fn status() -> (KillSwitchSettings, bool, Option<String>) {
     )
 }
 
-/// A tunnel is up on interface `index`; `servers` must stay reachable.
-pub fn tunnel_up(index: u32, servers: Vec<IpAddr>) {
+/// Connection `generation`'s tunnel is up on interface `index`; `servers` must stay reachable.
+pub fn tunnel_up(generation: u64, index: u32, servers: Vec<IpAddr>) {
     let mut c = controller();
     c.last_servers.clone_from(&servers);
-    c.tunnel = Some((index, servers));
+    c.tunnel = Some((generation, index, servers));
+    c.held = false;
     if c.settings.mode == KillSwitchMode::Always {
         c.save();
     }
     c.apply();
 }
 
-/// The tunnel is down.
-pub fn tunnel_down() {
+/// Connection `generation`'s tunnel was taken down on purpose (the user disconnected). A
+/// newer connection's tunnel is left alone.
+pub fn tunnel_down(generation: u64) {
     let mut c = controller();
-    if c.tunnel.take().is_some() {
+    if c.tunnel.as_ref().is_some_and(|(g, ..)| *g == generation) {
+        c.tunnel = None;
+        c.held = false;
+        c.apply();
+    }
+}
+
+/// Connection `generation`'s tunnel dropped without being asked to. In "while connected"
+/// mode the blocking stays until [`release`] or a new tunnel: true when it does.
+pub fn tunnel_lost(generation: u64) -> bool {
+    let mut c = controller();
+    if !c.tunnel.as_ref().is_some_and(|(g, ..)| *g == generation) {
+        return false;
+    }
+    c.tunnel = None;
+    c.held = c.settings.mode == KillSwitchMode::Connected;
+    c.apply();
+    c.held
+}
+
+/// The user disconnected: a held block ends.
+pub fn release() {
+    let mut c = controller();
+    if c.held && c.tunnel.is_none() {
+        c.held = false;
         c.apply();
     }
 }
@@ -210,6 +268,7 @@ pub fn tunnel_down() {
 pub fn shutdown() {
     let mut c = controller();
     c.tunnel = None;
+    c.held = false;
     if c.settings.mode != KillSwitchMode::Always
         && let Some((mut backend, _)) = c.backend.take()
     {
@@ -237,5 +296,29 @@ mod tests {
             (KillSwitchSettings::default(), Vec::new())
         );
         assert_eq!(decode("mode=connected\n").0.mode, KillSwitchMode::Connected);
+    }
+
+    #[test]
+    fn a_dropped_tunnel_stays_blocked_while_connected_mode_holds_it() {
+        let connected = KillSwitchSettings {
+            mode: KillSwitchMode::Connected,
+            allow_lan: true,
+        };
+        let servers: Vec<IpAddr> = vec!["203.0.113.9".parse().unwrap()];
+        let programs = || vec![PathBuf::from("polytunnel")];
+        // Up: only the tunnel and the servers.
+        let up = desired(&connected, Some((7, &servers)), false, &[], programs).unwrap();
+        assert_eq!((up.tunnel_if, up.programs.len()), (Some(7), 0));
+        // Never connected, or disconnected on purpose: nothing is blocked.
+        assert_eq!(desired(&connected, None, false, &servers, programs), None);
+        // Dropped: blocked; the last servers and Polytunnel itself may still get out.
+        let held = desired(&connected, None, true, &servers, programs).unwrap();
+        assert_eq!(held.tunnel_if, None);
+        assert_eq!(held.servers, servers);
+        assert_eq!(held.programs, vec![PathBuf::from("polytunnel")]);
+        assert!(held.allow_lan);
+        // Off never blocks.
+        let off = KillSwitchSettings::default();
+        assert_eq!(desired(&off, None, true, &servers, programs), None);
     }
 }

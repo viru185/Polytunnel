@@ -10,9 +10,9 @@ use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList, GetConsoleWindow};
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
-    RegCloseKey, RegDeleteKeyValueW, RegDeleteKeyW, RegDeleteTreeW, RegEnumKeyExW, RegGetValueW,
-    RegOpenKeyExW, RegSetKeyValueW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ, RRF_RT_REG_BINARY,
+    RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegCloseKey, RegDeleteKeyValueW, RegDeleteKeyW,
+    RegDeleteTreeW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, RegSetKeyValueW,
 };
 use windows_sys::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -176,6 +176,27 @@ pub fn reg_get_dword(hive: Hive, key: &str, name: &str) -> Option<u32> {
         )
     };
     (code == ERROR_SUCCESS).then_some(value)
+}
+
+/// Reads a binary value (at most 64 bytes).
+pub fn reg_get_binary(hive: Hive, key: &str, name: &str) -> Option<Vec<u8>> {
+    let key = wide(key);
+    let name = wide(name);
+    let mut buf = [0u8; 64];
+    let mut bytes = buf.len() as u32;
+    // SAFETY: `buf` holds `bytes` bytes; strings are NUL-terminated.
+    let code = unsafe {
+        RegGetValueW(
+            hive.handle(),
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_BINARY,
+            null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut bytes,
+        )
+    };
+    (code == ERROR_SUCCESS).then(|| buf[..(bytes as usize).min(buf.len())].to_vec())
 }
 
 /// Deletes `HKEY_CURRENT_USER\key` and everything below it; a missing key is not an error.

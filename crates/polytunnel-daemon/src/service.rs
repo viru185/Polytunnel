@@ -76,8 +76,10 @@ pub mod windows {
     use std::time::Duration;
 
     use windows_service::service::{
-        ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
-        ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+        Service, ServiceAccess, ServiceAction, ServiceActionType, ServiceControl,
+        ServiceControlAccept, ServiceErrorControl, ServiceExitCode, ServiceFailureActions,
+        ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus,
+        ServiceType,
     };
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -86,6 +88,40 @@ pub mod windows {
     use super::{DESCRIPTION, DISPLAY_NAME, SERVICE_NAME, serve};
 
     define_windows_service!(ffi_service_main, service_main);
+
+    /// If the service stops unexpectedly (a crash, or an exit with an error), Windows starts it
+    /// again: after 2 s, 10 s, then every minute; the count resets after a day. On start it
+    /// undoes whatever network changes the stopped run left behind.
+    fn restart_on_failure(service: &Service) -> windows_service::Result<()> {
+        let restart = |secs| ServiceAction {
+            action_type: ServiceActionType::Restart,
+            delay: Duration::from_secs(secs),
+        };
+        service.update_failure_actions(ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86_400)),
+            reboot_msg: None,
+            command: None,
+            actions: Some(vec![restart(2), restart(10), restart(60)]),
+        })?;
+        service.set_failure_actions_on_non_crash_failures(true)
+    }
+
+    /// The installer creates the service without recovery actions: the service sets them on
+    /// itself (as LocalSystem it may). Windows wants the start right as well as the
+    /// change-configuration right for a "restart" action.
+    fn ensure_restart_on_failure() {
+        let result = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .and_then(|manager| {
+                manager.open_service(
+                    SERVICE_NAME,
+                    ServiceAccess::CHANGE_CONFIG | ServiceAccess::START,
+                )
+            })
+            .and_then(|service| restart_on_failure(&service));
+        if let Err(e) = result {
+            crate::warn!("cannot set the service's restart-on-failure actions: {e}");
+        }
+    }
 
     /// Called by the service control manager (`polytunnel-daemon run --service`).
     pub fn run_service() -> Result<(), String> {
@@ -119,6 +155,11 @@ pub mod windows {
         };
         let accept = ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN;
         let _ = handle.set_service_status(status(ServiceState::Running, accept, 0));
+        // The log first, so a problem setting the recovery actions is recorded.
+        if crate::paths::ensure_state_dir().is_ok() {
+            crate::log::init(Some(&crate::paths::log_file()), false);
+        }
+        ensure_restart_on_failure();
         let code = match serve(rx, false) {
             Ok(()) => 0,
             Err(e) => {
@@ -156,6 +197,7 @@ pub mod windows {
             .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
             .map_err(|e| format!("cannot create the service: {e}"))?;
         let _ = service.set_description(DESCRIPTION);
+        let _ = restart_on_failure(&service);
         service
             .start::<&str>(&[])
             .map_err(|e| format!("created, but cannot start the service: {e}"))?;

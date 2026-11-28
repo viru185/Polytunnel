@@ -25,7 +25,9 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 
 use crate::common::{
-    Ended, STEP_TIMEOUT, StatusCell, blocking, bring_up, host_port, now_unix, set,
+    Ended, RECONNECT_FOR, STEP_TIMEOUT, StatusCell, blocking, bring_up, conclude, connected_status,
+    failed, host_port, now_unix, reconnect_delay, reconnecting_status, set, tunnel_ended,
+    until_stopped,
 };
 use crate::packets::{self, Channels, Pump};
 use crate::{info, paths, warn};
@@ -34,11 +36,15 @@ use crate::{info, paths, warn};
 const TLS_KEEPALIVE: Duration = Duration::from_secs(10);
 const ESP_KEEPALIVE: Duration = Duration::from_secs(10);
 const ESP_DEAD_AFTER: Duration = Duration::from_secs(45);
-const TLS_RECONNECTS: usize = 3;
+/// The gateway answers every TLS keepalive: this long without anything from it means the
+/// tunnel is dead (the operating system's TCP timeout could take many minutes).
+const TLS_DEAD_AFTER: Duration = Duration::from_secs(40);
 /// The HIP report is sent again this often while connected, as openconnect does.
 const HIP_RECHECK: Duration = Duration::from_secs(3600);
 /// Reading the device's security state from Windows must not hold up the connection.
 const POSTURE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Logging out of a gateway that no longer answers must not hold up the disconnect.
+const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The ESP probe is an ICMP echo to the gateway's `gw-address` that the gateway only answers
 /// with this payload ("monitor", two zero bytes, "pan ha "), sent with this identifier, as
 /// openconnect documents.
@@ -118,31 +124,24 @@ pub async fn run(c: GpConnect, status: StatusCell, mut stop: watch::Receiver<boo
     let mut journal = match Journal::open(paths::journal_file()) {
         Ok(j) => j,
         Err(e) => {
+            warn!("cannot open the network journal: {e}");
             set(
                 &status,
-                Status::Failed {
+                failed(
                     profile,
-                    message: format!("network journal: {e}"),
-                },
+                    "Polytunnel could not prepare the network settings. Restart the computer                      and try again."
+                        .into(),
+                ),
             );
             return;
         }
     };
     let result = connect_and_run(&c, &status, &mut stop, &mut journal, system.as_mut()).await;
-    crate::killswitch::tunnel_down();
+    let held = tunnel_ended(&status, &result);
     if let Err(e) = journal.rollback(system.as_mut()) {
         warn!("could not undo every network change: {e}");
     }
-    match result {
-        Ok(()) => {
-            info!("disconnected from {}", c.gateway);
-            set(&status, Status::Idle {});
-        }
-        Err(message) => {
-            warn!("connection to {} failed: {message}", c.gateway);
-            set(&status, Status::Failed { profile, message });
-        }
-    }
+    conclude(&status, profile, &c.gateway, result, held);
 }
 
 async fn connect_and_run(
@@ -170,29 +169,39 @@ async fn connect_and_run(
 
     let settings = {
         let (client, session, pinned) = (client.clone(), session.clone(), pinned.clone());
-        blocking(move || {
+        let step = blocking(move || {
             let response = crate::trace::transport_to(None, pinned)
                 .send(&tunnel::getconfig_request(&client, &session))
                 .map_err(|e| e.to_string())?;
             tunnel::parse_getconfig(&response).map_err(|e| e.to_string())
-        })
-        .await?
+        });
+        match until_stopped(stop, step).await {
+            Some(settings) => settings?,
+            None => return Ok(()),
+        }
     };
 
     // HIP comes before any network change, as in openconnect: many gateways pass no traffic
     // until they have it.
     let notice = match settings.address_v4 {
-        Some((ip, _)) => hip_round(&client, &session, pinned.clone(), ip.to_string(), true).await,
+        Some((ip, _)) => {
+            let step = hip_round(&client, &session, pinned.clone(), ip.to_string(), true);
+            match until_stopped(stop, step).await {
+                Some(notice) => notice,
+                None => return Ok(()),
+            }
+        }
         None => None,
     };
 
     let mut servers = gateway_ips.clone();
     servers.extend(settings.gateway_address);
     let config = tunnel_config(&settings, servers.clone());
-    let device = bring_up(&c.profile, &config, journal, system)?;
+    let device = bring_up(&c.profile, &config, journal, system, status)?;
 
     let (pump, mut channels) =
         Pump::start(device.clone(), config.mtu).map_err(|e| e.to_string())?;
+    status.set_counters(pump.counters());
     // The report is sent again every hour; the gateway's verdict updates the status.
     let recheck = settings.address_v4.map(|(ip, _)| {
         let (client, session, pinned, status) = (
@@ -208,10 +217,11 @@ async fn connect_and_run(
                 every.tick().await;
                 let notice =
                     hip_round(&client, &session, pinned.clone(), ip.to_string(), false).await;
-                let mut current = status.lock().unwrap_or_else(|e| e.into_inner());
-                if let Status::Connected { notice: shown, .. } = &mut *current {
-                    *shown = notice;
-                }
+                status.update(|current| {
+                    if let Status::Connected { notice: shown, .. } = current {
+                        *shown = notice;
+                    }
+                });
             }
         })
     });
@@ -240,13 +250,15 @@ async fn connect_and_run(
     pump.stop();
 
     let (client, session) = (client.clone(), session.clone());
-    let _ = blocking(move || {
+    let logout = blocking(move || {
         crate::trace::transport_to(None, pinned)
             .send(&tunnel::logout_request(&client, &session))
             .map(|_| ())
             .map_err(|e| e.to_string())
-    })
-    .await;
+    });
+    if timeout(LOGOUT_TIMEOUT, logout).await.is_err() {
+        info!("the gateway did not answer the logout; disconnecting anyway");
+    }
     result
 }
 
@@ -283,9 +295,11 @@ async fn hip_round(
             }
             (!messages.is_empty()).then(|| messages.join(" "))
         }
+        // Not the gateway's verdict: only logged, so the window does not claim the server
+        // restricted anything.
         Err(e) => {
-            warn!("HIP report: {e}");
-            Some(format!("the HIP report could not be sent ({e})"))
+            warn!("the HIP report could not be sent: {e}");
+            None
         }
     }
 }
@@ -329,32 +343,70 @@ async fn transports(
     addresses: &[String],
     notice: Option<String>,
 ) -> Result<(), String> {
-    let connected = |transport: &str| Status::Connected {
-        profile: c.profile.clone(),
-        server: host.to_string(),
-        addresses: addresses.to_vec(),
-        transport: transport.to_string(),
-        since_unix: now_unix(),
-        notice: notice.clone(),
+    // A reconnect keeps when the connection first came up and the gateway's latest verdict.
+    let connected = |transport: &str| {
+        connected_status(
+            status,
+            &c.profile,
+            host,
+            Some(gateway_addr.ip().to_string()),
+            addresses.to_vec(),
+            transport,
+            notice.clone(),
+        )
     };
 
     // Without an IPv6 address on the tunnel, the system's own IPv6 traffic stays out of it.
     let ipv6 = settings.address_v6.is_some();
-    if c.allow_esp
-        && let (Some(esp), Some((tunnel_ip, _))) = (&settings.esp, settings.address_v4)
-    {
-        let probe_to = match settings.gateway_address {
-            Some(IpAddr::V4(v4)) => Some(v4),
-            _ => match gateway_addr.ip() {
-                IpAddr::V4(v4) => Some(v4),
-                IpAddr::V6(_) => None,
-            },
-        };
-        if let Some(probe_to) = probe_to {
-            match start_esp(esp, gateway_addr.ip(), tunnel_ip, probe_to).await {
-                Ok((socket, out, inb)) => {
+    // ESP when the profile allows it and the gateway offers it; its probe goes to the
+    // gateway's tunnel-side address.
+    let esp = match (&settings.esp, settings.address_v4) {
+        (Some(esp), Some((tunnel_ip, _))) if c.allow_esp => {
+            let probe_to = match settings.gateway_address {
+                Some(IpAddr::V4(v4)) => Some(v4),
+                _ => match gateway_addr.ip() {
+                    IpAddr::V4(v4) => Some(v4),
+                    IpAddr::V6(_) => None,
+                },
+            };
+            probe_to.map(|probe_to| (esp, tunnel_ip, probe_to))
+        }
+        _ => None,
+    };
+
+    // A dropped tunnel is brought back with the same session (the network stays set up, and
+    // the kill switch keeps blocking meanwhile): ESP again if it works, else TLS, with growing
+    // pauses, for up to RECONNECT_FOR.
+    let mut lost: Option<(Instant, String)> = None;
+    let mut attempt = 0u32;
+    loop {
+        if let Some((since, reason)) = &lost {
+            if since.elapsed() > RECONNECT_FOR {
+                return Err(format!(
+                    "the tunnel was lost ({reason}) and could not be brought back"
+                ));
+            }
+            attempt += 1;
+            set(
+                status,
+                reconnecting_status(status, &c.profile, host, attempt),
+            );
+            if until_stopped(stop, tokio::time::sleep(reconnect_delay(attempt)))
+                .await
+                .is_none()
+            {
+                return Ok(());
+            }
+        }
+        if let Some((esp, tunnel_ip, probe_to)) = esp {
+            let started =
+                until_stopped(stop, start_esp(esp, gateway_addr.ip(), tunnel_ip, probe_to)).await;
+            match started {
+                None => return Ok(()),
+                Some(Ok((socket, out, inb))) => {
                     info!("ESP is working; using UDP");
                     set(status, connected("esp"));
+                    attempt = 0;
                     match esp_loop(
                         socket,
                         out,
@@ -367,40 +419,39 @@ async fn transports(
                     .await
                     {
                         Ended::Stopped => return Ok(()),
-                        Ended::Lost(e) => warn!("ESP stopped ({e}); switching to the TLS tunnel"),
+                        Ended::Lost(e) => {
+                            warn!("ESP stopped ({e}); bringing the tunnel back");
+                            lost = Some((Instant::now(), e));
+                            continue;
+                        }
                     }
                 }
-                Err(e) => info!("ESP not available ({e}); using the TLS tunnel"),
+                Some(Err(e)) => info!("ESP not available ({e}); using the TLS tunnel"),
             }
+        }
+        let opened = until_stopped(
+            stop,
+            open_tls(host, gateway_addr, session, &settings.tunnel_path),
+        )
+        .await;
+        match opened {
+            None => return Ok(()),
+            Some(Ok(stream)) => {
+                set(status, connected("tls"));
+                attempt = 0;
+                match tls_loop(stream, channels, stop, ipv6).await {
+                    Ended::Stopped => return Ok(()),
+                    Ended::Lost(e) => {
+                        warn!("the TLS tunnel dropped ({e}); bringing it back");
+                        lost = Some((Instant::now(), e));
+                    }
+                }
+            }
+            // The first time, the gateway refusing the tunnel is the answer.
+            Some(Err(e)) if lost.is_none() => return Err(e),
+            Some(Err(e)) => warn!("reconnecting did not work yet: {e}"),
         }
     }
-
-    let mut last_error = String::new();
-    for attempt in 0..=TLS_RECONNECTS {
-        if *stop.borrow() {
-            return Ok(());
-        }
-        if attempt > 0 {
-            tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
-        }
-        let stream = match open_tls(host, gateway_addr, session, &settings.tunnel_path).await {
-            Ok(stream) => stream,
-            Err(e) if attempt == 0 => return Err(e),
-            Err(e) => {
-                last_error = e;
-                continue;
-            }
-        };
-        set(status, connected("tls"));
-        match tls_loop(stream, channels, stop, ipv6).await {
-            Ended::Stopped => return Ok(()),
-            Ended::Lost(e) => {
-                warn!("the TLS tunnel dropped: {e}");
-                last_error = e;
-            }
-        }
-    }
-    Err(format!("the tunnel was lost: {last_error}"))
 }
 
 async fn open_tls(
@@ -448,6 +499,8 @@ pub async fn tls_loop<S: AsyncRead + AsyncWrite>(
     let mut buf = vec![0u8; 32 * 1024];
     let mut keepalive = tokio::time::interval(TLS_KEEPALIVE);
     keepalive.tick().await;
+    // Tokio's clock, so tests can let time pass.
+    let mut last_rx = tokio::time::Instant::now();
     loop {
         if *stop.borrow() {
             return Ended::Stopped;
@@ -461,17 +514,18 @@ pub async fn tls_loop<S: AsyncRead + AsyncWrite>(
                 Some(packet) => if let Err(e) = writer.write_all(&frame::encode_packet(&packet)).await {
                     return Ended::Lost(e.to_string());
                 },
-                None => return Ended::Stopped,
+                None => return Ended::Lost(packets::INTERFACE_STOPPED.into()),
             },
             read = reader.read(&mut buf) => match read {
                 Ok(0) => return Ended::Lost("the gateway closed the tunnel".into()),
                 Ok(n) => {
+                    last_rx = tokio::time::Instant::now();
                     decoder.feed(&buf[..n]);
                     loop {
                         match decoder.next_frame() {
                             Ok(Some(frame::Frame::Packet(packet))) => {
                                 if channels.to_system.send(packet).await.is_err() {
-                                    return Ended::Stopped;
+                                    return Ended::Lost(packets::INTERFACE_STOPPED.into());
                                 }
                             }
                             Ok(Some(frame::Frame::Keepalive)) => {}
@@ -482,8 +536,13 @@ pub async fn tls_loop<S: AsyncRead + AsyncWrite>(
                 }
                 Err(e) => return Ended::Lost(e.to_string()),
             },
-            _ = keepalive.tick() => if let Err(e) = writer.write_all(&frame::encode_keepalive()).await {
-                return Ended::Lost(e.to_string());
+            _ = keepalive.tick() => {
+                if last_rx.elapsed() > TLS_DEAD_AFTER {
+                    return Ended::Lost("the gateway stopped answering".into());
+                }
+                if let Err(e) = writer.write_all(&frame::encode_keepalive()).await {
+                    return Ended::Lost(e.to_string());
+                }
             },
         }
     }
@@ -583,7 +642,7 @@ pub async fn esp_loop(
                     },
                     Err(e) => return Ended::Lost(e.to_string()),
                 },
-                None => return Ended::Stopped,
+                None => return Ended::Lost(packets::INTERFACE_STOPPED.into()),
             },
             received = socket.recv(&mut buf) => match received {
                 Ok(n) => match inb.open(&buf[..n]) {
@@ -593,7 +652,7 @@ pub async fn esp_loop(
                             continue;
                         }
                         if channels.to_system.send(packet).await.is_err() {
-                            return Ended::Stopped;
+                            return Ended::Lost(packets::INTERFACE_STOPPED.into());
                         }
                     }
                     Err(e) => warn!("dropped an ESP packet: {e}"),
@@ -621,6 +680,26 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn tls_loop_notices_a_gateway_that_stopped_answering() {
+        let (client_side, _gateway_side) = tokio::io::duplex(64 * 1024);
+        let (mut ch, _system_tx, _system_rx) = channels();
+        let (_stop_tx, mut stop_rx) = watch::channel(false);
+        // Keepalives go out, nothing comes back: the loop gives up after TLS_DEAD_AFTER.
+        let ended = tls_loop(client_side, &mut ch, &mut stop_rx, false).await;
+        assert_eq!(ended, Ended::Lost("the gateway stopped answering".into()));
+    }
+
+    #[tokio::test]
+    async fn a_stopped_tunnel_interface_is_a_failure_not_a_stop() {
+        let (client_side, _gateway_side) = tokio::io::duplex(64 * 1024);
+        let (mut ch, system_tx, _system_rx) = channels();
+        drop(system_tx);
+        let (_stop_tx, mut stop_rx) = watch::channel(false);
+        let ended = tls_loop(client_side, &mut ch, &mut stop_rx, false).await;
+        assert_eq!(ended, Ended::Lost(packets::INTERFACE_STOPPED.into()));
+    }
 
     fn channels() -> (Channels, mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
         let (out_tx, out_rx) = mpsc::channel(16);

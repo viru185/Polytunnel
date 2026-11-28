@@ -141,6 +141,10 @@ pub enum ProbeMethod {
 pub struct FortinetSslProfile {
     /// Server address: `vpn.example.com`, `vpn.example.com:10443` or an `https://` URL.
     pub server: String,
+    /// More gateways (same forms as `server`), tried in order when the ones before cannot be
+    /// reached, like FortiClient's list of remote gateways.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backup_servers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,6 +155,25 @@ pub struct FortinetSslProfile {
     pub server_cert: Option<crate::pin::CertFingerprint>,
 }
 
+impl FortinetSslProfile {
+    /// Every gateway, in the order to try them.
+    pub fn servers(&self) -> Vec<String> {
+        gateway_list(&self.server, &self.backup_servers)
+    }
+}
+
+/// `first` and then `more`, trimmed, without blanks or repeats.
+fn gateway_list(first: &str, more: &[String]) -> Vec<String> {
+    let mut list: Vec<String> = Vec::new();
+    for server in std::iter::once(first).chain(more.iter().map(String::as_str)) {
+        let server = server.trim();
+        if !server.is_empty() && !list.iter().any(|s| s.eq_ignore_ascii_case(server)) {
+            list.push(server.to_string());
+        }
+    }
+    list
+}
+
 /// A FortiGate dial-up IPsec tunnel (IKEv1 aggressive mode, pre-shared key, XAuth,
 /// mode-config), as FortiClient configures it.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -158,6 +181,10 @@ pub struct FortinetSslProfile {
 pub struct FortinetIpsecProfile {
     /// The FortiGate's host name or IPv4 address (IKE uses UDP 500 and 4500).
     pub server: String,
+    /// More gateways (host names or IPv4 addresses), tried in order when the ones before do
+    /// not answer, like FortiClient's list of remote gateways.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backup_servers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     /// FortiClient's "Local ID" (the FortiGate's peer ID). Unset: our IP address.
@@ -221,6 +248,13 @@ pub struct FortinetIpsecProfile {
     /// The gateway's TCP port for `transport = "tcp"` (default 443).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_port: Option<u16>,
+}
+
+impl FortinetIpsecProfile {
+    /// Every gateway, in the order to try them.
+    pub fn servers(&self) -> Vec<String> {
+        gateway_list(&self.server, &self.backup_servers)
+    }
 }
 
 /// EAP methods for IKEv2 sign-in.
@@ -389,6 +423,38 @@ pub fn valid_host(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fortinet_profiles_list_their_gateways_in_order() {
+        let text = r#"
+[profile.office]
+type = "fortinet-ssl"
+server = "fw.example.net:10443"
+backup-servers = ["fw-backup.example.net:10443", " ", "FW.example.net:10443"]
+
+[profile.lab]
+type = "fortinet-ipsec"
+server = "198.51.100.7"
+"#;
+        let profiles = Profiles::parse(text).unwrap();
+        let Some(Profile::FortinetSsl(office)) = profiles.get("office") else {
+            panic!("office");
+        };
+        assert_eq!(
+            office.servers(),
+            ["fw.example.net:10443", "fw-backup.example.net:10443"]
+        );
+        let Some(Profile::FortinetIpsec(lab)) = profiles.get("lab") else {
+            panic!("lab");
+        };
+        assert_eq!(lab.servers(), ["198.51.100.7"]);
+        assert!(lab.backup_servers.is_empty());
+        // Written back the same way; no list when there are no backups.
+        let again = Profiles::parse(&profiles.to_toml()).unwrap();
+        assert_eq!(again, profiles);
+        assert!(profiles.to_toml().contains("backup-servers = ["));
+        assert_eq!(profiles.to_toml().matches("backup-servers").count(), 1);
+    }
 
     #[test]
     fn parses_both_profile_types() {

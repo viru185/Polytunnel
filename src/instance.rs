@@ -66,7 +66,12 @@ pub struct Instance {
 pub fn claim(role: Role) -> io::Result<Option<Instance>> {
     let dir = paths::runtime_dir();
     fs::create_dir_all(&dir)?;
-    let lock = File::create(dir.join(format!("{}.lock", role.name())))?;
+    // Opened, not created afresh: truncating a file another process holds locked fails.
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(format!("{}.lock", role.name())))?;
     match lock.try_lock() {
         Ok(()) => Ok(Some(Instance { _lock: lock })),
         Err(fs::TryLockError::WouldBlock) => Ok(None),

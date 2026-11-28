@@ -65,7 +65,7 @@ jobs:
             if ($services.Count -ne 1 -or $services[0].Status -ne 'Running') {
               throw "expected the Polytunnel service running, found: $($services | Out-String)"
             }
-            foreach ($file in 'polytunnel.exe', 'polytunnel-daemon.exe', 'polytunnel-sso.exe', 'wintun.dll', 'LICENSE.txt',
+            foreach ($file in 'polytunnel.exe', 'polytunnelw.exe', 'polytunnel-daemon.exe', 'polytunnel-sso.exe', 'wintun.dll', 'LICENSE.txt',
                               'THIRD-PARTY-NOTICES.txt', 'wintun-LICENSE.txt') {
               if (-not (Test-Path "$dir\$file")) { throw "missing $file" }
             }

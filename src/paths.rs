@@ -32,6 +32,19 @@ pub fn log_dir() -> PathBuf {
         .join(APP_DIR)
 }
 
+/// The program that opens the window and the tray without a console window: `polytunnelw`
+/// next to this program (Windows), else this program itself.
+pub fn gui_program() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    if cfg!(windows)
+        && let Some(gui) = exe.parent().map(|d| d.join("polytunnelw.exe"))
+        && gui.is_file()
+    {
+        return Some(gui);
+    }
+    Some(exe)
+}
+
 /// The login name, reduced to characters that are safe in pipe and file names.
 pub fn user_name() -> String {
     let raw = std::env::var("USERNAME")
