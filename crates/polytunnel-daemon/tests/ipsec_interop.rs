@@ -36,6 +36,7 @@ fn ikev1(psk: String, password: String, esp_lifetime: u32) -> IpsecConnect {
     IpsecConnect {
         profile: "interop".into(),
         server: env("GATEWAY"),
+        backup_servers: Vec::new(),
         psk: Secret::new(psk),
         xauth: Some(XauthLogin {
             username: env("USER"),

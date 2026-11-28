@@ -145,9 +145,20 @@ pub fn connect_request(
                 .into(),
         );
     }
+    let mut backup_servers = Vec::new();
+    for gateway in p.servers().into_iter().skip(1) {
+        let host = gateway.trim().to_ascii_lowercase();
+        if !valid_host(&host) {
+            return Err(format!(
+                "'{gateway}' is not a host name or IPv4 address (IPsec gateways have no scheme                  or port)"
+            ));
+        }
+        backup_servers.push(host);
+    }
     let request = IpsecConnect {
         profile: name,
         server,
+        backup_servers,
         psk: secrets.psk,
         xauth,
         local_id: p.local_id.clone().filter(|s| !s.trim().is_empty()),

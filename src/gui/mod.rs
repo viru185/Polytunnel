@@ -115,6 +115,8 @@ struct Editor {
     gateway: String,
     preferred: String,
     realm: String,
+    /// Fortinet: more gateways, tried in order after `server`.
+    backups: Vec<String>,
     /// Fortinet SSL: the trusted certificate's SHA-256 (empty: the system decides).
     server_cert: String,
     strict_tiers: bool,
@@ -129,7 +131,6 @@ struct Editor {
     tcp: bool,
     /// The profile being edited: settings the form does not show are kept.
     gp_base: GlobalProtectProfile,
-    forti_base: FortinetSslProfile,
     ipsec_base: FortinetIpsecProfile,
     error: Option<String>,
 }
@@ -145,6 +146,7 @@ impl Editor {
             gateway: String::new(),
             preferred: String::new(),
             realm: String::new(),
+            backups: Vec::new(),
             server_cert: String::new(),
             strict_tiers: false,
             tcp_probe: false,
@@ -157,7 +159,6 @@ impl Editor {
             eap: false,
             tcp: false,
             gp_base: GlobalProtectProfile::default(),
-            forti_base: FortinetSslProfile::default(),
             ipsec_base: FortinetIpsecProfile::default(),
             error: None,
         }
@@ -185,8 +186,8 @@ impl Editor {
                 server: p.server.clone(),
                 username: text(&p.username),
                 realm: text(&p.realm),
+                backups: p.backup_servers.clone(),
                 server_cert: p.server_cert.map(|c| c.to_string()).unwrap_or_default(),
-                forti_base: p.clone(),
                 ..Editor::new(Kind::FortinetSsl)
             },
             Profile::FortinetIpsec(p) => Editor {
@@ -195,6 +196,7 @@ impl Editor {
                 server: p.server.clone(),
                 username: text(&p.username),
                 local_id: text(&p.local_id),
+                backups: p.backup_servers.clone(),
                 dh_group: p
                     .dh_group
                     .unwrap_or(crate::ipsec::DEFAULT_DH_GROUP)
@@ -237,6 +239,23 @@ impl Editor {
         } else {
             normalize_server(&self.server).map_err(|e| e.to_string())?;
         }
+        let mut backups = Vec::new();
+        for (i, gateway) in self.backups.iter().map(|g| g.trim()).enumerate() {
+            if gateway.is_empty() {
+                continue;
+            }
+            let usable = match self.kind {
+                Kind::FortinetIpsec => valid_host(gateway),
+                _ => normalize_server(gateway).is_ok(),
+            };
+            if !usable {
+                return Err(format!(
+                    "Backup gateway {} ('{gateway}') is not a usable address.",
+                    i + 1
+                ));
+            }
+            backups.push(gateway.to_string());
+        }
         let opt = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
         let profile = match self.kind {
             Kind::GlobalProtect => Profile::GlobalProtect(GlobalProtectProfile {
@@ -251,6 +270,7 @@ impl Editor {
             }),
             Kind::FortinetSsl => Profile::FortinetSsl(FortinetSslProfile {
                 server: self.server.trim().to_string(),
+                backup_servers: backups,
                 username: opt(&self.username),
                 realm: opt(&self.realm),
                 server_cert: match self.server_cert.trim() {
@@ -260,7 +280,6 @@ impl Editor {
                             .map_err(|e| format!("Server certificate: {e}."))?,
                     ),
                 },
-                ..self.forti_base.clone()
             }),
             Kind::FortinetIpsec => {
                 let group: u16 = self
@@ -273,6 +292,7 @@ impl Editor {
                 let base = &self.ipsec_base;
                 Profile::FortinetIpsec(FortinetIpsecProfile {
                     server: self.server.trim().to_string(),
+                    backup_servers: backups,
                     username: opt(&self.username),
                     local_id: opt(&self.local_id),
                     dh_group: (group != crate::ipsec::DEFAULT_DH_GROUP).then_some(group),
@@ -529,6 +549,64 @@ fn bytes(n: u64) -> String {
     } else {
         format!("{:.2} GB", f / (K * K * K))
     }
+}
+
+/// ` (+2 backup gateways)` for a list of `count` gateways.
+fn backup_note(count: usize) -> String {
+    match count {
+        0 | 1 => String::new(),
+        2 => " (+1 backup gateway)".into(),
+        n => format!(" (+{} backup gateways)", n - 1),
+    }
+}
+
+/// The editor's list of backup gateways: each can be edited, moved up or down, or removed.
+fn backup_list(ui: &mut egui::Ui, backups: &mut Vec<String>) {
+    ui.vertical(|ui| {
+        let count = backups.len();
+        let mut action: Option<(usize, i8)> = None;
+        for (i, gateway) in backups.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(gateway)
+                        .desired_width(220.0)
+                        .hint_text("host or host:port"),
+                );
+                if ui
+                    .add_enabled(i > 0, egui::Button::new("\u{2191}").small())
+                    .on_hover_text("Try earlier")
+                    .clicked()
+                {
+                    action = Some((i, -1));
+                }
+                if ui
+                    .add_enabled(i + 1 < count, egui::Button::new("\u{2193}").small())
+                    .on_hover_text("Try later")
+                    .clicked()
+                {
+                    action = Some((i, 1));
+                }
+                if ui
+                    .add(egui::Button::new("\u{2715}").small())
+                    .on_hover_text("Remove")
+                    .clicked()
+                {
+                    action = Some((i, 0));
+                }
+            });
+        }
+        match action {
+            Some((i, 0)) => {
+                backups.remove(i);
+            }
+            Some((i, -1)) => backups.swap(i, i - 1),
+            Some((i, _)) => backups.swap(i, i + 1),
+            None => {}
+        }
+        if backups.len() < 16 && ui.small_button("Add a gateway").clicked() {
+            backups.push(String::new());
+        }
+    });
 }
 
 /// The profile of the connection that is on, on its way, or stopping.
@@ -1230,6 +1308,14 @@ impl App {
                 });
                 ui.text_edit_singleline(&mut editor.server);
                 ui.end_row();
+                if editor.kind != Kind::GlobalProtect {
+                    ui.label("Backup gateways").on_hover_text(
+                        "Tried from the top when the gateway above cannot be reached. A wrong \
+                         password stops there.",
+                    );
+                    backup_list(ui, &mut editor.backups);
+                    ui.end_row();
+                }
                 ui.label("Username (optional)");
                 ui.text_edit_singleline(&mut editor.username);
                 ui.end_row();
@@ -1414,8 +1500,16 @@ impl App {
         ui.heading(&name);
         match &profile {
             Profile::GlobalProtect(p) => ui.label(format!("GlobalProtect portal {}", p.portal)),
-            Profile::FortinetSsl(p) => ui.label(format!("Fortinet SSL VPN {}", p.server)),
-            Profile::FortinetIpsec(p) => ui.label(format!("Fortinet IPsec {}", p.server)),
+            Profile::FortinetSsl(p) => ui.label(format!(
+                "Fortinet SSL VPN {}{}",
+                p.server,
+                backup_note(p.servers().len())
+            )),
+            Profile::FortinetIpsec(p) => ui.label(format!(
+                "Fortinet IPsec {}{}",
+                p.server,
+                backup_note(p.servers().len())
+            )),
         };
         let active = active_profile(&self.status).map(str::to_string);
         let this_active = active.as_deref() == Some(name.as_str());
@@ -2154,6 +2248,39 @@ mod tests {
         assert_eq!(p.client_version.as_deref(), Some("6.3.0-33"));
         assert_eq!(p.client_os, Some(polytunnel_core::profile::ClientOs::Linux));
         assert_eq!(p.username.as_deref(), Some("me"));
+    }
+
+    #[test]
+    fn editor_keeps_and_checks_backup_gateways() {
+        let forti = Profile::FortinetSsl(FortinetSslProfile {
+            server: "fw.example.net:10443".into(),
+            backup_servers: vec!["fw-backup.example.net:10443".into()],
+            ..Default::default()
+        });
+        let mut editor = Editor::from_profile("office", &forti);
+        assert_eq!(editor.to_profile(), Ok(("office".to_string(), forti)));
+        // Blank rows are dropped; a bad address is refused with its position.
+        editor.backups.push("  ".into());
+        assert!(editor.to_profile().is_ok());
+        editor.backups.push("http://plain.example.net".into());
+        assert!(
+            editor
+                .to_profile()
+                .unwrap_err()
+                .contains("Backup gateway 3")
+        );
+        let mut ipsec = Editor::new(Kind::FortinetIpsec);
+        ipsec.name = "lab".into();
+        ipsec.server = "198.51.100.7".into();
+        ipsec.backups = vec!["198.51.100.8".into()];
+        let Ok((_, Profile::FortinetIpsec(p))) = ipsec.to_profile() else {
+            panic!("not IPsec");
+        };
+        assert_eq!(p.backup_servers, ["198.51.100.8"]);
+        ipsec.backups = vec!["198.51.100.8:500".into()];
+        assert!(ipsec.to_profile().is_err());
+        assert_eq!(backup_note(1), "");
+        assert_eq!(backup_note(3), " (+2 backup gateways)");
     }
 
     #[test]

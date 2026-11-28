@@ -140,6 +140,9 @@ pub struct IpsecConnect {
     pub profile: String,
     /// Host name or IPv4 address of the FortiGate.
     pub server: String,
+    /// More gateways, tried in order when the ones before do not answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backup_servers: Vec<String>,
     pub psk: Secret,
     /// Username and password for XAuth (IKEv1) or EAP (IKEv2); `None` when not used.
     pub xauth: Option<XauthLogin>,
@@ -427,9 +430,24 @@ impl Connect {
 }
 
 impl IpsecConnect {
+    /// Every gateway, in the order to try them.
+    pub fn servers(&self) -> Vec<String> {
+        let mut list = vec![self.server.clone()];
+        for server in &self.backup_servers {
+            if !list.iter().any(|s| s.eq_ignore_ascii_case(server)) {
+                list.push(server.clone());
+            }
+        }
+        list
+    }
+
     fn validate(&self) -> Result<(), String> {
         check(printable(&self.profile, 128), "profile name")?;
         check(valid_host(&self.server), "server")?;
+        check(self.backup_servers.len() <= 16, "number of gateways")?;
+        for server in &self.backup_servers {
+            check(valid_host(server), "backup gateway")?;
+        }
         check(matches!(self.ike_version, 1 | 2), "IKE version")?;
         if self.ike_version == 1 {
             check(
@@ -599,6 +617,7 @@ mod tests {
         IpsecConnect {
             profile: "office".into(),
             server: "vpn.example.net".into(),
+            backup_servers: vec!["198.51.100.8".into()],
             psk: Secret::new(["shared", "key"].join("-")),
             xauth: Some(XauthLogin {
                 username: "user".into(),
@@ -638,6 +657,11 @@ mod tests {
         };
         assert!(bad(|c| c.server = "https://vpn.example.net".into()));
         assert!(bad(|c| c.server = "-o".into()));
+        assert!(bad(
+            |c| c.backup_servers = vec!["vpn.example.net:443".into()]
+        ));
+        assert!(bad(|c| c.backup_servers = vec!["198.51.100.9".into(); 17]));
+        assert_eq!(ipsec().servers(), ["vpn.example.net", "198.51.100.8"]);
         assert!(bad(|c| c.psk = Secret::new("")));
         assert!(bad(|c| c.psk = Secret::new("line\nbreak")));
         assert!(bad(|c| c.ike_proposals = vec!["aes256; rm".into()]));

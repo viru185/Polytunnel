@@ -605,6 +605,9 @@ impl Tunnel<'_> {
     }
 }
 
+/// Connects to the first of the request's gateways that answers, in order (FortiClient's
+/// remote gateway list). A gateway that cannot be resolved or reached, or never answers IKE,
+/// is skipped; one that answered and then refused stops there.
 async fn connect_and_run(
     c: &IpsecConnect,
     status: &StatusCell,
@@ -613,6 +616,38 @@ async fn connect_and_run(
     journal: &mut Journal,
     system: &mut dyn System,
 ) -> Result<(), String> {
+    let servers = c.servers();
+    let mut silent: Vec<String> = Vec::new();
+    for (i, server) in servers.iter().enumerate() {
+        let mut one = c.clone();
+        one.server.clone_from(server);
+        match connect_to(&one, status, stop, answers, journal, system).await {
+            Ok(()) => return Ok(()),
+            Err((e, false)) if i + 1 < servers.len() => {
+                warn!("{server} did not answer ({e}); trying the next gateway");
+                silent.push(server.clone());
+            }
+            Err((e, _)) if silent.is_empty() => return Err(e),
+            Err((e, _)) => {
+                return Err(format!("{e} (no answer from {} either)", silent.join(", ")));
+            }
+        }
+    }
+    Err("the profile names no gateway".into())
+}
+
+/// One gateway. `Err((message, answered))`: `answered` is false when the gateway never
+/// answered (another one may be tried).
+async fn connect_to(
+    c: &IpsecConnect,
+    status: &StatusCell,
+    stop: &mut watch::Receiver<bool>,
+    answers: &mut mpsc::Receiver<Answer>,
+    journal: &mut Journal,
+    system: &mut dyn System,
+) -> Result<(), (String, bool)> {
+    let unanswered = |e: String| (e, false);
+    let answered = |e: String| (e, true);
     let over_tcp = c.transport == IpsecTransport::Tcp;
     info!(
         "connecting to {} (IKEv{} over {})",
@@ -621,7 +656,7 @@ async fn connect_and_run(
         if over_tcp { "TCP" } else { "UDP" }
     );
     let gateway = match until_stopped(stop, resolve(&c.server)).await {
-        Some(gateway) => gateway?,
+        Some(gateway) => gateway.map_err(unanswered)?,
         None => return Ok(()),
     };
     let link = async {
@@ -632,23 +667,29 @@ async fn connect_and_run(
         }
     };
     let (link, local) = match until_stopped(stop, link).await {
-        Some(link) => link?,
+        Some(link) => link.map_err(unanswered)?,
         None => return Ok(()),
     };
     let remote = SocketAddr::new(
         IpAddr::V4(gateway),
         if over_tcp { c.tcp_port } else { IKE_PORT },
     );
-    let remote_network = remote_network(c)?;
+    // Problems with the request itself are not the gateway's: no other gateway is tried.
+    let remote_network = remote_network(c).map_err(answered)?;
     let ike: Box<dyn Session> = if c.ike_version == 2 {
         let request = c.clone();
-        let config = blocking(move || ike2_config(&request, local, remote)).await?;
-        Box::new(v2::Initiator::new(config, Instant::now())?)
+        let config = blocking(move || ike2_config(&request, local, remote))
+            .await
+            .map_err(answered)?;
+        Box::new(v2::Initiator::new(config, Instant::now()).map_err(answered)?)
     } else {
-        Box::new(v1::Initiator::new(
-            ike_config(c, local, remote)?,
-            Instant::now(),
-        )?)
+        Box::new(
+            v1::Initiator::new(
+                ike_config(c, local, remote).map_err(answered)?,
+                Instant::now(),
+            )
+            .map_err(answered)?,
+        )
     };
     let mut tunnel = Tunnel {
         c,
@@ -672,6 +713,8 @@ async fn connect_and_run(
     let mut keepalive = tokio::time::interval(keepalive_every);
     let mut buf = vec![0u8; 65_536];
     let mut answers_open = true;
+    // Whether the gateway has answered at all (before that, another gateway may be tried).
+    let mut heard = false;
     let result = loop {
         if let Some(end) = tunnel
             .carry_out(std::mem::take(&mut outs), journal, system)
@@ -688,7 +731,10 @@ async fn connect_and_run(
                 break Ok(());
             },
             received = tunnel.link.recv(&mut buf) => match received {
-                Ok(Incoming::Ike(message)) => outs = tunnel.ike.receive(Instant::now(), &message),
+                Ok(Incoming::Ike(message)) => {
+                    heard = true;
+                    outs = tunnel.ike.receive(Instant::now(), &message);
+                }
                 Ok(Incoming::Esp(packet)) => tunnel.on_esp(&packet).await,
                 Ok(Incoming::Nothing) => {}
                 Err(e) => break Err(e),
@@ -731,7 +777,7 @@ async fn connect_and_run(
         }
     }
     tunnel.stop_pump();
-    result
+    result.map_err(|e| (e, heard))
 }
 
 #[cfg(test)]
@@ -744,6 +790,7 @@ mod tests {
         IpsecConnect {
             profile: "office".into(),
             server: "vpn.example.net".into(),
+            backup_servers: Vec::new(),
             psk: Secret::new(["shared", "key"].join("-")),
             xauth: Some(XauthLogin {
                 username: "user".into(),

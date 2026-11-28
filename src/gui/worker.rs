@@ -275,10 +275,10 @@ fn login_fortinet(
     p: &FortinetSslProfile,
     events: &Notifier,
 ) -> Result<ipc::Connect, String> {
-    let base = normalize_server(&p.server).map_err(|e| e.to_string())?;
+    let first = normalize_server(&p.server).map_err(|e| e.to_string())?;
     let (reply, answer) = mpsc::channel();
     events.send(Event::Prompt(Prompt::Credentials {
-        title: format!("Sign in to {}", base.trim_start_matches("https://")),
+        title: format!("Sign in to {}", first.trim_start_matches("https://")),
         message: None,
         username_label: "Username".into(),
         password_label: "Password".into(),
@@ -286,17 +286,11 @@ fn login_fortinet(
         reply,
     }));
     let (username, password) = answer.recv().ok().flatten().ok_or("cancelled")?;
-    events.progress(format!(
-        "Logging in to {}...",
-        base.trim_start_matches("https://")
-    ));
-    let realm = crate::auth::forti_realm(p);
-    let cookie = polytunnel_forti::login(
-        &crate::trace::transport(p.server_cert),
-        &base,
+    let (base, cookie) = crate::auth::forti_login_any(
+        p,
         &username,
         &password,
-        &realm,
+        &mut |line| events.progress(line),
         &mut |challenge| {
             let (reply, answer) = mpsc::channel();
             let mut message = challenge
@@ -317,8 +311,7 @@ fn login_fortinet(
             }));
             answer.recv().ok().flatten().ok_or(FortiError::Cancelled)
         },
-    )
-    .map_err(|e| crate::auth::forti_error(&base, p.server_cert, e))?;
+    )?;
     Ok(connect::forti_connect(
         name.to_string(),
         base,

@@ -184,3 +184,29 @@ fn logs_in_and_reads_the_configuration_over_pinned_tls() {
         );
     }
 }
+
+/// A gateway that cannot be reached (nothing listens on its port) is a network error, which
+/// is what lets a Fortinet profile move on to its next gateway; it is never mistaken for a
+/// refused login.
+#[test]
+fn an_unreachable_gateway_is_a_network_error() {
+    // A port that was free a moment ago: nothing listens on it now.
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let transport = UreqTransport::with_server_cert(None);
+    let result = polytunnel_forti::login::login(
+        &transport,
+        &format!("https://127.0.0.1:{port}"),
+        "user",
+        &Secret::new(["not", "real"].join("-")),
+        "",
+        &mut |_| panic!("no token expected"),
+    );
+    assert!(
+        matches!(result, Err(polytunnel_forti::FortiError::Http(_))),
+        "{result:?}"
+    );
+}
