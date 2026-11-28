@@ -402,9 +402,9 @@ mod tests {
             antimalware: vec![Antimalware {
                 name: "Windows Defender".into(),
                 vendor: Some("Microsoft Corporation".into()),
-                version: Some("4.18.1.4".into()),
+                version: Some("4.18.2600.4".into()),
                 signatures: Some("1.400.2.0".into()),
-                engine: Some("1.1.3.4".into()),
+                engine: Some("1.1.2600.4".into()),
                 signature_date: Some((2026, 3, 7)),
                 real_time_protection: Some(true),
                 last_full_scan: None,
@@ -425,7 +425,7 @@ mod tests {
             report.contains(
                 "<entry name=\"anti-malware\"><list><entry><ProductInfo>\
                  <Prod name=\"Windows Defender\" vendor=\"Microsoft Corporation\" \
-                 version=\"4.18.1.4\" defver=\"1.400.2.0\" engver=\"1.1.3.4\" prodType=\"3\" \
+                 version=\"4.18.2600.4\" defver=\"1.400.2.0\" engver=\"1.1.2600.4\" prodType=\"3\" \
                  osType=\"1\" dateyear=\"2026\" datemon=\"3\" dateday=\"7\"/>\
                  <real-time-protection>yes</real-time-protection>\
                  <last-full-scan-time>n/a</last-full-scan-time></ProductInfo></entry></list></entry>"

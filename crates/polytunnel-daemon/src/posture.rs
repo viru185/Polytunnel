@@ -272,7 +272,7 @@ mod tests {
         let posture = Posture {
             antimalware: vec![Antimalware {
                 name: "Windows Defender".into(),
-                signatures: Some("1.2.3.0".into()),
+                signatures: Some("1.400.300.0".into()),
                 signature_date: Some((2026, 3, 7)),
                 real_time_protection: Some(true),
                 ..Default::default()
@@ -285,7 +285,7 @@ mod tests {
         };
         assert_eq!(
             describe(&posture),
-            "antimalware: Windows Defender (real-time protection on, signatures 1.2.3.0 from \
+            "antimalware: Windows Defender (real-time protection on, signatures 1.400.300.0 from \
              2026-03-07); firewall: Windows Firewall on"
         );
         assert_eq!(
