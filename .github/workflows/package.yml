@@ -89,6 +89,10 @@ jobs:
 
           Invoke-Msi '/i' 'dist\polytunnel-0.0.1-windows-x64.msi' 'install.log'
           Assert-Installed '0.0.1'
+          # Only the wizard's Finish page turns on starting at sign-in, never a silent install.
+          if (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name Polytunnel -ErrorAction SilentlyContinue) {
+            throw 'a silent install wrote the Run\Polytunnel value'
+          }
           Invoke-Msi '/i' 'dist\polytunnel-0.0.2-windows-x64.msi' 'upgrade.log'
           Assert-Installed '0.0.2'
           Invoke-Msi '/x' 'dist\polytunnel-0.0.2-windows-x64.msi' 'uninstall.log'

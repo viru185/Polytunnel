@@ -51,7 +51,7 @@ windows() {
     unzip -q "$work/wintun.zip" -d "$work"
 
     dotnet tool restore > /dev/null
-    dotnet wix build packaging/windows/Polytunnel.wxs -arch "$arch" \
+    dotnet wix build packaging/windows/Polytunnel.wxs packaging/windows/ui.wxs -arch "$arch" \
         -d "Version=$version" -d "BinDir=$bin" \
         -d "WintunDll=$work/wintun/bin/$dll/wintun.dll" \
         -d "WintunLicense=$work/wintun/LICENSE.txt" \

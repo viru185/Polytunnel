@@ -1,0 +1,346 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Polytunnel's installer wizard, in core WiX (no WixUI extension).
+
+    install:      Welcome > License > Progress > Finish
+    installed:    Repair or remove > Progress > Finish
+    also:         Cancel, Cancelled (user exit), Failed (fatal error), Error, files in use
+                  (Restart Manager and classic).
+
+  Pages are 370 x 270 installer units. The Welcome and Finish style pages put the logo and
+  their text on dialog.bmp (370 x 234 units): white text on its dark top, dark text and the
+  Finish page's check boxes on its light bottom band (from Y = 180), which is the window
+  colour that check boxes fill behind their labels. The others have
+  banner.bmp (370 x 44 units) at the top. make_art.py makes both, logo included, at twice the
+  100% size so they stay sharp on scaled displays. (An Icon control is no sharper: Windows
+  Installer stretches the icon's 48 px image and puts a pale square behind its transparent
+  corners.) Everything here runs only with a full UI: silent installs (/qn, the in-app
+  updater, CI) never show a page or run the Finish page's actions.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Fragment>
+    <Binary Id="PolyDialogBmp" SourceFile="packaging/windows/dialog.bmp" />
+    <Binary Id="PolyBannerBmp" SourceFile="packaging/windows/banner.bmp" />
+
+    <!-- Finish page actions, run by the client as the signed-in user, never in /qn. -->
+    <CustomAction Id="LaunchPolytunnel" Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[INSTALLFOLDER]polytunnelw.exe&quot;"
+                  Execute="immediate" Impersonate="yes" Return="asyncNoWait" />
+    <CustomAction Id="AutostartOn" Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[INSTALLFOLDER]polytunnelw.exe&quot; autostart on"
+                  Execute="immediate" Impersonate="yes" Return="ignore" />
+
+    <!-- The Install button says Update when this replaces an older version. -->
+    <SetProperty Id="PolyInstallLabel" Value="&amp;Update" Sequence="ui" After="FindRelatedProducts"
+                 Condition="WIX_UPGRADE_DETECTED" />
+
+    <UI Id="PolytunnelUI">
+      <TextStyle Id="PolyFont_Normal" FaceName="Segoe UI" Size="9" />
+      <TextStyle Id="PolyFont_Bold" FaceName="Segoe UI Semibold" Size="9" />
+      <!-- White on the dark art. -->
+      <TextStyle Id="PolyFont_Hero" FaceName="Segoe UI Semibold" Size="16" Red="255" Green="255" Blue="255" />
+      <TextStyle Id="PolyFont_HeroText" FaceName="Segoe UI" Size="9" Red="224" Green="226" Blue="232" />
+      <TextStyle Id="PolyFont_BannerTitle" FaceName="Segoe UI Semibold" Size="11" Red="255" Green="255" Blue="255" />
+      <TextStyle Id="PolyFont_BannerText" FaceName="Segoe UI" Size="9" Red="200" Green="204" Blue="214" />
+
+      <Property Id="DefaultUIFont" Value="PolyFont_Normal" />
+      <Property Id="ErrorDialog" Value="ErrorDlg" />
+      <Property Id="PolyInstallLabel" Value="&amp;Install" />
+      <Property Id="PolyMaintenance" Value="Repair" />
+      <Property Id="PolyRMOption" Value="UseRM" />
+      <!-- Finish page check boxes: both on by default. -->
+      <Property Id="LAUNCHPOLYTUNNEL" Value="1" />
+      <Property Id="AUTOSTARTPOLYTUNNEL" Value="1" />
+
+      <InstallUISequence>
+        <Show Dialog="WelcomeDlg" Before="ProgressDlg" Condition="NOT Installed" />
+        <Show Dialog="MaintenanceDlg" Before="ProgressDlg"
+              Condition="Installed AND NOT RESUME AND NOT Preselected" />
+        <Show Dialog="ProgressDlg" Before="ExecuteAction" />
+        <Show Dialog="ExitDlg" OnExit="success" />
+        <Show Dialog="UserExitDlg" OnExit="cancel" />
+        <Show Dialog="FatalErrorDlg" OnExit="error" />
+      </InstallUISequence>
+      <AdminUISequence>
+        <Show Dialog="ExitDlg" OnExit="success" />
+        <Show Dialog="UserExitDlg" OnExit="cancel" />
+        <Show Dialog="FatalErrorDlg" OnExit="error" />
+      </AdminUISequence>
+
+      <!-- Welcome: the full art with the title on it. -->
+      <Dialog Id="WelcomeDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="&amp;Next">
+          <Publish Event="NewDialog" Value="LicenseDlg" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+        <!-- In the tab order ahead of the text, so the text is drawn on top of it. -->
+        <Control Id="Bitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no" Text="PolyDialogBmp" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="&amp;Back" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="20" Y="62" Width="330" Height="26" Transparent="yes" NoPrefix="yes"
+                 Text="{\PolyFont_Hero}Welcome to Polytunnel" HideCondition="WIX_UPGRADE_DETECTED" />
+        <Control Id="UpdateTitle" Type="Text" X="20" Y="62" Width="330" Height="26" Transparent="yes" NoPrefix="yes" Hidden="yes"
+                 Text="{\PolyFont_Hero}Update Polytunnel to [ProductVersion]" ShowCondition="WIX_UPGRADE_DETECTED" />
+        <Control Id="Text" Type="Text" X="20" Y="92" Width="310" Height="46" Transparent="yes" NoPrefix="yes"
+                 Text="{\PolyFont_HeroText}Setup installs Polytunnel [ProductVersion], a lightweight VPN client, with the service that makes its connections."
+                 HideCondition="WIX_UPGRADE_DETECTED" />
+        <Control Id="UpdateText" Type="Text" X="20" Y="92" Width="310" Height="46" Transparent="yes" NoPrefix="yes" Hidden="yes"
+                 Text="{\PolyFont_HeroText}Your profiles and settings stay as they are. If you are connected, the connection closes while Polytunnel updates."
+                 ShowCondition="WIX_UPGRADE_DETECTED" />
+        <!-- On the light band: the default (dark) text colour. -->
+        <Control Id="Hint" Type="Text" X="20" Y="196" Width="330" Height="14" Transparent="yes" NoPrefix="yes"
+                 Text="Click Next to continue, or Cancel to exit." />
+      </Dialog>
+
+      <!-- License: the MIT License, to read. It needs no acceptance, so Install is always on. -->
+      <Dialog Id="LicenseDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="LicenseText" Type="ScrollableText" X="20" Y="56" Width="330" Height="166" Sunken="yes" TabSkip="no">
+          <Text SourceFile="packaging/windows/License.rtf" />
+        </Control>
+        <Control Id="Back" Type="PushButton" X="156" Y="243" Width="56" Height="17" Text="&amp;Back">
+          <Publish Event="NewDialog" Value="WelcomeDlg" />
+        </Control>
+        <Control Id="Install" Type="PushButton" X="212" Y="243" Width="80" Height="17" Default="yes" ElevationShield="yes"
+                 Text="[PolyInstallLabel]">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+        <!-- In the tab order (after the buttons) so the banner text is drawn on top of it. -->
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="PolyBannerBmp" />
+        <Control Id="Title" Type="Text" X="15" Y="8" Width="300" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="{\PolyFont_BannerTitle}License" />
+        <Control Id="Description" Type="Text" X="15" Y="25" Width="300" Height="13" Transparent="yes" NoPrefix="yes"
+                 Text="{\PolyFont_BannerText}Polytunnel is free software under the MIT License." />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+      </Dialog>
+
+      <!-- Opened while installed: repair or remove. The button below names the choice. -->
+      <Dialog Id="MaintenanceDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="Choice" Type="RadioButtonGroup" X="20" Y="60" Width="330" Height="34" Property="PolyMaintenance">
+          <RadioButtonGroup Property="PolyMaintenance">
+            <RadioButton Value="Repair" X="0" Y="0" Width="330" Height="14" Text="&amp;Repair Polytunnel" />
+            <RadioButton Value="Remove" X="0" Y="18" Width="330" Height="14" Text="Re&amp;move Polytunnel" />
+          </RadioButtonGroup>
+        </Control>
+        <Control Id="Repair" Type="PushButton" X="212" Y="243" Width="80" Height="17" ElevationShield="yes"
+                 Text="Re&amp;pair" HideCondition="NOT PolyMaintenance = &quot;Repair&quot;"
+                 ShowCondition="PolyMaintenance = &quot;Repair&quot;">
+          <Publish Property="PolyMode" Value="Repair" Order="1" />
+          <Publish Event="ReinstallMode" Value="ecmus" Order="2" />
+          <Publish Event="Reinstall" Value="All" Order="3" />
+          <Publish Event="EndDialog" Value="Return" Order="4" />
+        </Control>
+        <Control Id="Remove" Type="PushButton" X="212" Y="243" Width="80" Height="17" ElevationShield="yes" Hidden="yes"
+                 Text="Remo&amp;ve" HideCondition="NOT PolyMaintenance = &quot;Remove&quot;"
+                 ShowCondition="PolyMaintenance = &quot;Remove&quot;">
+          <Publish Property="PolyMode" Value="Remove" Order="1" />
+          <Publish Event="Remove" Value="All" Order="2" />
+          <Publish Event="EndDialog" Value="Return" Order="3" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="PolyBannerBmp" />
+        <Control Id="Title" Type="Text" X="15" Y="8" Width="300" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="{\PolyFont_BannerTitle}Repair or remove Polytunnel" />
+        <Control Id="Description" Type="Text" X="15" Y="25" Width="300" Height="13" Transparent="yes" NoPrefix="yes"
+                 Text="{\PolyFont_BannerText}Polytunnel [ProductVersion] is installed on this computer." />
+        <Control Id="RepairText" Type="Text" X="20" Y="104" Width="330" Height="40" NoPrefix="yes"
+                 Text="Puts back missing or damaged files, the service and the Start menu shortcut. Your profiles and settings are kept."
+                 HideCondition="NOT PolyMaintenance = &quot;Repair&quot;" ShowCondition="PolyMaintenance = &quot;Repair&quot;" />
+        <Control Id="RemoveText" Type="Text" X="20" Y="104" Width="330" Height="40" NoPrefix="yes" Hidden="yes"
+                 Text="Removes Polytunnel, its service and its Start menu shortcut from this computer, and stops it starting when you sign in."
+                 HideCondition="NOT PolyMaintenance = &quot;Remove&quot;" ShowCondition="PolyMaintenance = &quot;Remove&quot;" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+      </Dialog>
+
+      <!-- Progress, titled for what is happening. -->
+      <Dialog Id="ProgressDlg" Width="370" Height="270" Title="[ProductName] Setup" Modeless="yes">
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="Cancel">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="PolyBannerBmp" />
+        <Control Id="TitleInstalling" Type="Text" X="15" Y="8" Width="300" Height="15" Transparent="yes" NoPrefix="yes" Hidden="yes"
+                 Text="{\PolyFont_BannerTitle}Installing Polytunnel"
+                 ShowCondition="NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
+        <Control Id="TitleUpdating" Type="Text" X="15" Y="8" Width="300" Height="15" Transparent="yes" NoPrefix="yes" Hidden="yes"
+                 Text="{\PolyFont_BannerTitle}Updating Polytunnel"
+                 ShowCondition="NOT Installed AND WIX_UPGRADE_DETECTED" />
+        <Control Id="TitleRepairing" Type="Text" X="15" Y="8" Width="300" Height="15" Transparent="yes" NoPrefix="yes" Hidden="yes"
+                 Text="{\PolyFont_BannerTitle}Repairing Polytunnel"
+                 ShowCondition="Installed AND NOT (PolyMode = &quot;Remove&quot; OR REMOVE = &quot;ALL&quot;)" />
+        <Control Id="TitleRemoving" Type="Text" X="15" Y="8" Width="300" Height="15" Transparent="yes" NoPrefix="yes" Hidden="yes"
+                 Text="{\PolyFont_BannerTitle}Removing Polytunnel"
+                 ShowCondition="Installed AND (PolyMode = &quot;Remove&quot; OR REMOVE = &quot;ALL&quot;)" />
+        <Control Id="Description" Type="Text" X="15" Y="25" Width="300" Height="13" Transparent="yes" NoPrefix="yes"
+                 Text="{\PolyFont_BannerText}This takes a moment." />
+        <Control Id="ActionText" Type="Text" X="20" Y="96" Width="330" Height="12" NoPrefix="yes">
+          <Subscribe Event="ActionText" Attribute="Text" />
+        </Control>
+        <Control Id="ProgressBar" Type="ProgressBar" X="20" Y="112" Width="330" Height="10" Text="Progress">
+          <Subscribe Event="SetProgress" Attribute="Progress" />
+        </Control>
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+      </Dialog>
+
+      <!-- Finish. Check boxes are opaque, so they sit on the art's light band. -->
+      <Dialog Id="ExitDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="Finish" Type="PushButton" X="304" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="&amp;Finish">
+          <Publish Event="DoAction" Value="AutostartOn" Order="1"
+                   Condition="AUTOSTARTPOLYTUNNEL = &quot;1&quot; AND NOT Installed AND NOT WIX_UPGRADE_DETECTED AND NOT ACTION = &quot;ADMIN&quot;" />
+          <Publish Event="DoAction" Value="LaunchPolytunnel" Order="2"
+                   Condition="LAUNCHPOLYTUNNEL = &quot;1&quot; AND NOT Installed AND NOT ACTION = &quot;ADMIN&quot;" />
+          <Publish Event="EndDialog" Value="Return" Order="3" />
+        </Control>
+        <!-- In the tab order ahead of the text, so the text is drawn on top of it. -->
+        <Control Id="Bitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no" Text="PolyDialogBmp" />
+        <Control Id="Launch" Type="CheckBox" X="20" Y="188" Width="330" Height="14" Property="LAUNCHPOLYTUNNEL"
+                 CheckBoxValue="1" Text="&amp;Launch Polytunnel" HideCondition="Installed OR ACTION = &quot;ADMIN&quot;" />
+        <Control Id="Autostart" Type="CheckBox" X="20" Y="206" Width="330" Height="14" Property="AUTOSTARTPOLYTUNNEL"
+                 CheckBoxValue="1" Text="&amp;Start Polytunnel in the tray when I sign in"
+                 HideCondition="Installed OR ACTION = &quot;ADMIN&quot; OR WIX_UPGRADE_DETECTED" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="&amp;Back" />
+        <Control Id="Cancel" Type="PushButton" X="236" Y="243" Width="56" Height="17" Disabled="yes" Text="Cancel" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="TitleInstalled" Type="Text" X="20" Y="62" Width="330" Height="26" Transparent="yes" NoPrefix="yes" Hidden="yes"
+                 Text="{\PolyFont_Hero}Polytunnel is installed" ShowCondition="NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
+        <Control Id="TitleUpdated" Type="Text" X="20" Y="62" Width="330" Height="26" Transparent="yes" NoPrefix="yes" Hidden="yes"
+                 Text="{\PolyFont_Hero}Polytunnel is updated" ShowCondition="NOT Installed AND WIX_UPGRADE_DETECTED" />
+        <Control Id="TitleRepaired" Type="Text" X="20" Y="62" Width="330" Height="26" Transparent="yes" NoPrefix="yes" Hidden="yes"
+                 Text="{\PolyFont_Hero}Polytunnel is repaired" ShowCondition="Installed AND NOT (PolyMode = &quot;Remove&quot; OR REMOVE = &quot;ALL&quot;)" />
+        <Control Id="TitleRemoved" Type="Text" X="20" Y="62" Width="330" Height="26" Transparent="yes" NoPrefix="yes" Hidden="yes"
+                 Text="{\PolyFont_Hero}Polytunnel is removed" ShowCondition="Installed AND (PolyMode = &quot;Remove&quot; OR REMOVE = &quot;ALL&quot;)" />
+        <Control Id="Text" Type="Text" X="20" Y="92" Width="310" Height="46" Transparent="yes" NoPrefix="yes" Hidden="yes"
+                 Text="{\PolyFont_HeroText}Open Polytunnel from the Start menu at any time." ShowCondition="NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
+        <Control Id="UpdatedText" Type="Text" X="20" Y="92" Width="310" Height="46" Transparent="yes" NoPrefix="yes" Hidden="yes"
+                 Text="{\PolyFont_HeroText}Polytunnel [ProductVersion] is ready, with your profiles and settings as they were."
+                 ShowCondition="NOT Installed AND WIX_UPGRADE_DETECTED" />
+        <Control Id="RemovedText" Type="Text" X="20" Y="92" Width="310" Height="46" Transparent="yes" NoPrefix="yes" Hidden="yes"
+                 Text="{\PolyFont_HeroText}Polytunnel and its service are no longer on this computer." ShowCondition="Installed AND (PolyMode = &quot;Remove&quot; OR REMOVE = &quot;ALL&quot;)" />
+      </Dialog>
+
+      <!-- Cancelled by the user. -->
+      <Dialog Id="UserExitDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="Finish" Type="PushButton" X="304" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="&amp;Finish">
+          <Publish Event="EndDialog" Value="Exit" />
+        </Control>
+        <!-- In the tab order ahead of the text, so the text is drawn on top of it. -->
+        <Control Id="Bitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no" Text="PolyDialogBmp" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="&amp;Back" />
+        <Control Id="Cancel" Type="PushButton" X="236" Y="243" Width="56" Height="17" Disabled="yes" Text="Cancel" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="20" Y="62" Width="330" Height="26" Transparent="yes" NoPrefix="yes"
+                 Text="{\PolyFont_Hero}Setup was cancelled" />
+        <Control Id="Text" Type="Text" X="20" Y="92" Width="310" Height="46" Transparent="yes" NoPrefix="yes"
+                 Text="{\PolyFont_HeroText}Polytunnel was not changed. Run Setup again whenever you are ready." />
+      </Dialog>
+
+      <!-- Ended by an error (after rolling back). -->
+      <Dialog Id="FatalErrorDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="Finish" Type="PushButton" X="304" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="&amp;Finish">
+          <Publish Event="EndDialog" Value="Exit" />
+        </Control>
+        <!-- In the tab order ahead of the text, so the text is drawn on top of it. -->
+        <Control Id="Bitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no" Text="PolyDialogBmp" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="&amp;Back" />
+        <Control Id="Cancel" Type="PushButton" X="236" Y="243" Width="56" Height="17" Disabled="yes" Text="Cancel" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="20" Y="62" Width="330" Height="26" Transparent="yes" NoPrefix="yes"
+                 Text="{\PolyFont_Hero}Setup could not finish" />
+        <Control Id="Text" Type="Text" X="20" Y="92" Width="310" Height="46" Transparent="yes" NoPrefix="yes"
+                 Text="{\PolyFont_HeroText}An error stopped Setup, and Polytunnel was left as it was. To see why, run Setup from a command prompt with /l*v setup.log added, then read setup.log." />
+      </Dialog>
+
+      <!-- Asked before cancelling. -->
+      <Dialog Id="CancelDlg" Width="260" Height="85" Title="[ProductName] Setup" NoMinimize="yes">
+        <Control Id="No" Type="PushButton" X="132" Y="57" Width="56" Height="17" Default="yes" Cancel="yes" Text="&amp;No">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+        <Control Id="Yes" Type="PushButton" X="72" Y="57" Width="56" Height="17" Text="&amp;Yes">
+          <Publish Event="EndDialog" Value="Exit" />
+        </Control>
+        <Control Id="Text" Type="Text" X="15" Y="15" Width="230" Height="30" NoPrefix="yes"
+                 Text="Cancel Polytunnel Setup? Anything it has changed so far is put back." />
+      </Dialog>
+
+      <!-- Windows Installer's own errors and questions; it shows only the buttons each needs. -->
+      <Dialog Id="ErrorDlg" Width="270" Height="105" Title="[ProductName] Setup" ErrorDialog="yes">
+        <Control Id="ErrorText" Type="Text" X="15" Y="15" Width="240" Height="60" TabSkip="no" NoPrefix="yes" Text="Information text" />
+        <Control Id="Y" Type="PushButton" X="100" Y="80" Width="56" Height="17" TabSkip="yes" Text="&amp;Yes">
+          <Publish Event="EndDialog" Value="ErrorYes" />
+        </Control>
+        <Control Id="A" Type="PushButton" X="100" Y="80" Width="56" Height="17" TabSkip="yes" Text="Cancel">
+          <Publish Event="EndDialog" Value="ErrorAbort" />
+        </Control>
+        <Control Id="C" Type="PushButton" X="100" Y="80" Width="56" Height="17" TabSkip="yes" Text="Cancel">
+          <Publish Event="EndDialog" Value="ErrorCancel" />
+        </Control>
+        <Control Id="I" Type="PushButton" X="100" Y="80" Width="56" Height="17" TabSkip="yes" Text="&amp;Ignore">
+          <Publish Event="EndDialog" Value="ErrorIgnore" />
+        </Control>
+        <Control Id="N" Type="PushButton" X="100" Y="80" Width="56" Height="17" TabSkip="yes" Text="&amp;No">
+          <Publish Event="EndDialog" Value="ErrorNo" />
+        </Control>
+        <Control Id="O" Type="PushButton" X="100" Y="80" Width="56" Height="17" TabSkip="yes" Text="OK">
+          <Publish Event="EndDialog" Value="ErrorOk" />
+        </Control>
+        <Control Id="R" Type="PushButton" X="100" Y="80" Width="56" Height="17" TabSkip="yes" Text="&amp;Retry">
+          <Publish Event="EndDialog" Value="ErrorRetry" />
+        </Control>
+      </Dialog>
+
+      <!-- Files in use, with Restart Manager: close the running tray and window cleanly
+           instead of asking for a restart. -->
+      <Dialog Id="MsiRMFilesInUse" Width="370" Height="270" Title="[ProductName] Setup" KeepModeless="yes">
+        <Control Id="OK" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="OK">
+          <Publish Event="RMShutdownAndRestart" Value="0" Order="1" Condition="PolyRMOption = &quot;UseRM&quot;" />
+          <Publish Event="EndDialog" Value="Return" Order="2" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
+          <Publish Event="EndDialog" Value="Exit" />
+        </Control>
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="PolyBannerBmp" />
+        <Control Id="Title" Type="Text" X="15" Y="8" Width="300" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="{\PolyFont_BannerTitle}Programs need to close" />
+        <Control Id="Description" Type="Text" X="15" Y="25" Width="300" Height="13" Transparent="yes" NoPrefix="yes"
+                 Text="{\PolyFont_BannerText}Some files that Setup updates are in use." />
+        <Control Id="Text" Type="Text" X="20" Y="54" Width="330" Height="26" NoPrefix="yes"
+                 Text="These programs are using them. Setup can close them now, or they stay open and Windows needs a restart afterwards." />
+        <Control Id="List" Type="ListBox" X="20" Y="84" Width="330" Height="94" Property="FileInUseProcess" Sunken="yes" TabSkip="yes" />
+        <Control Id="ShutdownOption" Type="RadioButtonGroup" X="20" Y="186" Width="330" Height="40" Property="PolyRMOption">
+          <RadioButtonGroup Property="PolyRMOption">
+            <RadioButton Value="UseRM" X="0" Y="0" Width="330" Height="16" Text="&amp;Close them and continue (recommended)" />
+            <RadioButton Value="DontUseRM" X="0" Y="20" Width="330" Height="16" Text="&amp;Do not close them (a restart will be needed)" />
+          </RadioButtonGroup>
+        </Control>
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+      </Dialog>
+
+      <!-- Files in use, without Restart Manager. -->
+      <Dialog Id="FilesInUse" Width="370" Height="270" Title="[ProductName] Setup" KeepModeless="yes">
+        <Control Id="Retry" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="&amp;Retry">
+          <Publish Event="EndDialog" Value="Retry" />
+        </Control>
+        <Control Id="Ignore" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="&amp;Ignore">
+          <Publish Event="EndDialog" Value="Ignore" />
+        </Control>
+        <Control Id="Exit" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="E&amp;xit">
+          <Publish Event="EndDialog" Value="Exit" />
+        </Control>
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="PolyBannerBmp" />
+        <Control Id="Title" Type="Text" X="15" Y="8" Width="300" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="{\PolyFont_BannerTitle}Programs need to close" />
+        <Control Id="Description" Type="Text" X="15" Y="25" Width="300" Height="13" Transparent="yes" NoPrefix="yes"
+                 Text="{\PolyFont_BannerText}Some files that Setup updates are in use." />
+        <Control Id="Text" Type="Text" X="20" Y="54" Width="330" Height="26" NoPrefix="yes"
+                 Text="Close these programs and click Retry, or click Ignore to continue and restart Windows afterwards." />
+        <Control Id="List" Type="ListBox" X="20" Y="84" Width="330" Height="138" Property="FileInUseProcess" Sunken="yes" TabSkip="yes" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+      </Dialog>
+    </UI>
+  </Fragment>
+</Wix>
