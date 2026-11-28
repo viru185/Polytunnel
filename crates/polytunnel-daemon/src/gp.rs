@@ -25,8 +25,9 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 
 use crate::common::{
-    Ended, STEP_TIMEOUT, StatusCell, blocking, bring_up, conclude, connected_status, failed,
-    host_port, now_unix, set, tunnel_ended, until_stopped,
+    Ended, RECONNECT_FOR, STEP_TIMEOUT, StatusCell, blocking, bring_up, conclude, connected_status,
+    failed, host_port, now_unix, reconnect_delay, reconnecting_status, set, tunnel_ended,
+    until_stopped,
 };
 use crate::packets::{self, Channels, Pump};
 use crate::{info, paths, warn};
@@ -35,7 +36,9 @@ use crate::{info, paths, warn};
 const TLS_KEEPALIVE: Duration = Duration::from_secs(10);
 const ESP_KEEPALIVE: Duration = Duration::from_secs(10);
 const ESP_DEAD_AFTER: Duration = Duration::from_secs(45);
-const TLS_RECONNECTS: usize = 3;
+/// The gateway answers every TLS keepalive: this long without anything from it means the
+/// tunnel is dead (the operating system's TCP timeout could take many minutes).
+const TLS_DEAD_AFTER: Duration = Duration::from_secs(40);
 /// The HIP report is sent again this often while connected, as openconnect does.
 const HIP_RECHECK: Duration = Duration::from_secs(3600);
 /// Reading the device's security state from Windows must not hold up the connection.
@@ -355,21 +358,55 @@ async fn transports(
 
     // Without an IPv6 address on the tunnel, the system's own IPv6 traffic stays out of it.
     let ipv6 = settings.address_v6.is_some();
-    if c.allow_esp
-        && let (Some(esp), Some((tunnel_ip, _))) = (&settings.esp, settings.address_v4)
-    {
-        let probe_to = match settings.gateway_address {
-            Some(IpAddr::V4(v4)) => Some(v4),
-            _ => match gateway_addr.ip() {
-                IpAddr::V4(v4) => Some(v4),
-                IpAddr::V6(_) => None,
-            },
-        };
-        if let Some(probe_to) = probe_to {
-            match start_esp(esp, gateway_addr.ip(), tunnel_ip, probe_to).await {
-                Ok((socket, out, inb)) => {
+    // ESP when the profile allows it and the gateway offers it; its probe goes to the
+    // gateway's tunnel-side address.
+    let esp = match (&settings.esp, settings.address_v4) {
+        (Some(esp), Some((tunnel_ip, _))) if c.allow_esp => {
+            let probe_to = match settings.gateway_address {
+                Some(IpAddr::V4(v4)) => Some(v4),
+                _ => match gateway_addr.ip() {
+                    IpAddr::V4(v4) => Some(v4),
+                    IpAddr::V6(_) => None,
+                },
+            };
+            probe_to.map(|probe_to| (esp, tunnel_ip, probe_to))
+        }
+        _ => None,
+    };
+
+    // A dropped tunnel is brought back with the same session (the network stays set up, and
+    // the kill switch keeps blocking meanwhile): ESP again if it works, else TLS, with growing
+    // pauses, for up to RECONNECT_FOR.
+    let mut lost: Option<(Instant, String)> = None;
+    let mut attempt = 0u32;
+    loop {
+        if let Some((since, reason)) = &lost {
+            if since.elapsed() > RECONNECT_FOR {
+                return Err(format!(
+                    "the tunnel was lost ({reason}) and could not be brought back"
+                ));
+            }
+            attempt += 1;
+            set(
+                status,
+                reconnecting_status(status, &c.profile, host, attempt),
+            );
+            if until_stopped(stop, tokio::time::sleep(reconnect_delay(attempt)))
+                .await
+                .is_none()
+            {
+                return Ok(());
+            }
+        }
+        if let Some((esp, tunnel_ip, probe_to)) = esp {
+            let started =
+                until_stopped(stop, start_esp(esp, gateway_addr.ip(), tunnel_ip, probe_to)).await;
+            match started {
+                None => return Ok(()),
+                Some(Ok((socket, out, inb))) => {
                     info!("ESP is working; using UDP");
                     set(status, connected("esp"));
+                    attempt = 0;
                     match esp_loop(
                         socket,
                         out,
@@ -382,40 +419,39 @@ async fn transports(
                     .await
                     {
                         Ended::Stopped => return Ok(()),
-                        Ended::Lost(e) => warn!("ESP stopped ({e}); switching to the TLS tunnel"),
+                        Ended::Lost(e) => {
+                            warn!("ESP stopped ({e}); bringing the tunnel back");
+                            lost = Some((Instant::now(), e));
+                            continue;
+                        }
                     }
                 }
-                Err(e) => info!("ESP not available ({e}); using the TLS tunnel"),
+                Some(Err(e)) => info!("ESP not available ({e}); using the TLS tunnel"),
             }
+        }
+        let opened = until_stopped(
+            stop,
+            open_tls(host, gateway_addr, session, &settings.tunnel_path),
+        )
+        .await;
+        match opened {
+            None => return Ok(()),
+            Some(Ok(stream)) => {
+                set(status, connected("tls"));
+                attempt = 0;
+                match tls_loop(stream, channels, stop, ipv6).await {
+                    Ended::Stopped => return Ok(()),
+                    Ended::Lost(e) => {
+                        warn!("the TLS tunnel dropped ({e}); bringing it back");
+                        lost = Some((Instant::now(), e));
+                    }
+                }
+            }
+            // The first time, the gateway refusing the tunnel is the answer.
+            Some(Err(e)) if lost.is_none() => return Err(e),
+            Some(Err(e)) => warn!("reconnecting did not work yet: {e}"),
         }
     }
-
-    let mut last_error = String::new();
-    for attempt in 0..=TLS_RECONNECTS {
-        if *stop.borrow() {
-            return Ok(());
-        }
-        if attempt > 0 {
-            tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
-        }
-        let stream = match open_tls(host, gateway_addr, session, &settings.tunnel_path).await {
-            Ok(stream) => stream,
-            Err(e) if attempt == 0 => return Err(e),
-            Err(e) => {
-                last_error = e;
-                continue;
-            }
-        };
-        set(status, connected("tls"));
-        match tls_loop(stream, channels, stop, ipv6).await {
-            Ended::Stopped => return Ok(()),
-            Ended::Lost(e) => {
-                warn!("the TLS tunnel dropped: {e}");
-                last_error = e;
-            }
-        }
-    }
-    Err(format!("the tunnel was lost: {last_error}"))
 }
 
 async fn open_tls(
@@ -463,6 +499,8 @@ pub async fn tls_loop<S: AsyncRead + AsyncWrite>(
     let mut buf = vec![0u8; 32 * 1024];
     let mut keepalive = tokio::time::interval(TLS_KEEPALIVE);
     keepalive.tick().await;
+    // Tokio's clock, so tests can let time pass.
+    let mut last_rx = tokio::time::Instant::now();
     loop {
         if *stop.borrow() {
             return Ended::Stopped;
@@ -476,17 +514,18 @@ pub async fn tls_loop<S: AsyncRead + AsyncWrite>(
                 Some(packet) => if let Err(e) = writer.write_all(&frame::encode_packet(&packet)).await {
                     return Ended::Lost(e.to_string());
                 },
-                None => return Ended::Stopped,
+                None => return Ended::Lost(packets::INTERFACE_STOPPED.into()),
             },
             read = reader.read(&mut buf) => match read {
                 Ok(0) => return Ended::Lost("the gateway closed the tunnel".into()),
                 Ok(n) => {
+                    last_rx = tokio::time::Instant::now();
                     decoder.feed(&buf[..n]);
                     loop {
                         match decoder.next_frame() {
                             Ok(Some(frame::Frame::Packet(packet))) => {
                                 if channels.to_system.send(packet).await.is_err() {
-                                    return Ended::Stopped;
+                                    return Ended::Lost(packets::INTERFACE_STOPPED.into());
                                 }
                             }
                             Ok(Some(frame::Frame::Keepalive)) => {}
@@ -497,8 +536,13 @@ pub async fn tls_loop<S: AsyncRead + AsyncWrite>(
                 }
                 Err(e) => return Ended::Lost(e.to_string()),
             },
-            _ = keepalive.tick() => if let Err(e) = writer.write_all(&frame::encode_keepalive()).await {
-                return Ended::Lost(e.to_string());
+            _ = keepalive.tick() => {
+                if last_rx.elapsed() > TLS_DEAD_AFTER {
+                    return Ended::Lost("the gateway stopped answering".into());
+                }
+                if let Err(e) = writer.write_all(&frame::encode_keepalive()).await {
+                    return Ended::Lost(e.to_string());
+                }
             },
         }
     }
@@ -598,7 +642,7 @@ pub async fn esp_loop(
                     },
                     Err(e) => return Ended::Lost(e.to_string()),
                 },
-                None => return Ended::Stopped,
+                None => return Ended::Lost(packets::INTERFACE_STOPPED.into()),
             },
             received = socket.recv(&mut buf) => match received {
                 Ok(n) => match inb.open(&buf[..n]) {
@@ -608,7 +652,7 @@ pub async fn esp_loop(
                             continue;
                         }
                         if channels.to_system.send(packet).await.is_err() {
-                            return Ended::Stopped;
+                            return Ended::Lost(packets::INTERFACE_STOPPED.into());
                         }
                     }
                     Err(e) => warn!("dropped an ESP packet: {e}"),
@@ -636,6 +680,26 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn tls_loop_notices_a_gateway_that_stopped_answering() {
+        let (client_side, _gateway_side) = tokio::io::duplex(64 * 1024);
+        let (mut ch, _system_tx, _system_rx) = channels();
+        let (_stop_tx, mut stop_rx) = watch::channel(false);
+        // Keepalives go out, nothing comes back: the loop gives up after TLS_DEAD_AFTER.
+        let ended = tls_loop(client_side, &mut ch, &mut stop_rx, false).await;
+        assert_eq!(ended, Ended::Lost("the gateway stopped answering".into()));
+    }
+
+    #[tokio::test]
+    async fn a_stopped_tunnel_interface_is_a_failure_not_a_stop() {
+        let (client_side, _gateway_side) = tokio::io::duplex(64 * 1024);
+        let (mut ch, system_tx, _system_rx) = channels();
+        drop(system_tx);
+        let (_stop_tx, mut stop_rx) = watch::channel(false);
+        let ended = tls_loop(client_side, &mut ch, &mut stop_rx, false).await;
+        assert_eq!(ended, Ended::Lost(packets::INTERFACE_STOPPED.into()));
+    }
 
     fn channels() -> (Channels, mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
         let (out_tx, out_rx) = mpsc::channel(16);

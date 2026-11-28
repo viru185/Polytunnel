@@ -177,6 +177,40 @@ pub fn connected_status(
     }
 }
 
+/// How long a dropped tunnel is tried again before the connection is given up.
+pub const RECONNECT_FOR: Duration = Duration::from_secs(300);
+
+/// The pause before reconnect try `attempt` (1, 2, ...): 2 s, 5 s, 10 s, then every 30 s.
+pub fn reconnect_delay(attempt: u32) -> Duration {
+    Duration::from_secs(match attempt {
+        0 | 1 => 2,
+        2 => 5,
+        3 => 10,
+        _ => 30,
+    })
+}
+
+/// The `Reconnecting` status for try `attempt`, keeping when the connection first came up.
+pub fn reconnecting_status(
+    status: &StatusCell,
+    profile: &str,
+    server: &str,
+    attempt: u32,
+) -> Status {
+    let since_unix = match status.get() {
+        Status::Connected { since_unix, .. } | Status::Reconnecting { since_unix, .. } => {
+            since_unix
+        }
+        _ => now_unix(),
+    };
+    Status::Reconnecting {
+        profile: profile.to_string(),
+        server: server.to_string(),
+        attempt,
+        since_unix,
+    }
+}
+
 /// The `Failed` status, stamped now.
 pub fn failed(profile: String, message: String) -> Status {
     Status::Failed {
@@ -435,6 +469,33 @@ mod tests {
             panic!("connected")
         };
         assert_eq!(since_unix, 1000);
+    }
+
+    #[test]
+    fn reconnects_wait_longer_each_time() {
+        let waits: Vec<u64> = (1..=6).map(|a| reconnect_delay(a).as_secs()).collect();
+        assert_eq!(waits, [2, 5, 10, 30, 30, 30]);
+        let run = StatusCell::new().next_run();
+        set(
+            &run,
+            Status::Connecting {
+                profile: "work".into(),
+            },
+        );
+        let first = connected_status(&run, "work", "gw.example.com", None, vec![], "tls", None);
+        let Status::Connected { since_unix, .. } = first.clone() else {
+            panic!("connected")
+        };
+        set(&run, first);
+        let Status::Reconnecting {
+            since_unix: kept,
+            attempt,
+            ..
+        } = reconnecting_status(&run, "work", "gw.example.com", 3)
+        else {
+            panic!("reconnecting")
+        };
+        assert_eq!((kept, attempt), (since_unix, 3));
     }
 
     #[tokio::test]

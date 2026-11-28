@@ -10,6 +10,10 @@ use tokio::sync::mpsc;
 
 use crate::common::Counters;
 
+/// Why a connection ends when the tunnel interface's packet threads stop (the interface
+/// failed or was removed): a failure, never a stop the user asked for.
+pub const INTERFACE_STOPPED: &str = "the tunnel interface stopped working";
+
 /// Packets from the system (to send through the tunnel) and to the system (received).
 pub struct Channels {
     pub from_system: mpsc::Receiver<Vec<u8>>,

@@ -52,6 +52,8 @@ const MTU: u16 = 1400;
 const TICK: Duration = Duration::from_millis(500);
 /// How long a prompt may wait for the user before the attempt is abandoned.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(180);
+/// Sends that keep failing this long mean the network is gone.
+const SEND_FAILING_FOR: Duration = Duration::from_secs(30);
 const IKE_PORT: u16 = 500;
 
 /// A prompt's ID and the user's values.
@@ -345,7 +347,8 @@ impl Link {
         ))
     }
 
-    async fn send_ike(&mut self, natt: bool, message: &[u8]) {
+    /// Sends an IKE message; false when it could not be sent.
+    async fn send_ike(&mut self, natt: bool, message: &[u8]) -> bool {
         let sent = match self {
             Link::Udp {
                 socket,
@@ -367,12 +370,14 @@ impl Link {
             }
             Link::Tcp { writer, .. } => writer.write_all(&tcp::frame_ike(message)).await,
         };
-        if let Err(e) = sent {
+        if let Err(e) = &sent {
             warn!("cannot send to the gateway: {e}");
         }
+        sent.is_ok()
     }
 
-    async fn send_esp(&mut self, packet: &[u8]) {
+    /// Sends an ESP packet; false when it could not be sent.
+    async fn send_esp(&mut self, packet: &[u8]) -> bool {
         let sent = match self {
             Link::Udp {
                 socket, gateway, ..
@@ -382,9 +387,10 @@ impl Link {
                 .map(|_| ()),
             Link::Tcp { writer, .. } => writer.write_all(&tcp::frame_esp(packet)).await,
         };
-        if let Err(e) = sent {
+        if let Err(e) = &sent {
             warn!("cannot send to the gateway: {e}");
         }
+        sent.is_ok()
     }
 
     async fn keepalive(&mut self) {
@@ -459,9 +465,20 @@ struct Tunnel<'a> {
     from_system: Option<mpsc::Receiver<Vec<u8>>>,
     to_system: Option<mpsc::Sender<Vec<u8>>>,
     pump: Option<Pump>,
+    /// Since when nothing could be sent to the gateway (the network went away).
+    failing_since: Option<Instant>,
 }
 
 impl Tunnel<'_> {
+    /// Notes whether a send worked.
+    fn sent(&mut self, ok: bool) {
+        if ok {
+            self.failing_since = None;
+        } else {
+            self.failing_since.get_or_insert_with(Instant::now);
+        }
+    }
+
     /// Carries out what IKE asked for. `Some`: the session is over.
     async fn carry_out(
         &mut self,
@@ -471,7 +488,10 @@ impl Tunnel<'_> {
     ) -> Option<Result<(), String>> {
         for out in outs {
             match out {
-                Output::Send { natt, message } => self.link.send_ike(natt, &message).await,
+                Output::Send { natt, message } => {
+                    let ok = self.link.send_ike(natt, &message).await;
+                    self.sent(ok);
+                }
                 Output::Prompt(p) => {
                     self.prompt_seq += 1;
                     self.prompt = Some((self.prompt_seq, Instant::now()));
@@ -591,7 +611,10 @@ impl Tunnel<'_> {
             return;
         };
         match sa.seal(packets::next_header(packet), packet) {
-            Ok(sealed) => self.link.send_esp(&sealed).await,
+            Ok(sealed) => {
+                let ok = self.link.send_esp(&sealed).await;
+                self.sent(ok);
+            }
             Err(e) => warn!("cannot encrypt a packet: {e}"),
         }
     }
@@ -706,6 +729,7 @@ async fn connect_to(
         from_system: None,
         to_system: None,
         pump: None,
+        failing_since: None,
     };
     let mut outs = tunnel.ike.start(Instant::now());
     let mut tick = tokio::time::interval(TICK);
@@ -746,7 +770,7 @@ async fn connect_to(
                 }
             } => match packet {
                 Some(packet) => tunnel.on_packet(&packet).await,
-                None => break Ok(()),
+                None => break Err(packets::INTERFACE_STOPPED.into()),
             },
             answer = answers.recv(), if answers_open => match answer {
                 Some((id, values)) if tunnel.prompt.is_some_and(|(p, _)| p == id) => {
@@ -763,6 +787,10 @@ async fn connect_to(
                 if tunnel.prompt.is_some_and(|(_, since)| since.elapsed() > PROMPT_TIMEOUT) {
                     break Err("nobody answered the sign-in prompt".into());
                 }
+                // Without dead-peer detection nothing else would notice the network going.
+                if tunnel.failing_since.is_some_and(|since| since.elapsed() > SEND_FAILING_FOR) {
+                    break Err("nothing can be sent to the gateway any more".into());
+                }
                 outs = tunnel.ike.poll(Instant::now());
             },
             _ = keepalive.tick(), if c.nat_keepalive > 0 => tunnel.link.keepalive().await,
@@ -772,7 +800,7 @@ async fn connect_to(
     if !tunnel.ike.is_closed() {
         for out in tunnel.ike.close() {
             if let Output::Send { natt, message } = out {
-                tunnel.link.send_ike(natt, &message).await;
+                let _ = tunnel.link.send_ike(natt, &message).await;
             }
         }
     }
