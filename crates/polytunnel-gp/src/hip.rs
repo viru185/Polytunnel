@@ -242,7 +242,8 @@ pub fn report(
     let security = posture_categories(posture, os_type);
     let body = |md5: &str| {
         format!(
-            "<hip-report name=\"hip-report\">\
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <hip-report name=\"hip-report\">\
              <md5-sum>{md5}</md5-sum>\
              <user-name>{user}</user-name>\
              <domain>{domain}</domain>\
@@ -267,7 +268,16 @@ pub fn report(
             host_id = escape(&client.host_id),
             ip = escape(client_ip),
             time = escape(generate_time),
-            version = escape(polytunnel_core::VERSION),
+            // The GlobalProtect app version this client announces (see
+            // `client::announced_version`): gateways read the report's format by it, and an
+            // unknown version makes them skip the anti-malware category. Without one, this
+            // program's own version.
+            version = escape(
+                client
+                    .app_version
+                    .as_deref()
+                    .unwrap_or(polytunnel_core::VERSION)
+            ),
             os = escape(&client.os_version),
         )
     };
@@ -316,10 +326,23 @@ mod tests {
         assert_eq!(md5.len(), 32);
         assert!(report.contains(&format!("<md5-sum>{md5}</md5-sum>")));
         assert!(report.contains("<os>Microsoft Windows 11 Pro , 64-bit</os>"));
+        assert!(report.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?><hip-report"));
+        // No announced app version: this program's own.
         assert!(report.contains(&format!(
             "<client-version>{}</client-version>",
             polytunnel_core::VERSION
         )));
+        // With one, the version the client announces to the gateway.
+        let mut announcing = test_client();
+        announcing.app_version = Some("6.3.0-33".into());
+        let (announced, _) = super::report(
+            &announcing,
+            &session(),
+            "10.20.30.40",
+            "01/02/2026 03:04:05",
+            &Posture::default(),
+        );
+        assert!(announced.contains("<client-version>6.3.0-33</client-version>"));
         // Nothing read from the OS: empty categories, no invented products.
         assert!(report.contains(
             "<entry name=\"anti-malware\"><list/></entry><entry name=\"firewall\"><list/></entry>"
@@ -387,7 +410,7 @@ mod tests {
                 last_full_scan: None,
             }],
             firewall: vec![Firewall {
-                name: "Microsoft Windows Firewall".into(),
+                name: "Windows Firewall".into(),
                 vendor: Some("Microsoft Corporation".into()),
                 version: None,
                 enabled: Some(true),
@@ -411,7 +434,7 @@ mod tests {
         );
         assert!(report.contains(
             "<entry name=\"firewall\"><list><entry><ProductInfo>\
-             <Prod name=\"Microsoft Windows Firewall\" vendor=\"Microsoft Corporation\"/>\
+             <Prod name=\"Windows Firewall\" vendor=\"Microsoft Corporation\"/>\
              <is-enabled>yes</is-enabled></ProductInfo></entry></list></entry>"
         ));
         // Unknown values are left out, never guessed.

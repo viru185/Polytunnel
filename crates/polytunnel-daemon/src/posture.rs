@@ -220,7 +220,7 @@ mod windows {
         let mut firewall = Vec::new();
         if !profiles.is_empty() {
             firewall.push(Firewall {
-                name: "Microsoft Windows Firewall".into(),
+                name: "Windows Firewall".into(),
                 vendor: Some("Microsoft Corporation".into()),
                 version: None,
                 // On only if every profile (domain, private, public) is on.
@@ -278,7 +278,7 @@ mod tests {
                 ..Default::default()
             }],
             firewall: vec![Firewall {
-                name: "Microsoft Windows Firewall".into(),
+                name: "Windows Firewall".into(),
                 enabled: Some(true),
                 ..Default::default()
             }],
@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(
             describe(&posture),
             "antimalware: Windows Defender (real-time protection on, signatures 1.2.3.0 from \
-             2026-03-07); firewall: Microsoft Windows Firewall on"
+             2026-03-07); firewall: Windows Firewall on"
         );
         assert_eq!(
             describe(&Posture::default()),
