@@ -130,8 +130,12 @@ impl Prompter for CliPrompter {
         }
         if self.mode == SsoMode::Embedded {
             eprintln!("Sign in in the login window...");
-            return crate::embedded::login(request, &format!("Sign in to {host}"))
-                .map_err(GpError::SsoFailed);
+            return crate::embedded::login(
+                request,
+                &format!("Sign in to {host}"),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .map_err(GpError::SsoFailed);
         }
 
         if self.listener.is_none() {
@@ -182,10 +186,13 @@ impl Prompter for CliPrompter {
         eprintln!("{message}...");
     }
 
-    fn select_gateway(&mut self, portal: &PortalSession) -> Result<Option<Gateway>, GpError> {
+    fn portal_ready(&mut self, portal: &PortalSession) {
         if let Err(e) = gateways::save_cache(portal) {
             eprintln!("Could not save the gateway list: {e}");
         }
+    }
+
+    fn select_gateway(&mut self, portal: &PortalSession) -> Result<Option<Gateway>, GpError> {
         let list = &portal.config.gateways;
         if list.len() <= 1 {
             return Ok(None); // nothing to choose from

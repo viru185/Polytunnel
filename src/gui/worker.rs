@@ -40,10 +40,21 @@ pub enum Prompt {
         message: String,
         reply: Sender<Option<Secret>>,
     },
+    /// The service's sign-in question (`id`), with all its fields at once; only the secret
+    /// ones are hidden.
+    Fields {
+        title: String,
+        message: String,
+        /// (label, secret)
+        fields: Vec<(String, bool)>,
+        reply: Sender<Option<Vec<Secret>>>,
+    },
     /// A browser login is in progress; the window may paste a result into `paste`.
     Browser {
         server: String,
         url: String,
+        /// Why the browser could not be opened, if it could not.
+        not_opened: Option<String>,
         paste: Sender<String>,
     },
 }
@@ -53,6 +64,11 @@ pub enum Event {
     Prompt(Prompt),
     /// The browser prompt is no longer needed.
     BrowserDone,
+    /// What was pasted into the browser prompt is not a login result.
+    PasteRejected(String),
+    /// The service stopped waiting for the answer to its question (it gave up, or the
+    /// connection ended): the question's dialog goes.
+    PromptClosed,
     Finished(Result<String, String>),
 }
 
@@ -117,12 +133,11 @@ fn run(
     }
     connect::send_connect(request)?;
     events.progress("Bringing the tunnel up...");
-    let status = connect::wait_connected(&mut |_| {}, &mut |prompt| {
-        if cancel.load(Ordering::SeqCst) {
-            return Err("cancelled".into());
-        }
-        answer_prompt(prompt, events)
-    })?;
+    let status = connect::wait_connected(
+        &|| cancel.load(Ordering::SeqCst),
+        &mut |_| {},
+        &mut |prompt| answer_prompt(prompt, events),
+    )?;
     Ok(connect::describe(&status))
 }
 
@@ -137,18 +152,45 @@ fn ask_hidden(events: &Notifier, title: String, message: String) -> Option<Secre
     answer.recv().ok().flatten()
 }
 
-/// The service needs more sign-in input (a one-time code, ...): ask for each field.
+/// The service needs more sign-in input (a one-time code, ...): one dialog with every field.
 fn answer_prompt(prompt: &ipc::Prompt, events: &Notifier) -> Result<Vec<Secret>, String> {
-    prompt
-        .fields
-        .iter()
-        .map(|field| {
-            let message = prompt.message.clone().unwrap_or_else(|| {
-                format!("The gateway asks for your {}.", field.label.to_lowercase())
-            });
-            ask_hidden(events, field.label.clone(), message).ok_or_else(|| "cancelled".to_string())
-        })
-        .collect()
+    let (reply, answer) = mpsc::channel();
+    let message = prompt.message.clone().unwrap_or_else(|| {
+        let labels: Vec<String> = prompt
+            .fields
+            .iter()
+            .map(|f| f.label.to_lowercase())
+            .collect();
+        format!("The gateway asks for your {}.", labels.join(" and "))
+    });
+    events.send(Event::Prompt(Prompt::Fields {
+        title: "The gateway needs more sign-in details".into(),
+        message,
+        fields: prompt
+            .fields
+            .iter()
+            .map(|f| (f.label.clone(), f.secret))
+            .collect(),
+        reply,
+    }));
+    loop {
+        match answer.recv_timeout(Duration::from_millis(500)) {
+            Ok(Some(values)) => return Ok(values),
+            Ok(None) | Err(RecvTimeoutError::Disconnected) => {
+                return Err(connect::CANCELLED.to_string());
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let waiting = matches!(
+                    connect::status(),
+                    Ok(ipc::Status::NeedsInput { prompt: p, .. }) if p.id == prompt.id
+                );
+                if !waiting {
+                    events.send(Event::PromptClosed);
+                    return Err(connect::PROMPT_GONE.to_string());
+                }
+            }
+        }
+    }
 }
 
 fn ipsec_request(
@@ -307,8 +349,14 @@ impl Prompter for GuiPrompter<'_> {
                 "Single sign-on for the {} {host}: complete it in the login window.",
                 iface.label()
             ));
-            return crate::embedded::login(request, &format!("Sign in to {host}"))
-                .map_err(GpError::SsoFailed);
+            return crate::embedded::login(request, &format!("Sign in to {host}"), self.cancel)
+                .map_err(|e| {
+                    if e == connect::CANCELLED {
+                        GpError::Cancelled
+                    } else {
+                        GpError::SsoFailed(e)
+                    }
+                });
         }
         if self.listener.is_none() {
             self.listener = callback::Listener::start().ok();
@@ -329,13 +377,15 @@ impl Prompter for GuiPrompter<'_> {
             "Single sign-on for the {} {host}: complete it in your browser.",
             iface.label()
         ));
-        if let Err(e) = browser::open(&url) {
-            self.events.progress(e);
+        let not_opened = browser::open(&url).err();
+        if let Some(e) = &not_opened {
+            self.events.progress(e.clone());
         }
         let (paste, pasted) = mpsc::channel();
         self.events.send(Event::Prompt(Prompt::Browser {
             server: host,
             url,
+            not_opened,
             paste,
         }));
         let result = self.wait_for_result(&pasted);
@@ -369,11 +419,16 @@ impl Prompter for GuiPrompter<'_> {
         self.events.progress(format!("{message}..."));
     }
 
-    fn select_gateway(&mut self, portal: &PortalSession) -> Result<Option<Gateway>, GpError> {
+    /// The gateway list is cached even when the profile always uses one gateway, so the
+    /// window's gateway table works for every profile.
+    fn portal_ready(&mut self, portal: &PortalSession) {
         if let Err(e) = gateways::save_cache(portal) {
             self.events
                 .progress(format!("Could not save the gateway list: {e}"));
         }
+    }
+
+    fn select_gateway(&mut self, portal: &PortalSession) -> Result<Option<Gateway>, GpError> {
         if portal.config.gateways.len() <= 1 {
             return Ok(None);
         }
@@ -412,9 +467,9 @@ impl GuiPrompter<'_> {
             if let Ok(text) = pasted.try_recv() {
                 match sso::parse_callback(&text) {
                     Ok(result) => return Ok(result),
-                    Err(e) => self
-                        .events
-                        .progress(format!("That is not a usable login result: {e}")),
+                    Err(e) => self.events.send(Event::PasteRejected(format!(
+                        "That is not a usable login result: {e}"
+                    ))),
                 }
             }
             let link = match &self.listener {

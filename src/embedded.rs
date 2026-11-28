@@ -1,9 +1,12 @@
 //! The optional embedded login window: the `polytunnel-sso` helper installed next to this
 //! program (Windows and macOS). Used when a profile asks for it or with `--embedded`.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use polytunnel_gp::prelogin::SamlRequest;
 use polytunnel_gp::sso::{self, SsoResult};
@@ -19,8 +22,9 @@ pub fn helper() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// Shows the login in the embedded window and returns its result.
-pub fn login(request: &SamlRequest, title: &str) -> Result<SsoResult, String> {
+/// Shows the login in the embedded window and returns its result. When `cancel` is set the
+/// window is closed and the login ends as cancelled.
+pub fn login(request: &SamlRequest, title: &str, cancel: &AtomicBool) -> Result<SsoResult, String> {
     let exe = helper().ok_or(
         "the embedded login window (polytunnel-sso) is not installed; sign in with the browser",
     )?;
@@ -46,10 +50,24 @@ pub fn login(request: &SamlRequest, title: &str) -> Result<SsoResult, String> {
             .write_all(html.as_bytes())
             .map_err(|e| format!("cannot hand the login page over: {e}"))?;
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("the login window failed: {e}"))?;
-    parse_output(&String::from_utf8_lossy(&output.stdout))
+    // The helper prints one short line at the end, so its output pipe never fills up.
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("cancelled".into());
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => thread::sleep(Duration::from_millis(150)),
+            Err(e) => return Err(format!("the login window failed: {e}")),
+        }
+    }
+    let mut stdout = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    parse_output(&stdout)
 }
 
 /// The helper's one JSON line, turned into a login result.
