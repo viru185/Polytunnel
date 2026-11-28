@@ -32,19 +32,31 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     /// Bring the window to the front.
     Show,
     /// Exit.
     Quit,
+    /// Bring the window to the front and connect with this profile.
+    Connect(String),
+}
+
+/// A profile name as the window accepts it: letters, digits, `-` and `_`, at most 64.
+pub fn valid_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 impl Message {
-    fn as_str(self) -> &'static str {
+    fn line(&self) -> String {
         match self {
-            Message::Show => "show",
-            Message::Quit => "quit",
+            Message::Show => "show".into(),
+            Message::Quit => "quit".into(),
+            Message::Connect(name) => format!("connect {name}"),
         }
     }
 
@@ -52,7 +64,10 @@ impl Message {
         match s.trim() {
             "show" => Some(Message::Show),
             "quit" => Some(Message::Quit),
-            _ => None,
+            other => other
+                .strip_prefix("connect ")
+                .filter(|name| valid_profile_name(name))
+                .map(|name| Message::Connect(name.to_string())),
         }
     }
 }
@@ -122,7 +137,7 @@ pub fn send(role: Role, message: Message) -> io::Result<()> {
     }
     let mut conn = BufReader::new(Stream::connect(socket_name(role)?)?);
     conn.get_mut()
-        .write_all(format!("{}\n", message.as_str()).as_bytes())?;
+        .write_all(format!("{}\n", message.line()).as_bytes())?;
     let mut reply = String::new();
     conn.read_line(&mut reply)?;
     Ok(())
@@ -175,9 +190,17 @@ mod tests {
 
     #[test]
     fn messages_round_trip() {
-        for m in [Message::Show, Message::Quit] {
-            assert_eq!(Message::parse(&format!("{}\n", m.as_str())), Some(m));
+        for m in [
+            Message::Show,
+            Message::Quit,
+            Message::Connect("office-2".into()),
+        ] {
+            assert_eq!(Message::parse(&format!("{}\n", m.line())), Some(m));
         }
         assert_eq!(Message::parse("rm -rf"), None);
+        // Only names a profile could have.
+        assert_eq!(Message::parse("connect ../x"), None);
+        assert_eq!(Message::parse("connect "), None);
+        assert_eq!(Message::parse("connect a b"), None);
     }
 }

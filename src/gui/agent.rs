@@ -4,16 +4,19 @@
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use polytunnel_core::ipc::Status;
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+use polytunnel_core::profile::Profiles;
+use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::WindowId;
 
+use super::notify;
+use super::prefs::{self, Appearance, Prefs};
 use crate::connect;
 use crate::instance::{self, Instance, Message, Role};
 
@@ -102,6 +105,78 @@ pub fn reopen_after_update() {
     ));
     command.creation_flags(CREATE_NO_WINDOW);
     let _ = command.spawn();
+}
+
+/// Makes the tray's menu follow the appearance setting: dark with Dark, light with Light, and
+/// the system's apps theme otherwise (uxtheme's `SetPreferredAppMode`, ordinal 135, then
+/// `FlushMenuThemes`, ordinal 136; Windows 10 1903 and later). Elsewhere: nothing.
+#[cfg(windows)]
+fn set_menu_theme(appearance: Appearance) {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+    };
+    type SetPreferredAppMode = unsafe extern "system" fn(i32) -> i32;
+    type FlushMenuThemes = unsafe extern "system" fn();
+    let mode = match appearance {
+        Appearance::System => 1, // allow dark
+        Appearance::Dark => 2,   // force dark
+        Appearance::Light => 3,  // force light
+    };
+    let name: Vec<u16> = "uxtheme.dll\0".encode_utf16().collect();
+    // SAFETY: a NUL-terminated name, loaded from System32 only; the two exports are looked up
+    // by ordinal and only called when present, with the signatures they have.
+    unsafe {
+        let module = LoadLibraryExW(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        );
+        if module.is_null() {
+            return;
+        }
+        let set = GetProcAddress(module, 135usize as *const u8);
+        let flush = GetProcAddress(module, 136usize as *const u8);
+        if let (Some(set), Some(flush)) = (set, flush) {
+            let set: SetPreferredAppMode = std::mem::transmute(set);
+            let flush: FlushMenuThemes = std::mem::transmute(flush);
+            set(mode);
+            flush();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn set_menu_theme(_appearance: Appearance) {}
+
+/// The profiles file's names, in order (none when it is missing or unreadable).
+fn profile_names() -> Vec<String> {
+    crate::paths::profiles_file()
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .and_then(|text| Profiles::parse(&text).ok())
+        .map(|p| p.profiles.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn profiles_changed_at() -> Option<SystemTime> {
+    crate::paths::profiles_file()
+        .and_then(|f| std::fs::metadata(f).ok())
+        .and_then(|m| m.modified().ok())
+}
+
+/// The "Connect to" entries: (menu id, label, enabled) for each profile, given the connection
+/// that is on (if any).
+fn connect_entries(names: &[String], active: Option<&str>) -> Vec<(String, String, bool)> {
+    names
+        .iter()
+        .map(|name| {
+            let (label, enabled) = match active {
+                Some(a) if a == name => (format!("{name} (connected)"), false),
+                Some(_) => (format!("Switch to {name}"), true),
+                None => (name.clone(), true),
+            };
+            (format!("connect:{name}"), label, enabled)
+        })
+        .collect()
 }
 
 /// What the icon shows.
@@ -258,8 +333,18 @@ pub fn run() -> i32 {
         })
         .ok();
 
+    let prefs = prefs::load();
+    set_menu_theme(prefs.appearance);
     let mut agent = Agent {
         tray: None,
+        connect_menu: Submenu::new("Connect to", true),
+        menu_key: None,
+        last_status: None,
+        prefs,
+        prefs_seen: prefs::changed_at(),
+        guid: std::env::current_exe()
+            .map(|e| notify::tray_guid(&e.display().to_string()))
+            .unwrap_or(0x5054_554e_4e45_4c00_8000_4000_0000_0001),
         status_item: MenuItem::new("Checking…", false, None),
         disconnect_item: MenuItem::with_id(MenuId::new("disconnect"), "Disconnect", false, None),
         update_item: MenuItem::with_id(MenuId::new("update"), "Check for updates", true, None),
@@ -283,6 +368,17 @@ pub fn run() -> i32 {
 
 struct Agent {
     tray: Option<TrayIcon>,
+    /// "Connect to ▸": one entry per profile.
+    connect_menu: Submenu,
+    /// What the "Connect to" entries were built from: the profiles file's time and the
+    /// connection that was on.
+    menu_key: Option<(Option<SystemTime>, Option<String>)>,
+    /// The last status, to notice changes worth a notification.
+    last_status: Option<Status>,
+    prefs: Prefs,
+    prefs_seen: Option<SystemTime>,
+    /// The tray icon's GUID (notifications are sent to it).
+    guid: u128,
     status_item: MenuItem,
     disconnect_item: MenuItem,
     update_item: MenuItem,
@@ -307,12 +403,16 @@ impl Agent {
             &self.status_item,
             &PredefinedMenuItem::separator(),
             &open,
+            &self.connect_menu,
             &self.disconnect_item,
             &self.update_item,
             &PredefinedMenuItem::separator(),
             &quit,
         ]);
-        match TrayIconBuilder::new()
+        let builder = TrayIconBuilder::new();
+        #[cfg(windows)]
+        let builder = builder.with_guid(self.guid);
+        match builder
             .with_menu(Box::new(menu))
             .with_tooltip(TITLE)
             .with_icon(icon(Look::Idle))
@@ -324,7 +424,80 @@ impl Agent {
         }
     }
 
+    /// Rebuilds "Connect to" when the profiles or the connection that is on changed.
+    fn refresh_connect_menu(&mut self, active: Option<String>) {
+        let key = (profiles_changed_at(), active.clone());
+        if self.menu_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.menu_key = Some(key);
+        while self.connect_menu.remove_at(0).is_some() {}
+        let entries = connect_entries(&profile_names(), active.as_deref());
+        if entries.is_empty() {
+            let _ = self
+                .connect_menu
+                .append(&MenuItem::new("No profiles yet", false, None));
+        }
+        for (id, label, enabled) in entries {
+            let _ =
+                self.connect_menu
+                    .append(&MenuItem::with_id(MenuId::new(id), label, enabled, None));
+        }
+    }
+
+    /// Announces a change of the connection, when notifications are on.
+    fn notify_change(&mut self, status: &Result<Status, String>) {
+        let Ok(now) = status else {
+            self.last_status = None;
+            return;
+        };
+        if self.prefs.notifications
+            && let Some(notice) = notify::notice_for(self.last_status.as_ref(), now)
+        {
+            #[cfg(windows)]
+            if let Some(tray) = &self.tray {
+                notify::show(tray.window_handle(), self.guid, &notice);
+            }
+            #[cfg(not(windows))]
+            let _ = notice;
+        }
+        self.last_status = Some(now.clone());
+    }
+
+    /// Picks up preferences the window changed (appearance, notifications).
+    fn refresh_prefs(&mut self) {
+        let seen = prefs::changed_at();
+        if seen != self.prefs_seen {
+            self.prefs_seen = seen;
+            self.prefs = prefs::load();
+        }
+        // Also follows a change of the system theme.
+        set_menu_theme(self.prefs.appearance);
+    }
+
+    /// Connects with `name` through the window (which asks for passwords and codes).
+    fn connect_profile(&mut self, name: String) {
+        if !instance::valid_profile_name(&name) {
+            return;
+        }
+        if instance::send(Role::Gui, Message::Connect(name.clone())).is_err() {
+            spawn_gui(&["connect", &name]);
+        }
+    }
+
     fn update(&mut self, status: Result<Status, String>) {
+        self.refresh_prefs();
+        self.notify_change(&status);
+        let connected_profile = match &status {
+            Ok(
+                Status::Connected { profile, .. }
+                | Status::Connecting { profile }
+                | Status::NeedsInput { profile, .. }
+                | Status::Reconnecting { profile, .. },
+            ) => Some(profile.clone()),
+            _ => None,
+        };
+        self.refresh_connect_menu(connected_profile);
         let text = status_text(&status);
         let look = look(&status);
         self.active = active(&status);
@@ -415,7 +588,11 @@ impl ApplicationHandler<UserEvent> for Agent {
                 let _ = connect::disconnect();
             }
             UserEvent::Menu(e) if e.id == *self.update_item.id() => self.update_clicked(),
-            UserEvent::Menu(_) => {}
+            UserEvent::Menu(e) => {
+                if let Some(name) = e.id.0.strip_prefix("connect:") {
+                    self.connect_profile(name.to_string());
+                }
+            }
             UserEvent::UpdateChecked(result) => {
                 self.update_item.set_enabled(true);
                 match result {
@@ -468,6 +645,7 @@ impl ApplicationHandler<UserEvent> for Agent {
                 self.last_open = None;
                 self.open_window();
             }
+            UserEvent::Ipc(Message::Connect(name)) => self.connect_profile(name),
             UserEvent::Status(status) => self.update(status),
         }
     }
@@ -521,6 +699,29 @@ mod tests {
         let old: Result<Status, String> =
             Err("protocol version 1 is not supported (the service speaks 2)".into());
         assert!(status_text(&old).contains("was updated"));
+    }
+
+    #[test]
+    fn connect_entries_follow_the_connection() {
+        let names = vec!["office".to_string(), "work".to_string()];
+        let idle = connect_entries(&names, None);
+        assert_eq!(
+            idle,
+            [
+                ("connect:office".into(), "office".into(), true),
+                ("connect:work".into(), "work".into(), true),
+            ]
+        );
+        let busy = connect_entries(&names, Some("work"));
+        assert_eq!(
+            busy[0],
+            ("connect:office".into(), "Switch to office".into(), true)
+        );
+        assert_eq!(
+            busy[1],
+            ("connect:work".into(), "work (connected)".into(), false)
+        );
+        assert!(connect_entries(&[], None).is_empty());
     }
 
     #[test]
