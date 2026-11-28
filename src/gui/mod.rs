@@ -13,7 +13,6 @@ mod worker;
 
 use std::collections::VecDeque;
 use std::fs;
-use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -21,13 +20,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use eframe::egui;
 use polytunnel_core::Secret;
 use polytunnel_core::ipc::{KillSwitchSettings, Status};
+use polytunnel_core::pin::CertFingerprint;
 use polytunnel_core::profile::{
     EapMethodName, FortinetIpsecProfile, FortinetSslProfile, GatewayPolicy, GlobalProtectProfile,
     IpsecTransport, ProbeMethod, Profile, Profiles, normalize_server, valid_host,
 };
 use polytunnel_gp::rank::Ranking;
+use polytunnel_http::CertInfo;
 
+use crate::auth::Trust;
 use crate::instance::{self, Instance, Message, Role};
+use crate::profiles_file::{save_profiles, trust_certificate};
 use crate::{autostart, connect, forticlient, gateways, paths, uri};
 
 const TITLE: &str = "Polytunnel";
@@ -167,6 +170,7 @@ struct Editor {
     tcp: bool,
     /// The profile being edited: settings the form does not show are kept.
     gp_base: GlobalProtectProfile,
+    forti_base: FortinetSslProfile,
     ipsec_base: FortinetIpsecProfile,
     error: Option<String>,
 }
@@ -195,6 +199,7 @@ impl Editor {
             eap: false,
             tcp: false,
             gp_base: GlobalProtectProfile::default(),
+            forti_base: FortinetSslProfile::default(),
             ipsec_base: FortinetIpsecProfile::default(),
             error: None,
         }
@@ -224,6 +229,7 @@ impl Editor {
                 realm: text(&p.realm),
                 backups: p.backup_servers.clone(),
                 server_cert: p.server_cert.map(|c| c.to_string()).unwrap_or_default(),
+                forti_base: p.clone(),
                 ..Editor::new(Kind::FortinetSsl)
             },
             Profile::FortinetIpsec(p) => Editor {
@@ -316,6 +322,7 @@ impl Editor {
                             .map_err(|e| format!("Server certificate: {e}."))?,
                     ),
                 },
+                ..self.forti_base.clone()
             }),
             Kind::FortinetIpsec => {
                 let group: u16 = self
@@ -380,6 +387,16 @@ enum PromptUi {
         /// (label, secret, value)
         fields: Vec<(String, bool, String)>,
         reply: Sender<Option<Vec<Secret>>>,
+        focused: bool,
+    },
+    /// A gateway certificate to trust or not.
+    Certificate {
+        /// `host:port`
+        server: String,
+        info: Box<CertInfo>,
+        /// The certificate the profile trusted before, when this one replaces it.
+        previous: Option<CertFingerprint>,
+        reply: Sender<Trust>,
         focused: bool,
     },
 }
@@ -532,32 +549,6 @@ fn load_profiles() -> (Profiles, Option<String>) {
             Some(format!("{}: {e}", path.display())),
         ),
     }
-}
-
-/// Writes `text` to `path` through a temporary file, so a failed write never leaves half a
-/// file, and keeps the previous version next to it as `<name>.bak`.
-fn write_with_backup(path: &Path, text: &str) -> Result<(), String> {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = path.with_file_name(format!("{name}.tmp"));
-    fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    if path.exists() {
-        let _ = fs::copy(path, path.with_file_name(format!("{name}.bak")));
-    }
-    fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("{}: {e}", path.display())
-    })
-}
-
-fn save_profiles(profiles: &Profiles) -> Result<(), String> {
-    let path = paths::profiles_file().ok_or("no configuration directory")?;
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    write_with_backup(&path, &profiles.to_toml())
 }
 
 fn link_status_text() -> String {
@@ -876,6 +867,7 @@ impl App {
         }
         let mut finished = false;
         let mut lines = Vec::new();
+        let mut trusted = Vec::new();
         if let Some(worker) = &self.worker {
             while let Ok(event) = worker.events.try_recv() {
                 match event {
@@ -930,6 +922,25 @@ impl App {
                             focused: false,
                         });
                     }
+                    worker::Event::Prompt(worker::Prompt::Certificate {
+                        server,
+                        info,
+                        previous,
+                        reply,
+                    }) => {
+                        self.prompt = Some(PromptUi::Certificate {
+                            server,
+                            info,
+                            previous,
+                            reply,
+                            focused: false,
+                        });
+                    }
+                    worker::Event::TrustCertificate {
+                        profile,
+                        gateway,
+                        fingerprint,
+                    } => trusted.push((profile, gateway, fingerprint)),
                     worker::Event::PromptClosed => self.prompt = None,
                     worker::Event::Prompt(worker::Prompt::Browser {
                         server,
@@ -965,6 +976,9 @@ impl App {
         }
         for (level, line) in lines {
             self.log_at(level, line);
+        }
+        for (profile, gateway, fingerprint) in trusted {
+            self.save_trusted_certificate(&profile, &gateway, fingerprint);
         }
         if finished {
             self.worker = None;
@@ -1205,6 +1219,41 @@ impl App {
         }
     }
 
+    /// Saves a certificate the user chose to always trust on one of a Fortinet profile's
+    /// gateways.
+    fn save_trusted_certificate(
+        &mut self,
+        name: &str,
+        gateway: &str,
+        fingerprint: CertFingerprint,
+    ) {
+        if self.read_only() {
+            self.log_at(
+                Level::Warning,
+                format!(
+                    "The certificate of {gateway} was trusted for this connection only: the \
+                     profiles file could not be read, so nothing was saved."
+                ),
+            );
+            return;
+        }
+        let before = self.profiles.clone();
+        let saved = trust_certificate(&mut self.profiles, name, gateway, fingerprint)
+            .and_then(|()| save_profiles(&self.profiles));
+        match saved {
+            Ok(()) => self.log(format!(
+                "'{name}' now always trusts this certificate on {gateway}."
+            )),
+            Err(e) => {
+                self.profiles = before;
+                self.log_at(
+                    Level::Problem,
+                    format!("Could not save the trusted certificate: {e}"),
+                );
+            }
+        }
+    }
+
     fn delete_profile(&mut self, name: &str) {
         let before = self.profiles.clone();
         self.profiles.profiles.remove(name);
@@ -1424,11 +1473,17 @@ mod tests {
         let editor = Editor::from_profile("work", &gp);
         assert_eq!(editor.to_profile(), Ok(("work".to_string(), gp)));
 
+        // Certificates trusted with "Always trust" have no field in the form, and are kept.
         let forti = Profile::FortinetSsl(FortinetSslProfile {
             server: "vpn.example.net:10443".into(),
             username: Some("me".into()),
             realm: None,
             server_cert: Some("0123456789abcdef".repeat(4).parse().unwrap()),
+            trusted_certs: [(
+                "vpn.example.net:10443".to_string(),
+                "ab".repeat(32).parse().unwrap(),
+            )]
+            .into(),
             ..Default::default()
         });
         assert_eq!(
@@ -1570,22 +1625,6 @@ mod tests {
         e.name = "ok".into();
         e.server = "http://vpn.example.com".into();
         assert!(e.to_profile().is_err());
-    }
-
-    #[test]
-    fn saving_keeps_the_previous_file() {
-        let dir = std::env::temp_dir().join(format!("polytunnel-save-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("profiles.toml");
-        write_with_backup(&path, "first").unwrap();
-        write_with_backup(&path, "second").unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "second");
-        assert_eq!(
-            fs::read_to_string(dir.join("profiles.toml.bak")).unwrap(),
-            "first"
-        );
-        assert!(!dir.join("profiles.toml.tmp").exists());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

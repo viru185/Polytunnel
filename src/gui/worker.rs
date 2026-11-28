@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use polytunnel_core::Secret;
 use polytunnel_core::ipc;
+use polytunnel_core::pin::CertFingerprint;
 use polytunnel_core::profile::{
     FortinetIpsecProfile, FortinetSslProfile, GlobalProtectProfile, Profile, normalize_server,
 };
@@ -18,7 +19,9 @@ use polytunnel_gp::flow::{self, LoginOptions, PasswordPrompt, PortalSession, Pro
 use polytunnel_gp::portal::Gateway;
 use polytunnel_gp::prelogin::{Interface, SamlRequest};
 use polytunnel_gp::sso::{self, SsoResult};
+use polytunnel_http::CertInfo;
 
+use crate::auth::Trust;
 use crate::gateways::{self, GatewayPrefs};
 use crate::{browser, callback, connect, ipsec, sysinfo, uri};
 
@@ -49,6 +52,15 @@ pub enum Prompt {
         fields: Vec<(String, bool)>,
         reply: Sender<Option<Vec<Secret>>>,
     },
+    /// A gateway's certificate is not trusted: trust it once, always, or not at all.
+    Certificate {
+        /// The gateway, `host:port`.
+        server: String,
+        info: Box<CertInfo>,
+        /// The certificate the profile trusted before, when this one replaces it.
+        previous: Option<CertFingerprint>,
+        reply: Sender<Trust>,
+    },
     /// A browser login is in progress; the window may paste a result into `paste`.
     Browser {
         server: String,
@@ -69,6 +81,13 @@ pub enum Event {
     /// The service stopped waiting for the answer to its question (it gave up, or the
     /// connection ended): the question's dialog goes.
     PromptClosed,
+    /// The user chose to always trust this certificate on `gateway` (`host:port`): the window
+    /// saves it in profile `profile`.
+    TrustCertificate {
+        profile: String,
+        gateway: String,
+        fingerprint: CertFingerprint,
+    },
     Finished(Result<String, String>),
 }
 
@@ -286,11 +305,22 @@ fn login_fortinet(
         reply,
     }));
     let (username, password) = answer.recv().ok().flatten().ok_or("cancelled")?;
-    let (base, cookie) = crate::auth::forti_login_any(
+    let outcome = crate::auth::forti_login_any(
         p,
         &username,
         &password,
         &mut |line| events.progress(line),
+        &mut |gateway, info, previous| {
+            let (reply, answer) = mpsc::channel();
+            events.send(Event::Prompt(Prompt::Certificate {
+                server: gateway.to_string(),
+                info: Box::new(info.clone()),
+                previous,
+                reply,
+            }));
+            // The dialog gone without an answer (the window closed): no.
+            answer.recv().unwrap_or(Trust::Cancel)
+        },
         &mut |challenge| {
             let (reply, answer) = mpsc::channel();
             let mut message = challenge
@@ -311,12 +341,20 @@ fn login_fortinet(
             }));
             answer.recv().ok().flatten().ok_or(FortiError::Cancelled)
         },
-    )?;
+    );
+    for (gateway, fingerprint) in outcome.always {
+        events.send(Event::TrustCertificate {
+            profile: name.to_string(),
+            gateway,
+            fingerprint,
+        });
+    }
+    let session = outcome.result?;
     Ok(connect::forti_connect(
         name.to_string(),
-        base,
-        cookie,
-        p.server_cert,
+        session.base,
+        session.cookie,
+        session.pin,
     ))
 }
 

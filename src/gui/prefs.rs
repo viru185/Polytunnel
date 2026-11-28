@@ -68,7 +68,7 @@ pub fn save(prefs: &Prefs) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let text = toml::to_string(prefs).map_err(|e| e.to_string())?;
-    super::write_with_backup(&path, &text)
+    crate::profiles_file::write_with_backup(&path, &text)
 }
 
 /// When the preferences file last changed (to notice changes made by the other process).

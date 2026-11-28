@@ -210,3 +210,48 @@ fn an_unreachable_gateway_is_a_network_error() {
         "{result:?}"
     );
 }
+
+/// What an untrusted-certificate prompt rests on, over real TLS: the system refuses the fake
+/// FortiGate's self-signed certificate, the certificate shown to the user is the one the
+/// server presents, and a login pinned to it (Trust once / Always trust) succeeds. A pin that
+/// no longer matches fails as a network error, and the certificate the server now presents
+/// can be read for a "certificate changed" prompt.
+#[test]
+fn an_untrusted_certificate_can_be_shown_and_then_trusted() {
+    let (port, pin, seen) = fake_fortigate();
+    let base = format!("https://127.0.0.1:{port}");
+    let login = |transport: &UreqTransport| {
+        polytunnel_forti::login::login(
+            transport,
+            &base,
+            "user",
+            &Secret::new(["not", "real"].join("-")),
+            "",
+            &mut |_| panic!("no token expected"),
+        )
+    };
+
+    let refused = login(&UreqTransport::with_server_cert(None));
+    assert!(
+        matches!(refused, Err(polytunnel_forti::FortiError::Http(_))),
+        "{refused:?}"
+    );
+    assert!(seen.lock().unwrap().is_empty(), "nothing is sent untrusted");
+
+    let info = polytunnel_http::untrusted_certificate_info("127.0.0.1", port).expect("shown");
+    assert_eq!(info.fingerprint, pin);
+    assert!(info.self_signed);
+    assert_eq!(info.dns_names, ["FGT-FAKE"]);
+    let cookies = login(&UreqTransport::with_server_cert(Some(info.fingerprint))).expect("login");
+    assert_eq!(cookies.expose(), "SVPNCOOKIE=FAKEsession%2Fvalue%3D%3D");
+
+    let stale: CertFingerprint = "ab".repeat(32).parse().unwrap();
+    let changed = login(&UreqTransport::with_server_cert(Some(stale)));
+    assert!(
+        matches!(&changed, Err(polytunnel_forti::FortiError::Http(e)) if e.contains("not the trusted one")),
+        "{changed:?}"
+    );
+    let now = polytunnel_http::server_certificate("127.0.0.1", port).expect("presented");
+    assert_eq!(now.fingerprint, pin);
+    assert_ne!(now.fingerprint, stale);
+}

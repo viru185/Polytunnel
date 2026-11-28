@@ -19,6 +19,7 @@ pub mod instance;
 pub mod ipsec;
 pub mod paths;
 pub mod probe;
+pub mod profiles_file;
 pub mod prompter;
 pub mod sysinfo;
 pub mod trace;

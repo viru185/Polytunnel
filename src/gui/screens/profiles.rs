@@ -8,7 +8,8 @@ use polytunnel_gp::rank::Probe;
 
 use crate::gui::icons::Icon;
 use crate::gui::widgets::{self, Tone};
-use crate::gui::{App, Kind, Leave, active_profile, save_profiles};
+use crate::gui::{App, Kind, Leave, active_profile};
+use crate::profiles_file::save_profiles;
 
 use super::home::profile_line;
 

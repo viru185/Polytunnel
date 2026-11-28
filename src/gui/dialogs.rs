@@ -1,12 +1,16 @@
-//! The dialogs over the window: sign-in, codes, the service's questions, browser sign-in, and
-//! confirmations. Enter submits (only when filled in); Escape or a click outside cancels.
+//! The dialogs over the window: sign-in, codes, the service's questions, untrusted
+//! certificates, browser sign-in, and confirmations. Enter submits (only when filled in, and
+//! never trusts a certificate); Escape or a click outside cancels.
 
 use eframe::egui::{self, Label, Margin, RichText, Stroke, TextEdit};
 
 use polytunnel_core::Secret;
+use polytunnel_core::pin::CertFingerprint;
+use polytunnel_http::CertInfo;
 
-use super::widgets;
+use super::widgets::{self, Tone};
 use super::{App, Confirm, Job, PromptUi};
+use crate::auth::{self, Trust};
 use crate::connect;
 
 /// The dialogs' frame: the surface colour with a border, rounded.
@@ -29,10 +33,185 @@ fn label(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).size(11.0).strong().color(p.muted));
 }
 
+/// A value under a [`label`], wrapped.
+fn value(ui: &mut egui::Ui, text: &str) {
+    ui.add(Label::new(RichText::new(text).size(12.0)).wrap());
+}
+
+/// A fingerprint as four lines of eight bytes, to fit the dialog.
+fn fingerprint_lines(fingerprint: &CertFingerprint) -> String {
+    fingerprint
+        .digest()
+        .chunks(8)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect::<Vec<_>>()
+                .join(":")
+        })
+        .collect::<Vec<_>>()
+        .join(":\n")
+}
+
+/// A fingerprint under a [`label`]: four lines of colon hex, with a Copy button.
+fn fingerprint_block(ui: &mut egui::Ui, title: &str, fingerprint: &CertFingerprint) {
+    label(ui, title);
+    ui.horizontal_top(|ui| {
+        ui.label(
+            RichText::new(fingerprint_lines(fingerprint))
+                .monospace()
+                .size(11.0),
+        );
+        if ui.add(widgets::mini(ui, "Copy")).clicked() {
+            ui.ctx().copy_text(fingerprint.colon_hex());
+        }
+    });
+}
+
+/// What "Copy details" copies, as plain text: the gateway, the issuer, the validity and the
+/// fingerprints.
+fn certificate_details(
+    server: &str,
+    info: &CertInfo,
+    previous: Option<&CertFingerprint>,
+) -> String {
+    let (dates, warning) = auth::certificate_dates(info);
+    let mut lines = vec![
+        format!("Gateway: {server}"),
+        format!("Issued by: {}", auth::certificate_issuer(info)),
+        match warning {
+            Some(warning) => format!("Valid: {dates} ({warning})"),
+            None => format!("Valid: {dates}"),
+        },
+    ];
+    match previous {
+        Some(previous) => {
+            lines.push(format!(
+                "Previously trusted SHA-256: {}",
+                previous.colon_hex()
+            ));
+            lines.push(format!("New SHA-256: {}", info.fingerprint.colon_hex()));
+        }
+        None => lines.push(format!("SHA-256: {}", info.fingerprint.colon_hex())),
+    }
+    lines.join("\n") + "\n"
+}
+
+/// The untrusted-certificate dialog (`previous`: the certificate trusted before, when this
+/// one replaces it); the user's choice once made. Cancel has the keyboard focus first, and
+/// Enter means Cancel unless a trust button was given the focus.
+fn certificate_dialog(
+    ui: &mut egui::Ui,
+    server: &str,
+    info: &CertInfo,
+    previous: Option<&CertFingerprint>,
+    focused: &mut bool,
+    enter: bool,
+    can_save: bool,
+) -> Option<Trust> {
+    let p = widgets::pal(ui);
+    if previous.is_some() {
+        ui.heading("This certificate changed");
+        widgets::banner(
+            ui,
+            Tone::Error,
+            "",
+            &format!(
+                "{server} sent a different certificate from the one trusted before. Trust the \
+                 new one only if your IT team confirms they replaced it."
+            ),
+        );
+    } else {
+        ui.heading("Check this certificate");
+        value(
+            ui,
+            &format!(
+                "{server} sent a certificate this PC doesn't trust. Trust it only if your IT \
+                 team confirms it's theirs."
+            ),
+        );
+        label(ui, "Issued to");
+        let subject = info.subject.summary();
+        value(
+            ui,
+            if subject.is_empty() {
+                "Not named"
+            } else {
+                &subject
+            },
+        );
+        if !info.dns_names.is_empty() {
+            ui.add(
+                Label::new(
+                    RichText::new(format!("Names: {}", info.dns_names.join(", ")))
+                        .size(11.0)
+                        .color(p.muted),
+                )
+                .wrap(),
+            );
+        }
+    }
+    label(ui, "Issued by");
+    value(ui, &auth::certificate_issuer(info));
+    label(ui, "Valid");
+    let (dates, warning) = auth::certificate_dates(info);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(dates).size(12.0));
+        if let Some(warning) = warning {
+            ui.label(RichText::new(warning).size(12.0).strong().color(p.red));
+        }
+    });
+    match previous {
+        Some(previous) => {
+            fingerprint_block(ui, "Previously trusted SHA-256", previous);
+            fingerprint_block(ui, "New SHA-256", &info.fingerprint);
+            if ui.add(widgets::mini(ui, "Copy details")).clicked() {
+                ui.ctx()
+                    .copy_text(certificate_details(server, info, Some(previous)));
+            }
+        }
+        None => fingerprint_block(ui, "SHA-256 fingerprint", &info.fingerprint),
+    }
+    ui.add_space(4.0);
+    // Windows order, and nothing drawn as the default action.
+    let mut choice = None;
+    ui.horizontal_wrapped(|ui| {
+        let trust = if previous.is_some() {
+            "Trust the new one"
+        } else {
+            "Always trust"
+        };
+        let always = ui
+            .add_enabled(can_save, widgets::secondary(ui, trust))
+            .on_disabled_hover_text(
+                "The profiles file could not be read, so nothing can be saved in it.",
+            );
+        let once = ui.add(widgets::secondary(ui, "Trust once"));
+        let cancel = ui.add(widgets::secondary(ui, "Cancel"));
+        if !*focused {
+            cancel.request_focus();
+            *focused = true;
+        }
+        let trust_focused = always.has_focus() || once.has_focus();
+        choice = if always.clicked() {
+            Some(Trust::Always)
+        } else if once.clicked() {
+            Some(Trust::Once)
+        } else if cancel.clicked() || (enter && !trust_focused) {
+            Some(Trust::Cancel)
+        } else {
+            None
+        };
+    });
+    choice
+}
+
 impl App {
     pub(super) fn prompts(&mut self, ctx: &egui::Context) {
         let mut close = false;
         let w = width(ctx);
+        let can_save = !self.read_only();
         if let Some(prompt) = &mut self.prompt {
             let modal = egui::Modal::new(egui::Id::unique("prompt"))
                 .frame(frame(ctx))
@@ -161,6 +340,27 @@ impl App {
                                 }
                             });
                         }
+                        PromptUi::Certificate {
+                            server,
+                            info,
+                            previous,
+                            reply,
+                            focused,
+                        } => {
+                            let choice = certificate_dialog(
+                                ui,
+                                server,
+                                info,
+                                previous.as_ref(),
+                                focused,
+                                enter,
+                                can_save,
+                            );
+                            if let Some(choice) = choice {
+                                let _ = reply.send(choice);
+                                close = true;
+                            }
+                        }
                     }
                 });
             // Escape (or a click outside) cancels.
@@ -174,6 +374,9 @@ impl App {
                     }
                     PromptUi::Fields { reply, .. } => {
                         let _ = reply.send(None);
+                    }
+                    PromptUi::Certificate { reply, .. } => {
+                        let _ = reply.send(Trust::Cancel);
                     }
                 }
                 close = true;
@@ -349,5 +552,48 @@ impl App {
             }
             Confirm::Discard(leave) => self.do_leave(leave),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprints_are_shown_in_four_lines() {
+        let pin: CertFingerprint = "0123456789abcdef".repeat(4).parse().unwrap();
+        let lines = fingerprint_lines(&pin);
+        assert_eq!(lines.lines().count(), 4);
+        assert_eq!(lines.replace('\n', ""), pin.colon_hex());
+    }
+
+    #[test]
+    fn copied_details_name_the_gateway_issuer_dates_and_both_fingerprints() {
+        let old: CertFingerprint = "11".repeat(32).parse().unwrap();
+        let new: CertFingerprint = "22".repeat(32).parse().unwrap();
+        let info = CertInfo {
+            fingerprint: new,
+            subject: Default::default(),
+            issuer: polytunnel_http::x509::CertName {
+                common_name: Some("Example Test CA".into()),
+                ..Default::default()
+            },
+            not_before: Some("2024-01-01".into()),
+            not_after: Some("2999-12-31".into()),
+            dns_names: Vec::new(),
+            self_signed: false,
+        };
+        let text = certificate_details("fw.example.net:10443", &info, Some(&old));
+        assert_eq!(
+            text,
+            format!(
+                "Gateway: fw.example.net:10443\nIssued by: Example Test CA\n\
+                 Valid: 2024-01-01 to 2999-12-31\nPreviously trusted SHA-256: {}\n\
+                 New SHA-256: {}\n",
+                old.colon_hex(),
+                new.colon_hex()
+            )
+        );
+        assert!(certificate_details("fw.example.net:10443", &info, None).contains("\nSHA-256: "));
     }
 }

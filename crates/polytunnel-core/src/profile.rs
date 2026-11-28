@@ -23,6 +23,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::pin::CertFingerprint;
+
 /// The operating system reported to a VPN server. Polytunnel reports the real one unless a
 /// profile explicitly overrides it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,10 +151,15 @@ pub struct FortinetSslProfile {
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realm: Option<String>,
-    /// Trust exactly this certificate (its SHA-256), for a FortiGate whose certificate the
-    /// system does not trust, such as its factory certificate. Unset: the system decides.
+    /// Trust exactly this certificate (its SHA-256) on every gateway, for a FortiGate whose
+    /// certificate the system does not trust, such as its factory certificate. Unset: the
+    /// system decides (or `trusted-certs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server_cert: Option<crate::pin::CertFingerprint>,
+    pub server_cert: Option<CertFingerprint>,
+    /// Certificates trusted for single gateways, by `host:port` (see [`gateway_key`]): what
+    /// "Always trust" saves. A gateway's own entry wins over `server-cert`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub trusted_certs: BTreeMap<String, CertFingerprint>,
 }
 
 impl FortinetSslProfile {
@@ -160,6 +167,37 @@ impl FortinetSslProfile {
     pub fn servers(&self) -> Vec<String> {
         gateway_list(&self.server, &self.backup_servers)
     }
+
+    /// The certificate trusted on one gateway (`host:port`, see [`gateway_key`]): its own
+    /// entry in `trusted-certs`, else `server-cert`. `None`: the system decides.
+    pub fn trusted_cert(&self, gateway: &str) -> Option<CertFingerprint> {
+        self.trusted_certs
+            .get(gateway)
+            .or_else(|| {
+                self.trusted_certs
+                    .iter()
+                    .find(|(key, _)| key.trim().eq_ignore_ascii_case(gateway))
+                    .map(|(_, pin)| pin)
+            })
+            .copied()
+            .or(self.server_cert)
+    }
+}
+
+/// The `trusted-certs` key of a gateway address (any form [`normalize_server`] takes):
+/// `host:port`, with the port always written (`vpn.example.com:443`, `[2001:db8::1]:443`).
+pub fn gateway_key(server: &str) -> Result<String, ProfileError> {
+    let base = normalize_server(server)?;
+    let authority = base.trim_start_matches("https://");
+    let has_port = match authority.rfind(']') {
+        Some(end) => authority[end..].contains(':'),
+        None => authority.contains(':'),
+    };
+    Ok(if has_port {
+        authority.to_string()
+    } else {
+        format!("{authority}:443")
+    })
 }
 
 /// `first` and then `more`, trimmed, without blanks or repeats.
@@ -516,6 +554,85 @@ nat-keepalive = 5
         assert_eq!(Profiles::parse(&profiles.to_toml()).unwrap(), profiles);
         assert_eq!(parse_ipv4_network("10.0.0.0/33"), None);
         assert_eq!(parse_ipv4_network("10.0.0.0"), None);
+    }
+
+    #[test]
+    fn trusted_certificates_round_trip_and_apply_per_gateway() {
+        let old: CertFingerprint = "11".repeat(32).parse().unwrap();
+        let own: CertFingerprint = "22".repeat(32).parse().unwrap();
+        let text = format!(
+            r#"
+[profile.office]
+type = "fortinet-ssl"
+server = "fw.example.net:10443"
+backup-servers = ["fw-backup.example.net", "[2001:db8::1]"]
+server-cert = "{old}"
+
+[profile.office.trusted-certs]
+"fw-backup.example.net:443" = "{own}"
+"#
+        );
+        let profiles = Profiles::parse(&text).unwrap();
+        let Some(Profile::FortinetSsl(office)) = profiles.get("office") else {
+            panic!("office");
+        };
+        assert_eq!(office.server_cert, Some(old));
+        assert_eq!(office.trusted_certs.len(), 1);
+        let keys: Vec<String> = office
+            .servers()
+            .iter()
+            .map(|s| gateway_key(s).unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "fw.example.net:10443",
+                "fw-backup.example.net:443",
+                "[2001:db8::1]:443"
+            ]
+        );
+        // The gateway's own entry, else server-cert (which applies to every gateway).
+        assert_eq!(office.trusted_cert("fw-backup.example.net:443"), Some(own));
+        assert_eq!(office.trusted_cert("FW-Backup.example.net:443"), Some(own));
+        assert_eq!(office.trusted_cert("fw.example.net:10443"), Some(old));
+        assert_eq!(office.trusted_cert("[2001:db8::1]:443"), Some(old));
+        let none = FortinetSslProfile::default();
+        assert_eq!(none.trusted_cert("fw.example.net:10443"), None);
+
+        // Written back the same way, and both fields survive.
+        let toml = profiles.to_toml();
+        assert!(toml.contains("server-cert = "), "{toml}");
+        assert!(toml.contains("trusted-certs"), "{toml}");
+        assert_eq!(Profiles::parse(&toml).unwrap(), profiles);
+        // No table when nothing is trusted.
+        let mut bare = office.clone();
+        bare.trusted_certs.clear();
+        let mut plain = Profiles::default();
+        plain
+            .profiles
+            .insert("x".into(), Profile::FortinetSsl(bare));
+        assert!(!plain.to_toml().contains("trusted-certs"));
+        // A value that is no fingerprint is refused.
+        let bad = text.replace(&own.to_string(), "sha256:00");
+        assert!(Profiles::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn gateway_keys_always_name_the_port() {
+        assert_eq!(
+            gateway_key("https://VPN.example.com/remote/login").unwrap(),
+            "vpn.example.com:443"
+        );
+        assert_eq!(
+            gateway_key("vpn.example.com:8443/Staff").unwrap(),
+            "vpn.example.com:8443"
+        );
+        assert_eq!(
+            gateway_key("[2001:db8::7]:10443").unwrap(),
+            "[2001:db8::7]:10443"
+        );
+        assert_eq!(gateway_key("198.51.100.4").unwrap(), "198.51.100.4:443");
+        assert!(gateway_key("http://vpn.example.com").is_err());
     }
 
     #[test]

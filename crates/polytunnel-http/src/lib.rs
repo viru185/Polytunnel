@@ -3,6 +3,7 @@
 
 mod pinned;
 pub mod trace;
+pub mod x509;
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
@@ -17,7 +18,10 @@ use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::{Connector, DefaultConnector, NextTimeout, TcpConnector};
 
-pub use pinned::{check_pin, fingerprint, tls_connector, untrusted_certificate};
+pub use pinned::{
+    check_pin, fingerprint, server_certificate, tls_connector, untrusted_certificate_info,
+};
+pub use x509::CertInfo;
 
 /// Response bodies larger than this are refused (VPN login answers are a few KB).
 const MAX_BODY: u64 = 4 * 1024 * 1024;

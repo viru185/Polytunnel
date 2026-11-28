@@ -19,6 +19,8 @@ use ureq::unversioned::transport::{
     TransportAdapter,
 };
 
+use crate::x509::CertInfo;
+
 /// The SHA-256 fingerprint of a certificate (DER).
 pub fn fingerprint(der: &[u8]) -> CertFingerprint {
     CertFingerprint::from_digest(Sha256::digest(der).into())
@@ -61,27 +63,43 @@ pub fn check_pin<S: Read + Write>(
     }
 }
 
-/// When the system rejects `host:port`'s certificate but a TLS connection is otherwise
-/// possible, the certificate's fingerprint (for the user to compare and trust). `None` when
-/// the system trusts it, or no TLS connection can be made at all.
-pub fn untrusted_certificate(host: &str, port: u16) -> Option<CertFingerprint> {
-    let handshake = |connector: TlsConnector| -> Option<TlsStream<TcpStream>> {
-        let addr = (host, port).to_socket_addrs().ok()?.next()?;
-        let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).ok()?;
-        tcp.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
-        tcp.set_write_timeout(Some(Duration::from_secs(10))).ok()?;
-        connector.connect(host, tcp).ok()
-    };
-    if handshake(tls_connector(None).ok()?).is_some() {
-        return None;
-    }
+/// A TCP connection to `host:port`, with the timeouts used for looking at certificates.
+fn tcp(host: &str, port: u16) -> Option<TcpStream> {
+    let addr = (host, port).to_socket_addrs().ok()?.next()?;
+    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).ok()?;
+    tcp.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+    tcp.set_write_timeout(Some(Duration::from_secs(10))).ok()?;
+    Some(tcp)
+}
+
+/// The certificate `host:port` presents, whether or not anything trusts it (for checking a
+/// pinned server whose certificate no longer matches). `None` when no TLS connection can be
+/// made at all.
+pub fn server_certificate(host: &str, port: u16) -> Option<CertInfo> {
     let mut accept_any = TlsConnector::builder();
     accept_any
         .danger_accept_invalid_certs(true)
         .danger_accept_invalid_hostnames(true);
-    let stream = handshake(accept_any.build().ok()?)?;
+    let stream = accept_any
+        .build()
+        .ok()?
+        .connect(host, tcp(host, port)?)
+        .ok()?;
     let der = stream.peer_certificate().ok()??.to_der().ok()?;
-    Some(fingerprint(&der))
+    Some(CertInfo::from_der(&der))
+}
+
+/// When the system rejects `host:port`'s certificate but a TLS connection is otherwise
+/// possible, the certificate (for the user to look at and decide), read in a second,
+/// unverified handshake. `None` when the system trusts it, or no TLS connection can be made
+/// at all.
+pub fn untrusted_certificate_info(host: &str, port: u16) -> Option<CertInfo> {
+    // Nothing answers: nothing to trust (and no second wait for the same timeout).
+    let tcp = tcp(host, port)?;
+    if tls_connector(None).ok()?.connect(host, tcp).is_ok() {
+        return None;
+    }
+    server_certificate(host, port)
 }
 
 fn io_error(message: impl Into<String>) -> ureq::Error {
@@ -274,13 +292,19 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_certificates_are_identified_for_the_user() {
+    fn untrusted_certificates_are_shown_to_the_user() {
         let (port, pin) = self_signed_server();
-        assert_eq!(untrusted_certificate("127.0.0.1", port), Some(pin));
+        let info = untrusted_certificate_info("127.0.0.1", port).expect("untrusted");
+        assert_eq!(info.fingerprint, pin);
+        assert_eq!(info.dns_names, ["fortigate.test"]);
+        assert!(info.self_signed);
+        // Read the same way when asked about a pinned server.
+        assert_eq!(server_certificate("127.0.0.1", port), Some(info));
         // Nothing listening: no TLS at all, so nothing to trust.
         let closed = TcpListener::bind("127.0.0.1:0").unwrap();
         let closed_port = closed.local_addr().unwrap().port();
         drop(closed);
-        assert_eq!(untrusted_certificate("127.0.0.1", closed_port), None);
+        assert_eq!(untrusted_certificate_info("127.0.0.1", closed_port), None);
+        assert_eq!(server_certificate("127.0.0.1", closed_port), None);
     }
 }
