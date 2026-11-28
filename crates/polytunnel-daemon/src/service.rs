@@ -107,10 +107,16 @@ pub mod windows {
     }
 
     /// The installer creates the service without recovery actions: the service sets them on
-    /// itself (as LocalSystem it may).
+    /// itself (as LocalSystem it may). Windows wants the start right as well as the
+    /// change-configuration right for a "restart" action.
     fn ensure_restart_on_failure() {
         let result = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-            .and_then(|manager| manager.open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG))
+            .and_then(|manager| {
+                manager.open_service(
+                    SERVICE_NAME,
+                    ServiceAccess::CHANGE_CONFIG | ServiceAccess::START,
+                )
+            })
             .and_then(|service| restart_on_failure(&service));
         if let Err(e) = result {
             crate::warn!("cannot set the service's restart-on-failure actions: {e}");
